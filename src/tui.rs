@@ -675,7 +675,14 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Install   ", Style::default().fg(DIM)),
-                Span::styled("npm install -g @anthropic-ai/claude-code", Style::default().fg(Color::Rgb(140, 200, 140))),
+                Span::styled(
+                    if cfg!(target_os = "windows") {
+                        "npm install -g @anthropic-ai/claude-code   (in PowerShell/cmd)"
+                    } else {
+                        "npm install -g @anthropic-ai/claude-code"
+                    },
+                    Style::default().fg(Color::Rgb(140, 200, 140)),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("    Log in    ", Style::default().fg(DIM)),
@@ -867,7 +874,11 @@ impl App {
             Line::from(""),
             Line::from(Span::styled("  Launch command", Style::default().fg(DIM))),
             Line::from(Span::styled(
-                format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display()),
+                if cfg!(target_os = "windows") {
+                    format!("  $env:CLAUDE_CONFIG_DIR='{}'; claude", profile_dir.display())
+                } else {
+                    format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
+                },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
         ];
