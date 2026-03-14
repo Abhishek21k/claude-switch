@@ -13,7 +13,14 @@ use std::io::{self, Write};
     long_about = "Manage multiple Claude Code accounts using isolated config directories.\n\
                   Each profile stores a complete ~/.claude snapshot and launches Claude\n\
                   with CLAUDE_CONFIG_DIR set — no credential swapping, no side effects.",
-    version
+    version,
+    after_help = "\
+Quick start:
+  cswitch add work           Detect active session, copy or login
+  cswitch login personal     Login to a different account
+  cswitch use work           Launch Claude with a profile
+  cswitch list               Show all profiles
+  cswitch                    Open interactive TUI (press ? for help)"
 )]
 struct Cli {
     #[command(subcommand)]
