@@ -3,7 +3,8 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use profile::ProfileManager;
+use profile::{detect_current_account, ProfileManager};
+use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(
@@ -27,13 +28,19 @@ enum Commands {
     /// List all saved profiles
     List,
 
-    /// Add current ~/.claude as a named profile
+    /// Add a new profile — detects active session and lets you choose
     Add {
         /// Profile name (alphanumeric, hyphens, underscores)
         name: String,
         /// Overwrite if profile already exists
         #[arg(short, long)]
         force: bool,
+    },
+
+    /// Log in to a new Claude account and save it as a profile (skips detection prompt)
+    Login {
+        /// Profile name (alphanumeric, hyphens, underscores)
+        name: String,
     },
 
     /// Remove a saved profile
@@ -92,29 +99,15 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Add { name, force }) => {
-            let result = if force {
-                manager.add_profile_force(&name)
-            } else {
-                manager.add_profile(&name)
-            };
+            handle_add(&manager, &name, force)?;
+        }
 
-            match result {
-                Ok(p) => {
-                    println!("✓ Profile '{}' added.", p.name);
-                    if let Some(email) = p.email {
-                        println!("  Account: {}", email);
-                    }
-                    println!("  Launch with: cswitch use {}", p.name);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+        Some(Commands::Login { name }) => {
+            manager.login_profile(&name)?;
         }
 
         Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
-            Ok(_) => println!("✓ Profile '{}' removed.", name),
+            Ok(_) => println!("Profile '{}' removed.", name),
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -154,4 +147,71 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Smart add: detects an active Claude session and asks the user whether to
+/// copy it or login fresh.
+fn handle_add(manager: &ProfileManager, name: &str, force: bool) -> Result<()> {
+    match detect_current_account() {
+        Some(acct) => {
+            let email = acct.email.as_deref().unwrap_or("unknown");
+            println!("Active Claude session detected: {}\n", email);
+            println!("  [c]  Copy this session as profile '{}'", name);
+            println!("  [l]  Login to a different account for profile '{}'", name);
+            println!();
+
+            let choice = prompt_choice("Choice [c/l]: ", &['c', 'l'])?;
+
+            match choice {
+                'c' => {
+                    let result = if force {
+                        manager.add_profile_force(name)
+                    } else {
+                        manager.add_profile(name)
+                    };
+                    match result {
+                        Ok(p) => {
+                            println!("\nProfile '{}' added.", p.name);
+                            if let Some(email) = p.email {
+                                println!("  Account: {}", email);
+                            }
+                            println!("  Launch with: cswitch use {}", p.name);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                'l' => {
+                    manager.login_profile(name)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        None => {
+            // No active session — go straight to login
+            println!("No active Claude session found. Opening Claude for login…\n");
+            manager.login_profile(name)?;
+        }
+    }
+    Ok(())
+}
+
+fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
+    loop {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if let Some(c) = input.trim().chars().next() {
+            let c = c.to_ascii_lowercase();
+            if valid.contains(&c) {
+                return Ok(c);
+            }
+        }
+        println!("Please enter one of: {}", valid.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+    }
 }

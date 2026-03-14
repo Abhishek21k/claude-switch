@@ -94,24 +94,65 @@ impl ProfileManager {
         Ok(profile)
     }
 
-    /// Add the current `~/.claude` as a named profile.
+    /// Add the current logged-in session as a named profile.
+    /// Copies `~/.claude/` dir, `~/.claude.json` (home root), and on macOS
+    /// extracts Keychain credentials into `.credentials.json`.
     pub fn add_profile(&self, name: &str) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        self.add_profile_from(name, &src)
+        let mut profile = self.add_profile_from(name, &src)?;
+        self.copy_extra_credentials(&home, name, &mut profile)?;
+        Ok(profile)
     }
 
-    /// Add the current `~/.claude`, overwriting if the profile already exists.
+    /// Same as `add_profile` but overwrites an existing profile.
     pub fn add_profile_force(&self, name: &str) -> Result<Profile> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let src = home.join(".claude");
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        self.add_profile_from_force(name, &src)
+        let mut profile = self.add_profile_from_force(name, &src)?;
+        self.copy_extra_credentials(&home, name, &mut profile)?;
+        Ok(profile)
+    }
+
+    /// Copy the extra files that live outside `~/.claude/`:
+    /// 1. `~/.claude.json` (home root — has oauthAccount metadata)
+    /// 2. macOS Keychain credentials → `.credentials.json`
+    fn copy_extra_credentials(
+        &self,
+        home: &Path,
+        name: &str,
+        profile: &mut Profile,
+    ) -> Result<()> {
+        let dest = self.profile_dir(name);
+
+        // 1. Copy ~/.claude.json from home root (contains oauthAccount w/ email)
+        let home_claude_json = home.join(".claude.json");
+        if home_claude_json.exists() {
+            fs::copy(&home_claude_json, dest.join(".claude.json"))?;
+            // Re-read email now that we have the full config
+            if profile.email.is_none() {
+                profile.email = read_email_from_dir(&dest);
+                self.upsert_profile(profile.clone())?;
+            }
+        }
+
+        // 2. On macOS, extract Keychain credentials
+        #[cfg(target_os = "macos")]
+        {
+            if !dest.join(".credentials.json").exists() {
+                if let Some(creds) = read_keychain_credentials() {
+                    fs::write(dest.join(".credentials.json"), creds)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn remove_profile(&self, name: &str) -> Result<()> {
@@ -165,6 +206,45 @@ impl ProfileManager {
         std::process::exit(status.code().unwrap_or(0));
     }
 
+    /// Create an empty profile directory and launch Claude into it.
+    /// Claude will detect no credentials and trigger its own login flow.
+    /// After the user authenticates and exits Claude, we read the email
+    /// from whatever config Claude wrote and register the profile.
+    pub fn login_profile(&self, name: &str) -> Result<()> {
+        let profile_dir = self.profiles_dir.join(name);
+        if profile_dir.exists() {
+            let has_files = profile_dir.read_dir()?.next().is_some();
+            if has_files {
+                bail!("Profile '{}' already exists. Remove it first or pick a different name.", name);
+            }
+        }
+        fs::create_dir_all(&profile_dir)?;
+
+        println!("Launching Claude Code — please log in with the account for profile '{}'.", name);
+        println!("After logging in, exit Claude (Ctrl-C or /exit) to finish setup.\n");
+
+        let status = std::process::Command::new("claude")
+            .env("CLAUDE_CONFIG_DIR", &profile_dir)
+            .status()
+            .context("Failed to launch claude. Is it installed and in your PATH?")?;
+
+        // Claude has exited — check if it wrote any config files
+        let email = read_email_from_dir(&profile_dir);
+        let profile = Profile {
+            name: name.to_string(),
+            email: email.clone(),
+            added: Utc::now(),
+            last_used: Some(Utc::now()),
+        };
+        self.upsert_profile(profile)?;
+
+        let display_email = email.as_deref().unwrap_or("unknown");
+        println!("\nProfile '{}' registered (account: {}).", name, display_email);
+        println!("Launch with: cswitch use {}", name);
+
+        std::process::exit(status.code().unwrap_or(0));
+    }
+
     /// Print shell alias lines for all managed profiles.
     pub fn generate_aliases(&self) -> Result<String> {
         let profiles = self.list_profiles()?;
@@ -209,6 +289,31 @@ impl ProfileManager {
     }
 }
 
+// ── First-run detection ───────────────────────────────────────────────────────
+
+/// Account details read from the live `~/.claude` directory.
+pub struct DetectedAccount {
+    pub email: Option<String>,
+    #[allow(dead_code)]
+    pub config_dir: std::path::PathBuf,
+}
+
+/// Try to read the currently logged-in Claude account.
+/// Checks both `~/.claude/` (config dir) and `~/.claude.json` (home root)
+/// since on macOS the account metadata lives at the root, not inside the dir.
+/// Returns `None` if neither exists.
+pub fn detect_current_account() -> Option<DetectedAccount> {
+    let home = dirs::home_dir()?;
+    let config_dir = home.join(".claude");
+    if !config_dir.exists() {
+        return None;
+    }
+    // Try ~/.claude/ first, then fallback to ~/.claude.json at home root
+    let email = read_email_from_dir(&config_dir)
+        .or_else(|| read_email_from_home_root(&home));
+    Some(DetectedAccount { email, config_dir })
+}
+
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
@@ -223,6 +328,47 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// On macOS, read the OAuth credentials from the system Keychain.
+/// Returns the raw JSON string if found, or None.
+#[cfg(target_os = "macos")]
+fn read_keychain_credentials() -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let creds = String::from_utf8(output.stdout).ok()?;
+    let trimmed = creds.trim().to_string();
+
+    // Validate it's actual JSON before returning
+    if serde_json::from_str::<serde_json::Value>(&trimmed).is_ok() {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+/// Read email from `~/.claude.json` at home root (macOS stores account metadata here).
+fn read_email_from_home_root(home: &Path) -> Option<String> {
+    let path = home.join(".claude.json");
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(email) = val
+                .get("oauthAccount")
+                .and_then(|o| o.get("emailAddress"))
+                .and_then(|e| e.as_str())
+            {
+                return Some(email.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Extract the account email from a Claude config directory.
@@ -652,6 +798,48 @@ mod tests {
         assert!(out.contains("alias claude-work="), "{out}");
         assert!(out.contains("alias claude-personal="), "{out}");
         assert!(out.contains("CLAUDE_CONFIG_DIR="), "{out}");
+    }
+
+    // ── login_profile ──────────────────────────────────────────────────────
+
+    #[test]
+    fn login_profile_rejects_existing_nonempty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"), "a@b.com");
+        mgr.add_profile_from("taken", &src).unwrap();
+
+        // login_profile should refuse because the dir is non-empty
+        let err = mgr.login_profile("taken").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    // ── read_email_from_home_root ─────────────────────────────────────────
+
+    #[test]
+    fn read_email_from_home_root_finds_oauth_account() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let claude_json = serde_json::json!({
+            "oauthAccount": {
+                "emailAddress": "root@test.com",
+                "accountUuid": "uuid"
+            },
+            "numStartups": 42
+        });
+        fs::write(
+            root.join(".claude.json"),
+            serde_json::to_string_pretty(&claude_json).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_email_from_home_root(root), Some("root@test.com".into()));
+    }
+
+    #[test]
+    fn read_email_from_home_root_returns_none_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(read_email_from_home_root(tmp.path()), None);
     }
 
     #[test]
