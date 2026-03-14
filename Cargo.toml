@@ -3,6 +3,13 @@ name = "claude-switch"
 version = "0.1.0"
 edition = "2024"
 description = "Multi-account profile manager for Claude Code"
+license = "MIT"
+repository = "https://github.com/Abhishek21k/claude-switch"
+homepage = "https://github.com/Abhishek21k/claude-switch"
+readme = "README.md"
+keywords = ["claude", "cli", "profile", "manager", "claude-code"]
+categories = ["command-line-utilities"]
+authors = ["Abhishek21k"]
 
 [[bin]]
 name = "cswitch"
