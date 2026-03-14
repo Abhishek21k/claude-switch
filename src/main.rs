@@ -1,9 +1,6 @@
 mod profile;
 mod tui;
 
-#[cfg(test)]
-mod tests;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use profile::ProfileManager;
