@@ -1,5 +1,5 @@
 [package]
-name = "claude-switch"
+name = "cswitch"
 version = "0.1.0"
 edition = "2024"
 description = "Multi-account profile manager for Claude Code"
