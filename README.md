@@ -10,17 +10,43 @@ Claude Code ties one account to `~/.claude`. If you have a work account, a perso
 
 ## Install
 
-### From source (requires Rust)
+### Homebrew (macOS/Linux)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-switch.git
-cd claude-switch
-cargo install --path .
+brew install Abhishek21k/tap/cc-switch
+```
+
+### Cargo (requires Rust)
+
+```bash
+cargo install cc-switch
 ```
 
 ### Pre-built binaries
 
-Coming soon. Check [Releases](https://github.com/YOUR_USERNAME/claude-switch/releases).
+Download the latest binary for your platform from [GitHub Releases](https://github.com/Abhishek21k/claude-switch/releases).
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv cswitch /usr/local/bin/
+
+# macOS (Intel)
+curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv cswitch /usr/local/bin/
+
+# Linux
+curl -fsSL https://github.com/Abhishek21k/claude-switch/releases/latest/download/cc-switch-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv cswitch /usr/local/bin/
+```
+
+### From source
+
+```bash
+git clone https://github.com/Abhishek21k/claude-switch.git
+cd claude-switch
+cargo install --path .
+```
 
 ## Quick start
 
