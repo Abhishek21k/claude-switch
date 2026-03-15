@@ -19,7 +19,7 @@ brew install Abhishek21k/tap/cc-switch
 ### Cargo (requires Rust)
 
 ```bash
-cargo install cc-switch
+cargo install cswitch
 ```
 
 ### Pre-built binaries
