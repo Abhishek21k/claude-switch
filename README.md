@@ -71,7 +71,8 @@ cswitch
 |---|---|
 | `cswitch` | Open interactive TUI |
 | `cswitch add <name>` | Add a new profile (detects active session, asks to copy or login) |
-| `cswitch login <name>` | Create a profile by logging into a new account |
+| `cswitch login <name>` | Create a profile by logging into a different account |
+| `cswitch login <name> --email <addr>` | Same, pre-filling the address on Claude's login page |
 | `cswitch use <name>` | Launch Claude Code with a specific profile |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
@@ -95,7 +96,7 @@ Run `cswitch` with no arguments to open the TUI.
 │   client          ││  CLAUDE_CONFIG_DIR='...' claude   │
 │   dev@client.io   ││                                   │
 └───────────────────┘└───────────────────────────────────┘
-┌ ↑↓/jk nav  enter launch  / search  l login  a add ... ┐
+┌ ↑↓/jk nav  enter launch  / search  a add account ...  ┐
 ```
 
 ### TUI keybindings
@@ -105,12 +106,55 @@ Run `cswitch` with no arguments to open the TUI.
 | `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
 | `/` | Search profiles by name or email |
-| `l` | Login — add a new account |
-| `a` | Add — copy current session as a profile |
-| `r` | Refresh — re-copy current session into selected profile |
+| `a` | Add account — enter a name, then choose copy or login |
+| `l` | Login — shortcut straight to a different account |
+| `r` | Refresh — overwrite the selected profile with the current session (confirmed) |
 | `d` | Delete selected profile |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |
+
+## Copy vs Login
+
+A profile is a **config environment**, not an identity. Its name is a local label you choose; the Claude account inside it comes from authentication and nothing else. So `a` always asks which of two things you want:
+
+**Copy current session** — same Claude account, separate setup.
+
+```bash
+cswitch add review      # → choose [c]
+```
+
+Use this for one account with two environments: different MCP servers, different project trust, separate conversation history. `review` and your main profile stay the same account.
+
+**Login to a different Claude account** — a different identity.
+
+```bash
+cswitch login business   # or press `a`, then [l]
+```
+
+The new profile is seeded with your warm setup (settings, skills, project trust), then every trace of the old account is stripped so Claude has to authenticate from scratch.
+
+### The browser decides which account you get
+
+`claude auth login` hands account selection to your browser. If claude.ai is already signed in as another account, OAuth grants **that** account — usually with no picker — and you end up with a second profile for the account you already had.
+
+Before logging a different account in:
+
+- sign out of claude.ai, **or**
+- complete the login in a private/incognito window.
+
+`cswitch login <name> --email you@company.com` pre-fills the login page, which helps once you are signed out. It cannot override a live session.
+
+After every login, cswitch reports the account Claude actually authenticated as — read from `claude auth status`, never from the name you typed. If that account already belongs to another profile, it says so instead of pretending a new account was added.
+
+### Two profiles, one account
+
+This is allowed, not an error. Duplicate account identity is a warning because separate config environments for a single Claude account are a legitimate setup. If it was not what you meant, the fix is in the browser:
+
+```bash
+cswitch remove business
+# sign out of claude.ai, then:
+cswitch login business
+```
 
 ## Adding your first profile
 
@@ -119,7 +163,7 @@ When you run `cswitch` for the first time, it detects your active Claude session
 1. **Copy active session** — saves your current credentials as a profile, no re-login needed
 2. **Login to a new account** — opens Claude so you can authenticate with a different account
 
-For every additional account after the first, use `cswitch login <name>`.
+After that, `a` in the TUI offers the same two choices for every additional profile.
 
 ## Shell aliases
 
