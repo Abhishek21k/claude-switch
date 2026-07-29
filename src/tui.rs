@@ -8,7 +8,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 
-use crate::profile::{detect_current_account, Profile, ProfileManager};
+use crate::profile::{describe_age, detect_current_account, Profile, ProfileManager};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -64,6 +64,11 @@ pub struct App {
     /// Account currently logged in under `~/.claude`, resolved when the add
     /// flow starts so "Copy" can name what it is about to copy.
     current_account: Option<String>,
+    /// Seconds since a Claude session last wrote to the selected profile, when
+    /// that was recent enough to matter. Resolved as a destructive confirmation
+    /// opens, because profiles run concurrently and the one being overwritten
+    /// may be open in another terminal.
+    selected_in_use: Option<u64>,
     pending: Option<PendingAction>,
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
@@ -105,6 +110,7 @@ impl App {
             detected_email,
             claude_dir_found,
             current_account: None,
+            selected_in_use: None,
             pending: None,
             account_probe: live_account_email,
         })
@@ -170,6 +176,13 @@ impl App {
             .selected()
             .and_then(|fi| self.filtered_indices.get(fi))
             .and_then(|&i| self.profiles.get(i))
+    }
+
+    /// How recently a Claude session wrote to the selected profile, if that was
+    /// recent enough that another terminal may still have it open.
+    fn selected_session_age(&self) -> Option<u64> {
+        let name = self.selected_profile()?.name.clone();
+        self.manager.maybe_in_use(&name)
     }
 
     fn move_up(&mut self) {
@@ -433,6 +446,7 @@ impl App {
 
             KeyCode::Char('d') | KeyCode::Delete => {
                 if self.selected_profile().is_some() {
+                    self.selected_in_use = self.selected_session_age();
                     self.mode = Mode::ConfirmDelete;
                 }
             }
@@ -443,6 +457,7 @@ impl App {
             // identities involved.
             KeyCode::Char('r') if self.selected_profile().is_some() => {
                 self.current_account = (self.account_probe)();
+                self.selected_in_use = self.selected_session_age();
                 self.mode = Mode::ConfirmRefresh;
             }
 
@@ -1185,8 +1200,6 @@ impl App {
             .selected_profile()
             .map(|p| p.name.as_str())
             .unwrap_or("?");
-        let area = centered_rect(50, 7, f.area());
-        f.render_widget(Clear, area);
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1198,26 +1211,39 @@ impl App {
             .border_style(Style::default().fg(DANGER))
             .style(Style::default().bg(PANEL));
 
-        f.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  Delete profile ", Style::default().fg(TEXT)),
-                    Span::styled(name.to_string(), Style::default().fg(DANGER).bold()),
-                    Span::styled("? This cannot be undone.", Style::default().fg(TEXT)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled("y", Style::default().fg(DANGER).bold()),
-                    Span::styled(" confirm   ", Style::default().fg(DIM)),
-                    Span::styled("any other key", Style::default().fg(ACCENT).bold()),
-                    Span::styled(" cancel", Style::default().fg(DIM)),
-                ]),
-            ]))
-            .block(block),
-            area,
-        );
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Delete profile ", Style::default().fg(TEXT)),
+                Span::styled(name.to_string(), Style::default().fg(DANGER).bold()),
+                Span::styled("? This cannot be undone.", Style::default().fg(TEXT)),
+            ]),
+            Line::from(""),
+        ];
+
+        if let Some(secs) = self.selected_in_use {
+            lines.push(Line::from(Span::styled(
+                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Deleting pulls the config out from under that terminal.",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("y", Style::default().fg(DANGER).bold()),
+            Span::styled(" confirm   ", Style::default().fg(DIM)),
+            Span::styled("any other key", Style::default().fg(ACCENT).bold()),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
+
+        let area = centered_rect(56, lines.len() as u16 + 2, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn render_add_name_popup(&self, f: &mut Frame) {
@@ -1312,9 +1338,6 @@ impl App {
     }
 
     fn render_confirm_refresh_popup(&self, f: &mut Frame) {
-        let area = centered_rect(66, 11, f.area());
-        f.render_widget(Clear, area);
-
         let (name, profile_email) = match self.selected_profile() {
             Some(p) => (
                 p.name.clone(),
@@ -1329,7 +1352,13 @@ impl App {
             .as_deref()
             .map(|c| !c.eq_ignore_ascii_case(&profile_email))
             .unwrap_or(true);
-        let color = if replaces_account { DANGER } else { ACCENT };
+        // Overwriting a profile another terminal is using is its own hazard,
+        // independent of which account it holds.
+        let color = if replaces_account || self.selected_in_use.is_some() {
+            DANGER
+        } else {
+            ACCENT
+        };
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1372,11 +1401,25 @@ impl App {
             lines.push(Line::from(""));
         }
 
+        if let Some(secs) = self.selected_in_use {
+            lines.push(Line::from(Span::styled(
+                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Another terminal may have this profile open right now.",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
         lines.push(Line::from(Span::styled(
             "  [y] Confirm   ·   any other key cancels",
             Style::default().fg(MUTED),
         )));
 
+        let area = centered_rect(66, lines.len() as u16 + 2, f.area());
+        f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
@@ -1796,6 +1839,73 @@ mod tests {
         assert_eq!(
             registry.profiles["business"].email.as_deref(),
             Some("other@example.com")
+        );
+    }
+
+    // ── Concurrent sessions ──────────────────────────────────────────────────
+
+    /// Give a profile the on-disk trace a running Claude session leaves.
+    fn mark_live(app: &App, name: &str) {
+        let dir = app.manager.profile_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session-env"), "live").unwrap();
+    }
+
+    #[test]
+    fn refreshing_a_profile_another_session_is_using_warns_first() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+        mark_live(&app, "business");
+
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.mode, Mode::ConfirmRefresh);
+        assert!(
+            app.selected_in_use.is_some(),
+            "a profile written to seconds ago must be reported as possibly open"
+        );
+    }
+
+    #[test]
+    fn deleting_a_profile_another_session_is_using_warns_first() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+        mark_live(&app, "business");
+
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        assert!(app.selected_in_use.is_some());
+    }
+
+    #[test]
+    fn an_untouched_profile_carries_no_in_use_warning() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.selected_in_use, None);
+    }
+
+    #[test]
+    fn the_in_use_warning_advises_but_does_not_block() {
+        // mtime is evidence, not proof. A user who knows the other terminal is
+        // closed must still be able to proceed, so `y` keeps its meaning.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+        mark_live(&app, "business");
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+
+        app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
+
+        assert!(
+            !app.manager.load_registry().unwrap().profiles.contains_key("business"),
+            "confirming must still delete"
         );
     }
 }

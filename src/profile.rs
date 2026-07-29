@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -186,6 +187,39 @@ impl ProfileManager {
 
     pub fn profile_dir(&self, name: &str) -> PathBuf {
         self.profiles_dir.join(name)
+    }
+
+    // ── Live-session detection ───────────────────────────────────────────────
+
+    /// Seconds since a Claude session last wrote to this profile.
+    ///
+    /// Profiles are isolated by `CLAUDE_CONFIG_DIR`, so several can run at once
+    /// in different terminals. That makes "overwrite this profile" a question
+    /// about *other people's live sessions*, not just about stored credentials —
+    /// hence this check.
+    ///
+    /// `None` means no evidence either way: never launched, markers removed, or
+    /// the directory is gone. Callers must read it as *unknown*, never as *idle*.
+    pub fn seconds_since_session_write(&self, name: &str) -> Option<u64> {
+        let dir = self.profile_dir(name);
+        let now = SystemTime::now();
+        SESSION_ACTIVITY_MARKERS
+            .iter()
+            .filter_map(|marker| newest_write(&dir.join(marker)))
+            // A timestamp ahead of the clock means skew, not staleness. Round it
+            // to "just now" so skew can never make a live profile look idle.
+            .map(|t| now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0))
+            .min()
+    }
+
+    /// How long ago this profile was written to, if that was recent enough that
+    /// another session may still have it open.
+    ///
+    /// Deliberately *may*: mtime is evidence of a session, not proof of a live
+    /// process. Callers should word their warnings the same way.
+    pub fn maybe_in_use(&self, name: &str) -> Option<u64> {
+        self.seconds_since_session_write(name)
+            .filter(|secs| *secs <= SESSION_ACTIVE_WINDOW_SECS)
     }
 
     /// Launch `claude` with `CLAUDE_CONFIG_DIR` pointed at the named profile.
@@ -571,6 +605,53 @@ fn seed_skip(include_history: bool) -> Vec<&'static str> {
         skip.extend_from_slice(SEED_SKIP_HISTORY);
     }
     skip
+}
+
+// ── Live-session detection ────────────────────────────────────────────────────
+
+/// Paths a running Claude session writes to, and that no seed operation copies.
+///
+/// Every entry here is in [`SEED_SKIP_ALWAYS`], which is the point: a fresh
+/// `cswitch add` gives every copied file a current mtime, so anything copyable
+/// would read as "active" the moment it was created. These are only ever
+/// written by a real session in that directory.
+const SESSION_ACTIVITY_MARKERS: &[&str] = &["sessions", "session-env", "shell-snapshots"];
+
+/// How long after its last write a profile is still treated as possibly in use.
+///
+/// Generous on purpose. An open-but-idle session touches its files only every
+/// few minutes, so a tight window would report "idle" for precisely the session
+/// this guard exists to protect. A false positive costs one extra line in a
+/// confirmation dialog; a false negative costs another account's credentials.
+pub const SESSION_ACTIVE_WINDOW_SECS: u64 = 30 * 60;
+
+/// Most recent write at `path`, looking one level into a directory.
+///
+/// A directory's own mtime moves only when entries are added or removed, so a
+/// session rewriting an existing session file in place would look idle if the
+/// directory alone were consulted.
+fn newest_write(path: &Path) -> Option<SystemTime> {
+    let meta = fs::metadata(path).ok()?;
+    let mut newest = meta.modified().ok();
+    if meta.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+                newest = Some(newest.map_or(t, |n| n.max(t)));
+            }
+        }
+    }
+    newest
+}
+
+/// Phrase an age the way the confirmation dialogs report it.
+pub fn describe_age(seconds: u64) -> String {
+    match seconds {
+        0..=90 => "seconds ago".to_string(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s => format!("{} h ago", s / 3600),
+    }
 }
 
 /// Keys stripped from a seeded `.claude.json` when the profile is going to hold
@@ -1463,5 +1544,119 @@ mod tests {
         // ...while the things that make a profile warm are still there.
         assert!(dest.join(".claude.json").exists());
         assert!(dest.join(".credentials.json").exists(), "add keeps the same account logged in");
+    }
+
+    // ── Live-session detection ────────────────────────────────────────────────
+
+    /// Backdate a path's mtime so a test can describe an old session.
+    fn backdate(path: &Path, secs: u64) {
+        let when = SystemTime::now() - std::time::Duration::from_secs(secs);
+        // A directory cannot be opened for writing, and does not need to be:
+        // `set_modified` is futimens, which only wants a handle.
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .or_else(|_| fs::File::open(path))
+            .unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn session_markers_can_never_arrive_by_copy() {
+        // This is what makes a fresh mtime mean "a session ran here". Copying
+        // stamps every file it writes with the current time, so a marker that
+        // any seed could copy would make a brand-new profile look occupied.
+        for marker in SESSION_ACTIVITY_MARKERS {
+            assert!(
+                SEED_SKIP_ALWAYS.contains(marker),
+                "'{marker}' is copyable, so `cswitch add` would look like a live session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_that_was_just_written_reads_as_maybe_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let dir = mgr.profile_dir("work");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session-env"), "live").unwrap();
+
+        assert!(mgr.seconds_since_session_write("work").unwrap() < 60);
+        assert!(mgr.maybe_in_use("work").is_some());
+    }
+
+    #[test]
+    fn a_profile_left_alone_past_the_window_is_not_in_use() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let dir = mgr.profile_dir("work");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session-env"), "done").unwrap();
+        backdate(&dir.join("session-env"), SESSION_ACTIVE_WINDOW_SECS + 60);
+
+        assert!(mgr.seconds_since_session_write("work").unwrap() > SESSION_ACTIVE_WINDOW_SECS);
+        assert!(mgr.maybe_in_use("work").is_none());
+    }
+
+    #[test]
+    fn the_most_recent_marker_wins() {
+        // Any one live marker means a session touched the profile, even if the
+        // others have been sitting untouched for hours.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let dir = mgr.profile_dir("work");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session-env"), "old").unwrap();
+        fs::write(dir.join("shell-snapshots"), "new").unwrap();
+        backdate(&dir.join("session-env"), 86_400);
+
+        assert!(mgr.maybe_in_use("work").is_some());
+    }
+
+    #[test]
+    fn a_profile_with_no_markers_reports_unknown_not_idle() {
+        // A profile can be warm, registered, and simply never launched. That is
+        // absence of evidence — callers must not render it as "safe".
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let dir = mgr.profile_dir("work");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".credentials.json"), "{}").unwrap();
+
+        assert_eq!(mgr.seconds_since_session_write("work"), None);
+        assert_eq!(mgr.maybe_in_use("work"), None);
+    }
+
+    #[test]
+    fn a_missing_profile_directory_reports_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        assert_eq!(mgr.seconds_since_session_write("never-existed"), None);
+    }
+
+    #[test]
+    fn a_rewritten_file_inside_a_marker_directory_still_counts() {
+        // A directory's own mtime moves only when entries are added or removed.
+        // Consulting it alone would call an actively-writing session idle.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let sessions = mgr.profile_dir("work").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("current.jsonl"), "turn").unwrap();
+        backdate(&sessions, 86_400);
+
+        let dir_only = fs::metadata(&sessions).unwrap().modified().unwrap();
+        let seen = newest_write(&sessions).unwrap();
+        assert!(seen > dir_only, "must look past the directory's own mtime");
+        assert!(mgr.maybe_in_use("work").is_some());
+    }
+
+    #[test]
+    fn describe_age_reads_as_a_sentence() {
+        assert_eq!(describe_age(3), "seconds ago");
+        assert_eq!(describe_age(90), "seconds ago");
+        assert_eq!(describe_age(240), "4 min ago");
+        assert_eq!(describe_age(7_200), "2 h ago");
     }
 }
