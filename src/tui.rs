@@ -1,14 +1,14 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    DefaultTerminal, Frame,
 };
 
-use crate::profile::{describe_age, detect_current_account, Profile, ProfileManager};
+use crate::profile::{Profile, ProfileManager, describe_age, detect_current_account};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -142,11 +142,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| {
                     p.name.to_lowercase().contains(&q)
-                        || p.email
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&q)
+                        || p.email.as_deref().unwrap_or("").to_lowercase().contains(&q)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -283,11 +279,7 @@ impl App {
     /// Tear the TUI down, run `action` against the real terminal, then rebuild
     /// the TUI and carry on. Errors are shown in-app rather than propagated —
     /// a cancelled or failed login must not take the whole program down with it.
-    fn run_pending(
-        &mut self,
-        action: PendingAction,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<()> {
+    fn run_pending(&mut self, action: PendingAction, terminal: &mut DefaultTerminal) -> Result<()> {
         ratatui::restore();
 
         // `select` is only set when a profile actually landed in the registry,
@@ -304,7 +296,11 @@ impl App {
                             .collect();
 
                         let msg = if others.is_empty() {
-                            format!("Profile '{}' logged in as {}.", name, result.display_email())
+                            format!(
+                                "Profile '{}' logged in as {}.",
+                                name,
+                                result.display_email()
+                            )
                         } else {
                             // Not an error: two profiles for one account is a
                             // valid setup. But say it, or it reads as a new one.
@@ -337,11 +333,7 @@ impl App {
 
     // ── Key handlers ──────────────────────────────────────────────────────────
 
-    fn handle_first_run_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_first_run_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -403,11 +395,7 @@ impl App {
         Ok(false)
     }
 
-    fn handle_normal_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_normal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
@@ -495,11 +483,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_search_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -816,11 +800,17 @@ impl App {
                 Style::default().fg(DIM),
             )),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(SUCCESS).bold()),
-                Span::styled("Claude Code installation detected", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "Claude Code installation detected",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -828,9 +818,15 @@ impl App {
                 Span::styled(email, Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  Set up your first profile:", Style::default().fg(TEXT))),
+            Line::from(Span::styled(
+                "  Set up your first profile:",
+                Style::default().fg(TEXT),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Profile name   ", Style::default().fg(DIM)),
@@ -842,19 +838,34 @@ impl App {
                 Span::styled(dest, Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [1] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Copy active session as this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Copy active session as this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Uses your existing credentials — no re-login needed", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Uses your existing credentials — no re-login needed",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [2] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Login to a different account for this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Login to a different account for this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Opens Claude for you to authenticate a new account", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Opens Claude for you to authenticate a new account",
+                Style::default().fg(DIM),
+            )),
         ]
     }
 
@@ -866,14 +877,23 @@ impl App {
                 Span::styled("claude-switch", Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✗ ", Style::default().fg(DANGER).bold()),
-                Span::styled("No Claude Code installation found at ~/.claude", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "No Claude Code installation found at ~/.claude",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  You need to install and log in to Claude Code before adding profiles.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  You need to install and log in to Claude Code before adding profiles.",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Install   ", Style::default().fg(DIM)),
@@ -891,7 +911,10 @@ impl App {
                 Span::styled("claude", Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Then re-run cswitch to set up your first profile.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  Then re-run cswitch to set up your first profile.",
+                Style::default().fg(DIM),
+            )),
         ]
     }
 
@@ -1066,7 +1089,10 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Config dir   ", Style::default().fg(DIM)),
-                Span::styled(profile_dir.display().to_string(), Style::default().fg(MUTED)),
+                Span::styled(
+                    profile_dir.display().to_string(),
+                    Style::default().fg(MUTED),
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -1077,7 +1103,10 @@ impl App {
             Line::from(Span::styled("  Launch command", Style::default().fg(DIM))),
             Line::from(Span::styled(
                 if cfg!(target_os = "windows") {
-                    format!("  $env:CLAUDE_CONFIG_DIR='{}'; claude", profile_dir.display())
+                    format!(
+                        "  $env:CLAUDE_CONFIG_DIR='{}'; claude",
+                        profile_dir.display()
+                    )
                 } else {
                     format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
                 },
@@ -1085,10 +1114,7 @@ impl App {
             )),
         ];
 
-        f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -1099,11 +1125,7 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let keys: Vec<(&str, &str)> = if self.mode == Mode::Search {
-            vec![
-                ("↑/↓", "navigate"),
-                ("enter", "confirm"),
-                ("esc", "clear"),
-            ]
+            vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
         } else {
             vec![
                 ("↑↓/jk", "nav"),
@@ -1129,10 +1151,7 @@ impl App {
             })
             .collect();
 
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).block(block),
-            area,
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     // ── Overlay popups ────────────────────────────────────────────────────────
@@ -1223,7 +1242,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1316,7 +1338,10 @@ impl App {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  [l] ", Style::default().fg(ACCENT).bold()),
-                    Span::styled("Log in to a different Claude account", Style::default().fg(TEXT)),
+                    Span::styled(
+                        "Log in to a different Claude account",
+                        Style::default().fg(TEXT),
+                    ),
                 ]),
                 Line::from(Span::styled(
                     "      Opens Claude's login. Sign out of claude.ai first,",
@@ -1403,7 +1428,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1531,8 +1559,7 @@ mod tests {
     /// An App wired to a manager that cannot reach the real `~/.claude-switch`,
     /// with the live-account probe stubbed out.
     fn make_app(tmp: &TempDir, existing: &[(&str, Option<&str>)]) -> App {
-        let manager =
-            ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
+        let manager = ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
 
         for (name, email) in existing {
             let mut registry = manager.load_registry().unwrap();
@@ -1572,7 +1599,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
         assert!(app.input_buffer.is_empty());
@@ -1669,7 +1697,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
         // Login must not register anything until Claude has authenticated.
         assert!(app.manager.load_registry().unwrap().profiles.is_empty());
@@ -1702,7 +1732,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
     }
 
@@ -1718,7 +1750,10 @@ mod tests {
         app.handle_add_choice(KeyCode::Esc).unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
-        assert_eq!(app.input_buffer, "business", "the typed name should survive");
+        assert_eq!(
+            app.input_buffer, "business",
+            "the typed name should survive"
+        );
         assert!(app.pending.is_none());
     }
 
@@ -1770,7 +1805,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::LoginName);
     }
@@ -1788,7 +1824,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
     }
 
@@ -1904,7 +1942,11 @@ mod tests {
         app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
 
         assert!(
-            !app.manager.load_registry().unwrap().profiles.contains_key("business"),
+            !app.manager
+                .load_registry()
+                .unwrap()
+                .profiles
+                .contains_key("business"),
             "confirming must still delete"
         );
     }

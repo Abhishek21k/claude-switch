@@ -3,7 +3,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use profile::{detect_current_account, LoginOutcome, ProfileManager};
+use profile::{LoginOutcome, ProfileManager, detect_current_account};
 use std::io::{self, Write};
 
 #[derive(Parser)]
@@ -117,11 +117,19 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Add { name, force, include_history }) => {
+        Some(Commands::Add {
+            name,
+            force,
+            include_history,
+        }) => {
             handle_add(&manager, &name, force, include_history)?;
         }
 
-        Some(Commands::Login { name, include_history, email }) => {
+        Some(Commands::Login {
+            name,
+            include_history,
+            email,
+        }) => {
             let outcome = manager.login_profile(&name, include_history, email.as_deref())?;
             report_login(&name, &outcome);
         }
@@ -231,7 +239,11 @@ fn handle_add(
 /// say so plainly — the usual cause is a browser that was still signed in, and
 /// silently listing the email would look like a different account was added.
 fn report_login(name: &str, outcome: &LoginOutcome) {
-    println!("\nProfile '{}' registered (account: {}).", name, outcome.display_email());
+    println!(
+        "\nProfile '{}' registered (account: {}).",
+        name,
+        outcome.display_email()
+    );
 
     let others: Vec<&str> = outcome
         .same_account_as
@@ -246,7 +258,9 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
             others.join(", ")
         );
         println!("  If you meant to add a different account, sign out of claude.ai");
-        println!("  (or use a private window) and run: cswitch remove {name} && cswitch login {name}");
+        println!(
+            "  (or use a private window) and run: cswitch remove {name} && cswitch login {name}"
+        );
     }
 
     println!("\nLaunch with: cswitch use {}", name);
@@ -266,6 +280,13 @@ fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
                 return Ok(c);
             }
         }
-        println!("Please enter one of: {}", valid.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+        println!(
+            "Please enter one of: {}",
+            valid
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }

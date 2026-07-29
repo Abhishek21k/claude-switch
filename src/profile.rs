@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -62,7 +62,11 @@ impl ProfileManager {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;
-        Ok(Self { base_dir, profiles_dir, registry_path })
+        Ok(Self {
+            base_dir,
+            profiles_dir,
+            registry_path,
+        })
     }
 
     // ── Registry I/O ─────────────────────────────────────────────────────────
@@ -134,12 +138,7 @@ impl ProfileManager {
     /// Copy the extra files that live outside `~/.claude/`:
     /// 1. `~/.claude.json` (home root — has oauthAccount metadata)
     /// 2. macOS Keychain credentials → `.credentials.json`
-    fn copy_extra_credentials(
-        &self,
-        home: &Path,
-        name: &str,
-        profile: &mut Profile,
-    ) -> Result<()> {
+    fn copy_extra_credentials(&self, home: &Path, name: &str, profile: &mut Profile) -> Result<()> {
         let dest = self.profile_dir(name);
 
         // 1. Copy ~/.claude.json from home root (contains oauthAccount w/ email)
@@ -293,11 +292,17 @@ impl ProfileManager {
         };
 
         if seeded {
-            println!("Seeded '{}' from your current setup (settings, skills, project trust).", name);
+            println!(
+                "Seeded '{}' from your current setup (settings, skills, project trust).",
+                name
+            );
             println!("Conversation history and session transcripts were not copied.\n");
         }
 
-        println!("Opening your browser — sign in as the account for profile '{}'.", name);
+        println!(
+            "Opening your browser — sign in as the account for profile '{}'.",
+            name
+        );
         // The OAuth grant follows the *browser's* claude.ai session, not this
         // directory. A signed-in browser authorises that account with no picker,
         // which is precisely how a "new" profile ends up cloning the old one.
@@ -368,7 +373,10 @@ impl ProfileManager {
         };
         self.upsert_profile(profile)?;
 
-        Ok(LoginOutcome { email, same_account_as })
+        Ok(LoginOutcome {
+            email,
+            same_account_as,
+        })
     }
 
     /// Names of already-registered profiles authenticated as `email`.
@@ -507,13 +515,20 @@ impl ProfileManager {
             if force {
                 fs::remove_dir_all(&dest)?;
             } else {
-                bail!("Profile '{}' already exists. Use --force to overwrite.", name);
+                bail!(
+                    "Profile '{}' already exists. Use --force to overwrite.",
+                    name
+                );
             }
         }
         copy_dir_all_filtered(src, &dest, &seed_skip(include_history))?;
         let email = read_email_from_dir(&dest);
-        let profile =
-            Profile { name: name.to_string(), email, added: Utc::now(), last_used: None };
+        let profile = Profile {
+            name: name.to_string(),
+            email,
+            added: Utc::now(),
+            last_used: None,
+        };
         self.upsert_profile(profile.clone())?;
         Ok(profile)
     }
@@ -545,8 +560,7 @@ pub fn detect_current_account() -> Option<DetectedAccount> {
         return None;
     }
     // Try ~/.claude/ first, then fallback to ~/.claude.json at home root
-    let email = read_email_from_dir(&config_dir)
-        .or_else(|| read_email_from_home_root(&home));
+    let email = read_email_from_dir(&config_dir).or_else(|| read_email_from_home_root(&home));
     Some(DetectedAccount { email, config_dir })
 }
 
@@ -814,7 +828,12 @@ fn extract_platform_credentials() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn extract_macos_keychain() -> Option<String> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -945,7 +964,11 @@ mod tests {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir).unwrap();
-        ProfileManager { base_dir, profiles_dir, registry_path }
+        ProfileManager {
+            base_dir,
+            profiles_dir,
+            registry_path,
+        }
     }
 
     /// Populate a fake `~/.claude` directory with the two files Claude Code
@@ -1061,7 +1084,10 @@ mod tests {
 
         assert_eq!(fs::read_to_string(dst.join("root.txt")).unwrap(), "root");
         assert_eq!(fs::read_to_string(dst.join("sub/mid.txt")).unwrap(), "mid");
-        assert_eq!(fs::read_to_string(dst.join("sub/deep/leaf.txt")).unwrap(), "leaf");
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/deep/leaf.txt")).unwrap(),
+            "leaf"
+        );
     }
 
     // ── Registry I/O ──────────────────────────────────────────────────────────
@@ -1093,7 +1119,10 @@ mod tests {
 
         let loaded = mgr.load_registry().unwrap();
         assert_eq!(loaded.profiles.len(), 1);
-        assert_eq!(loaded.profiles["work"].email.as_deref(), Some("work@acme.com"));
+        assert_eq!(
+            loaded.profiles["work"].email.as_deref(),
+            Some("work@acme.com")
+        );
         assert!(loaded.profiles["work"].last_used.is_none());
     }
 
@@ -1109,7 +1138,10 @@ mod tests {
 
         let dest = mgr.profile_dir("work");
         assert!(dest.join(".claude.json").exists(), ".claude.json missing");
-        assert!(dest.join(".credentials.json").exists(), ".credentials.json missing");
+        assert!(
+            dest.join(".credentials.json").exists(),
+            ".credentials.json missing"
+        );
     }
 
     #[test]
@@ -1185,7 +1217,10 @@ mod tests {
         mgr.add_profile_from_force("slot", &src2).unwrap();
 
         let reg = mgr.load_registry().unwrap();
-        assert_eq!(reg.profiles["slot"].email.as_deref(), Some("second@test.com"));
+        assert_eq!(
+            reg.profiles["slot"].email.as_deref(),
+            Some("second@test.com")
+        );
         // Old files replaced
         let content = fs::read_to_string(mgr.profile_dir("slot").join(".claude.json")).unwrap();
         assert!(content.contains("second@test.com"));
@@ -1241,7 +1276,12 @@ mod tests {
         mgr.remove_profile("to-delete").unwrap();
 
         assert!(!mgr.profile_dir("to-delete").exists());
-        assert!(!mgr.load_registry().unwrap().profiles.contains_key("to-delete"));
+        assert!(
+            !mgr.load_registry()
+                .unwrap()
+                .profiles
+                .contains_key("to-delete")
+        );
     }
 
     #[test]
@@ -1334,12 +1374,19 @@ mod tests {
     fn profiles_with_email_finds_every_profile_on_that_account() {
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
-        for (name, email) in [("work", "same@x.com"), ("solo", "same@x.com"), ("alt", "other@x.com")] {
+        for (name, email) in [
+            ("work", "same@x.com"),
+            ("solo", "same@x.com"),
+            ("alt", "other@x.com"),
+        ] {
             let src = make_claude_dir(&tmp.path().join(name), email);
             mgr.add_profile_from(name, &src).unwrap();
         }
 
-        assert_eq!(mgr.profiles_with_email("same@x.com").unwrap(), vec!["solo", "work"]);
+        assert_eq!(
+            mgr.profiles_with_email("same@x.com").unwrap(),
+            vec!["solo", "work"]
+        );
         assert_eq!(mgr.profiles_with_email("other@x.com").unwrap(), vec!["alt"]);
     }
 
@@ -1350,7 +1397,10 @@ mod tests {
         let src = make_claude_dir(&tmp.path().join("work"), "Me@Example.COM");
         mgr.add_profile_from("work", &src).unwrap();
 
-        assert_eq!(mgr.profiles_with_email("  me@example.com ").unwrap(), vec!["work"]);
+        assert_eq!(
+            mgr.profiles_with_email("  me@example.com ").unwrap(),
+            vec!["work"]
+        );
     }
 
     #[test]
@@ -1386,7 +1436,10 @@ mod tests {
 
         abort_login(&staged, true);
 
-        assert!(!staged.exists(), "a staged dir must not survive a failed login");
+        assert!(
+            !staged.exists(),
+            "a staged dir must not survive a failed login"
+        );
     }
 
     #[test]
@@ -1417,7 +1470,10 @@ mod tests {
         assert!(mgr.login_profile("keep", false, None).is_err());
 
         assert_eq!(fs::read(&creds).unwrap(), before);
-        assert_eq!(fs::read_to_string(&mgr.registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read_to_string(&mgr.registry_path).unwrap(),
+            registry_before
+        );
     }
 
     #[test]
@@ -1451,7 +1507,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(read_email_from_home_root(root), Some("root@test.com".into()));
+        assert_eq!(
+            read_email_from_home_root(root),
+            Some("root@test.com".into())
+        );
     }
 
     #[test]
@@ -1487,9 +1546,18 @@ mod tests {
         let dst = tmp.path().join("dst");
         copy_dir_all_filtered(&src, &dst, &seed_skip(false)).unwrap();
 
-        assert!(!dst.join("projects").exists(), "transcripts must not be copied");
-        assert!(!dst.join("history.jsonl").exists(), "prompt history must not be copied");
-        assert!(dst.join("settings.json").exists(), "settings must be copied");
+        assert!(
+            !dst.join("projects").exists(),
+            "transcripts must not be copied"
+        );
+        assert!(
+            !dst.join("history.jsonl").exists(),
+            "prompt history must not be copied"
+        );
+        assert!(
+            dst.join("settings.json").exists(),
+            "settings must be copied"
+        );
         assert!(dst.join("skills/a.md").exists(), "skills must be copied");
     }
 
@@ -1574,8 +1642,14 @@ mod tests {
         let dst = tmp.path().join("dst");
         copy_dir_all_filtered(&src, &dst, &seed_skip(true)).unwrap();
 
-        assert!(dst.join("projects/t.jsonl").exists(), "opt-in keeps transcripts");
-        assert!(dst.join("history.jsonl").exists(), "opt-in keeps prompt history");
+        assert!(
+            dst.join("projects/t.jsonl").exists(),
+            "opt-in keeps transcripts"
+        );
+        assert!(
+            dst.join("history.jsonl").exists(),
+            "opt-in keeps prompt history"
+        );
         assert!(
             !dst.join("shell-snapshots").exists(),
             "machine-local state is skipped under every flag"
@@ -1601,7 +1675,10 @@ mod tests {
         assert!(!dest.join("history.jsonl").exists());
         // ...while the things that make a profile warm are still there.
         assert!(dest.join(".claude.json").exists());
-        assert!(dest.join(".credentials.json").exists(), "add keeps the same account logged in");
+        assert!(
+            dest.join(".credentials.json").exists(),
+            "add keeps the same account logged in"
+        );
     }
 
     // ── Live-session detection ────────────────────────────────────────────────
@@ -1731,7 +1808,10 @@ mod tests {
 
         let copied = mgr.profile_dir("work").join("skills/checkpoint");
         assert!(copied.is_symlink(), "the link must stay a link");
-        assert_eq!(fs::read_to_string(copied.join("SKILL.md")).unwrap(), "# checkpoint");
+        assert_eq!(
+            fs::read_to_string(copied.join("SKILL.md")).unwrap(),
+            "# checkpoint"
+        );
     }
 
     #[test]
@@ -1748,14 +1828,20 @@ mod tests {
         fs::write(repo_skill.join("SKILL.md"), "linked").unwrap();
         fs::create_dir_all(src.join("skills")).unwrap();
         // Relative to the link's own directory, `<tmp>/fake/skills/`.
-        std::os::unix::fs::symlink("../../repo/skills/checkpoint", src.join("skills/checkpoint"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            "../../repo/skills/checkpoint",
+            src.join("skills/checkpoint"),
+        )
+        .unwrap();
 
         mgr.add_profile_from("work", &src).unwrap();
 
         let copied = mgr.profile_dir("work").join("skills/checkpoint");
         assert!(fs::read_link(&copied).unwrap().is_absolute());
-        assert_eq!(fs::read_to_string(copied.join("SKILL.md")).unwrap(), "linked");
+        assert_eq!(
+            fs::read_to_string(copied.join("SKILL.md")).unwrap(),
+            "linked"
+        );
     }
 
     #[test]
