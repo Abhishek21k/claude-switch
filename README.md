@@ -109,7 +109,7 @@ Run `cswitch` with no arguments to open the TUI.
 | `a` | Add account — enter a name, then choose copy or login |
 | `l` | Login — shortcut straight to a different account |
 | `r` | Refresh — overwrite the selected profile with the current session (confirmed) |
-| `d` | Delete selected profile |
+| `d` | Delete selected profile (confirmed) |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |
 
@@ -132,6 +132,27 @@ cswitch login business   # or press `a`, then [l]
 ```
 
 The new profile is seeded with your warm setup (settings, skills, project trust), then every trace of the old account is stripped so Claude has to authenticate from scratch.
+
+### What carries over — and what doesn't
+
+A profile is a copy of your **config directory**. That boundary decides everything:
+
+| | Carries over |
+|---|---|
+| Settings (`settings.json`) | Yes |
+| **User-level** skills — `~/.claude/skills/` | Yes |
+| Project trust and onboarding state | Yes |
+| MCP server **definitions** | Yes |
+| **Project-level** skills — `<your-repo>/.claude/skills/` | **No** — they belong to the repo, not the config directory |
+| MCP **authorizations** (OAuth) | **No** — a grant belongs to the account that gave it |
+| Conversation history and transcripts | No, unless you pass `--include-history` |
+
+Anything you've **symlinked** into `~/.claude` stays a symlink in the profile, pointing at the same place — so a skill linked out of a repository keeps tracking that repository from every profile, instead of each profile freezing its own stale copy.
+
+Two consequences worth expecting:
+
+- **A server like Whimsical will ask you to authenticate again.** The server definition copied fine; the new account has simply never authorised it. That is correct behavior, not lost configuration.
+- **Skills that live in a repo stay with that repo.** `CLAUDE_CONFIG_DIR` does not relocate a project's `.claude/skills/`, so those load from wherever you launch Claude, identically under every profile. If a skill seems to have gone missing after a switch, check which of the two kinds it is before suspecting the profile.
 
 ### The browser decides which account you get
 
@@ -200,7 +221,7 @@ Nothing in your original `~/.claude` is modified. Profiles are fully isolated fr
 
 ## Running multiple accounts simultaneously
 
-Open separate terminals and run different profiles in each:
+Switching is not the only mode — profiles run **at the same time**. `CLAUDE_CONFIG_DIR` is read per process, so each terminal is bound to whichever profile launched it, for as long as it lives:
 
 ```bash
 # Terminal 1
@@ -210,7 +231,20 @@ cswitch use work
 cswitch use personal
 ```
 
-Both run independently with their own credentials and config.
+Both run independently with their own credentials, settings, and MCP servers. You can keep a work session and a personal session open side by side, in the same repository, indefinitely. Shell aliases (`cswitch aliases`) work the same way.
+
+### One thing to watch
+
+The profile list is shared, but a running session is not: `r` (refresh) and `d` (delete) act on files another terminal may have open right now. Refreshing a profile mid-session replaces its credentials underneath a live login; deleting one removes the config directory that session is reading from.
+
+`cswitch` checks for this. When a profile was written to recently, the confirmation turns red and says so:
+
+```
+  In use? Written 4 min ago by a Claude session.
+  Another terminal may have this profile open right now.
+```
+
+It is a warning, not a block — `cswitch` can see that a session wrote to the profile, not whether that terminal is still open. If you know it is closed, go ahead.
 
 ## License
 
