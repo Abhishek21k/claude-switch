@@ -283,6 +283,18 @@ impl ProfileManager {
             .filter(|secs| *secs <= SESSION_ACTIVE_WINDOW_SECS)
     }
 
+    /// Whether this profile has accumulated conversation content of its own.
+    ///
+    /// A refresh replaces the directory wholesale and reseeds without history,
+    /// so anything here is destroyed. That is worth saying out loud: unlike
+    /// credentials, transcripts cannot be recovered by logging in again.
+    pub fn has_local_history(&self, name: &str) -> bool {
+        let dir = self.profile_dir(name);
+        SEED_SKIP_HISTORY
+            .iter()
+            .any(|entry| dir.join(entry).exists())
+    }
+
     /// Launch `claude` with `CLAUDE_CONFIG_DIR` pointed at the named profile.
     pub fn launch_claude(&self, name: &str, args: &[OsString]) -> Result<()> {
         let preparation = self.prepare_launch(name)?;
@@ -774,6 +786,8 @@ pub fn detect_current_account() -> Option<DetectedAccount> {
 const SEED_SKIP_HISTORY: &[&str] = &[
     "projects",      // session transcripts (NOT the .claude.json "projects" key)
     "history.jsonl", // every prompt ever typed
+    "transcripts",   // ses_*.jsonl — verbatim prompts, tool calls and results
+    "plans",         // plan-mode documents, written from conversation
     "file-history",
     "todos",
 ];
@@ -795,6 +809,9 @@ const SEED_SKIP_ALWAYS: &[&str] = &[
     "cache",
     "ide",
     "statsig",
+    "debug",            // debug logs for this machine's sessions
+    "usage-data",       // per-account token accounting
+    "stats-cache.json", // per-day message and tool-call counts
 ];
 
 /// Build the skip list for a seed operation.
@@ -1778,6 +1795,59 @@ mod tests {
         copy_dir_all_filtered(&src, &dst, &[]).unwrap();
 
         assert!(dst.join("projects/t.jsonl").exists());
+    }
+
+    #[test]
+    fn every_directory_holding_conversation_content_is_skipped_by_default() {
+        // `projects` alone is not the whole of it. Claude also writes verbatim
+        // transcripts to `transcripts/` and plan-mode documents to `plans/`,
+        // and a profile seeded for a *different account* must not inherit
+        // either — that is the entire point of seeding without history.
+        for dir in ["projects", "transcripts", "plans", "history.jsonl"] {
+            assert!(
+                seed_skip(false).contains(&dir),
+                "'{dir}' holds conversation content and must not be copied by default"
+            );
+            assert!(
+                !seed_skip(true).contains(&dir),
+                "'{dir}' must come back under --include-history"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_content_does_not_reach_a_seeded_profile() {
+        // The list above is only worth as much as the copy that honours it.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("fake-claude"), "old@test.com");
+
+        fs::create_dir_all(src.join("transcripts")).unwrap();
+        fs::write(
+            src.join("transcripts").join("ses_abc.jsonl"),
+            r#"{"type":"user","content":"a private prompt"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(src.join("plans")).unwrap();
+        fs::write(src.join("plans").join("plan.md"), "# secret plan").unwrap();
+
+        mgr.add_profile_from("work", &src).unwrap();
+        let dest = mgr.profile_dir("work");
+
+        assert!(!dest.join("transcripts").exists(), "transcripts leaked");
+        assert!(!dest.join("plans").exists(), "plans leaked");
+    }
+
+    #[test]
+    fn usage_accounting_is_never_copied() {
+        // Per-account token accounting and activity counts describe the source
+        // account, not the profile — stale at best, misleading at worst.
+        for entry in ["usage-data", "stats-cache.json", "debug"] {
+            assert!(
+                seed_skip(true).contains(&entry),
+                "'{entry}' must be skipped even with --include-history"
+            );
+        }
     }
 
     #[test]
