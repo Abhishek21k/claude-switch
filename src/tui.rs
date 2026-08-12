@@ -69,6 +69,11 @@ pub struct App {
     /// opens, because profiles run concurrently and the one being overwritten
     /// may be open in another terminal.
     selected_in_use: Option<u64>,
+    /// Whether the selected profile holds conversation content that a refresh
+    /// would destroy. Resolved alongside `selected_in_use`, for the same
+    /// reason: the confirmation should name every consequence, not just the
+    /// credential one.
+    selected_has_history: bool,
     pending: Option<PendingAction>,
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
@@ -111,6 +116,7 @@ impl App {
             claude_dir_found,
             current_account: None,
             selected_in_use: None,
+            selected_has_history: false,
             pending: None,
             account_probe: live_account_email,
         })
@@ -179,6 +185,15 @@ impl App {
     fn selected_session_age(&self) -> Option<u64> {
         let name = self.selected_profile()?.name.clone();
         self.manager.maybe_in_use(&name)
+    }
+
+    /// Whether the selected profile has conversation content a refresh would
+    /// destroy.
+    fn selected_holds_history(&self) -> bool {
+        match self.selected_profile() {
+            Some(p) => self.manager.has_local_history(&p.name),
+            None => false,
+        }
     }
 
     fn move_up(&mut self) {
@@ -446,6 +461,7 @@ impl App {
             KeyCode::Char('r') if self.selected_profile().is_some() => {
                 self.current_account = (self.account_probe)();
                 self.selected_in_use = self.selected_session_age();
+                self.selected_has_history = self.selected_holds_history();
                 self.mode = Mode::ConfirmRefresh;
             }
 
@@ -1378,12 +1394,14 @@ impl App {
             .map(|c| !c.eq_ignore_ascii_case(&profile_email))
             .unwrap_or(true);
         // Overwriting a profile another terminal is using is its own hazard,
-        // independent of which account it holds.
-        let color = if replaces_account || self.selected_in_use.is_some() {
-            DANGER
-        } else {
-            ACCENT
-        };
+        // independent of which account it holds — as is destroying history,
+        // which happens even on a same-account refresh.
+        let color =
+            if replaces_account || self.selected_in_use.is_some() || self.selected_has_history {
+                DANGER
+            } else {
+                ACCENT
+            };
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1436,6 +1454,21 @@ impl App {
             )));
             lines.push(Line::from(Span::styled(
                 "  Another terminal may have this profile open right now.",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        // A refresh reseeds without history, so whatever this profile has
+        // accumulated goes with it. Credentials can be logged in again;
+        // transcripts cannot be recovered at all.
+        if self.selected_has_history {
+            lines.push(Line::from(Span::styled(
+                "  This profile's conversation history will be deleted.",
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Transcripts and prompt history cannot be recovered.",
                 Style::default().fg(DANGER),
             )));
             lines.push(Line::from(""));
@@ -1887,6 +1920,60 @@ mod tests {
         let dir = app.manager.profile_dir(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("session-env"), "live").unwrap();
+    }
+
+    /// Give a profile the conversation content a refresh would destroy.
+    fn mark_has_history(app: &App, name: &str) {
+        let dir = app.manager.profile_dir(name).join("transcripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ses_abc.jsonl"), "{}").unwrap();
+    }
+
+    #[test]
+    fn refreshing_a_profile_holding_history_says_it_will_be_destroyed() {
+        // A refresh reseeds without history, so this is a one-way loss — and
+        // it happens even when the account is unchanged, which is exactly the
+        // case the account comparison alone reports as safe.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+        mark_has_history(&app, "business");
+
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert_eq!(app.mode, Mode::ConfirmRefresh);
+        assert!(
+            app.selected_has_history,
+            "history that the refresh will delete must be reported"
+        );
+    }
+
+    #[test]
+    fn refreshing_a_profile_without_history_reports_nothing_to_lose() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert!(
+            !app.selected_has_history,
+            "a profile with no transcripts must not claim a loss"
+        );
+    }
+
+    #[test]
+    fn the_history_warning_does_not_change_the_confirmation_keys() {
+        // Advises, does not block — same contract as the in-use warning.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);
+        mark_has_history(&app, "business");
+
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        app.handle_confirm_refresh(KeyCode::Esc).unwrap();
+
+        assert_eq!(app.mode, Mode::Normal, "Esc must still cancel");
     }
 
     #[test]
