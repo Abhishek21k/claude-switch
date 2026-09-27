@@ -1,18 +1,22 @@
 mod profile;
+mod skills_sync;
 mod tui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use profile::{LoginOutcome, ProfileManager, detect_current_account};
+use skills_sync::{SyncAction, SyncOptions, SyncReport};
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(
     name = "cswitch",
     about = "Multi-account profile manager for Claude Code",
     long_about = "Manage multiple Claude Code accounts using isolated config directories.\n\
-                  Each profile stores a complete ~/.claude snapshot and launches Claude\n\
-                  with CLAUDE_CONFIG_DIR set — no credential swapping, no side effects.",
+                  Each profile keeps its own credentials and settings, links shared skills,\n\
+                  and launches Claude with CLAUDE_CONFIG_DIR set.",
     version,
     after_help = "\
 Quick start:
@@ -25,6 +29,26 @@ Quick start:
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    fn try_parse_from<I, T>(input: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let raw: Vec<OsString> = input.into_iter().map(Into::into).collect();
+        let mut cli = <Self as Parser>::try_parse_from(raw.clone())?;
+        if let Some(Commands::Use { args, .. }) = &mut cli.command {
+            // Clap consumes the `--` separator. Claude must receive it as typed.
+            if let Some(use_index) = raw.iter().enumerate().skip(1).find_map(|(index, part)| {
+                if part == "use" { Some(index) } else { None }
+            }) {
+                *args = raw.iter().skip(use_index + 2).cloned().collect();
+            }
+        }
+        Ok(cli)
+    }
 }
 
 #[derive(Subcommand)]
@@ -69,12 +93,29 @@ enum Commands {
     },
 
     /// Launch Claude Code with a specific profile
+    #[command(disable_help_flag = true, disable_version_flag = true)]
     Use {
         /// Profile name to use
         name: String,
         /// Extra arguments passed directly to claude
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+
+    /// Link shared skills into one or all profiles
+    #[command(group(ArgGroup::new("target").required(true).args(["name", "all"])))]
+    Sync {
+        /// Profile name
+        name: Option<String>,
+        /// Sync every registered profile
+        #[arg(long)]
+        all: bool,
+        /// Preview changes without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Back up and replace a diverged skill
+        #[arg(long = "adopt")]
+        adopt: Vec<String>,
     },
 
     /// Show details for a specific profile
@@ -88,7 +129,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let manager = ProfileManager::new()?;
 
     match cli.command {
@@ -146,6 +187,31 @@ fn main() -> Result<()> {
             manager.launch_claude(&name, &args)?;
         }
 
+        Some(Commands::Sync {
+            name,
+            all,
+            dry_run,
+            adopt,
+        }) => {
+            let opts = SyncOptions { dry_run, adopt };
+            let names = if all {
+                manager
+                    .list_profiles()?
+                    .into_iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![name.expect("clap requires a name or --all")]
+            };
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+            let (output, failed) = sync_profile_blocks(&manager, &names, &opts, &home, all)?;
+            print!("{output}");
+            if failed {
+                std::process::exit(1);
+            }
+        }
+
         Some(Commands::Info { name }) => match manager.get_profile(&name) {
             Ok(p) => {
                 let dir = manager.profile_dir(&p.name);
@@ -161,7 +227,7 @@ fn main() -> Result<()> {
                 println!("Directory: {}", dir.display());
                 println!();
                 println!("Launch:");
-                println!("  CLAUDE_CONFIG_DIR='{}' claude", dir.display());
+                println!("  cswitch use {}", p.name);
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -175,6 +241,126 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn sync_profile_blocks(
+    manager: &ProfileManager,
+    names: &[String],
+    opts: &SyncOptions,
+    home: &Path,
+    all: bool,
+) -> Result<(String, bool)> {
+    let mut output = String::new();
+    let mut failed = false;
+    for name in names {
+        match manager.sync_skills(name, opts) {
+            Ok(report) => {
+                output.push_str(&format_sync_report(name, &report, opts.dry_run, home));
+                failed |= report.has_failures();
+            }
+            Err(error) if all => {
+                output.push_str(&sync_header(name, opts.dry_run));
+                output.push_str(&format!("\n  error: {error}\n"));
+                failed = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((output, failed))
+}
+
+fn sync_header(name: &str, dry_run: bool) -> String {
+    if dry_run {
+        format!("{name} (dry run):")
+    } else {
+        format!("{name}:")
+    }
+}
+
+fn format_sync_report(name: &str, report: &SyncReport, dry_run: bool, home: &Path) -> String {
+    let mut counts = [0usize; 9];
+    let mut rows = Vec::<(&str, &str, Option<String>)>::new();
+    for entry in &report.entries {
+        let skill = &entry.name;
+        let (index, label, detail) = match &entry.action {
+            SyncAction::Linked => (0, if dry_run { "would link" } else { "linked" }, None),
+            SyncAction::AlreadyLinked => {
+                counts[1] += 1;
+                continue;
+            }
+            SyncAction::Migrated { backup } => (
+                2,
+                if dry_run { "would migrate" } else { "migrated" },
+                Some(format!("backup: {}", pretty_path(backup, home))),
+            ),
+            SyncAction::Adopted { backup } => (
+                3,
+                if dry_run { "would adopt" } else { "adopted" },
+                Some(format!("backup: {}", pretty_path(backup, home))),
+            ),
+            SyncAction::Diverged => (
+                4,
+                "diverged",
+                Some(format!(
+                    "differs from {}; keep it, or run: cswitch sync {name} --adopt {skill}",
+                    pretty_path(&home.join(".claude/skills").join(skill), home)
+                )),
+            ),
+            SyncAction::ForeignLink { target } => (
+                5,
+                "foreign link",
+                Some(format!("-> {}", pretty_path(target, home))),
+            ),
+            SyncAction::RemovedDangling => (
+                6,
+                if dry_run { "would remove" } else { "removed" },
+                Some("dangling link into ~/.claude/skills".to_string()),
+            ),
+            SyncAction::ProfileOnly => (7, "profile-only", None),
+            SyncAction::Failed { error } => (8, "FAILED", Some(error.clone())),
+        };
+        counts[index] += 1;
+        rows.push((label, skill, detail));
+    }
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_width = rows
+        .iter()
+        .map(|(_, skill, _)| skill.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![sync_header(name, dry_run)];
+    for (label, skill, detail) in rows {
+        lines.push(match detail {
+            Some(detail) => {
+                format!("  {label:<label_width$}  {skill:<name_width$}  {detail}")
+            }
+            None => format!("  {label:<label_width$}  {skill}"),
+        });
+    }
+    lines.push(format!(
+        "  counts: linked {}, already linked {}, migrated {}, adopted {}, diverged {}, foreign link {}, removed {}, profile-only {}, failed {}",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        counts[6],
+        counts[7],
+        counts[8]
+    ));
+    lines.join("\n") + "\n"
+}
+
+fn pretty_path(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// Smart add: detects an active Claude session and asks the user whether to
@@ -288,5 +474,189 @@ fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills_sync::SyncEntry;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn use_args(input: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(input).unwrap();
+        let Some(Commands::Use { name, args }) = cli.command else {
+            panic!("expected use command");
+        };
+        assert_eq!(name, "personal");
+        args.into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn use_passes_resume_flag_and_optional_id() {
+        // Clap must not claim Claude's resume flag as a cswitch option.
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--resume"]),
+            ["--resume"]
+        );
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--resume", "session-id"]),
+            ["--resume", "session-id"]
+        );
+    }
+
+    #[test]
+    fn use_passes_short_continue_flag() {
+        // Treating -c as a cswitch option would consume Claude's flag.
+        assert_eq!(use_args(&["cswitch", "use", "personal", "-c"]), ["-c"]);
+    }
+
+    #[test]
+    fn use_passes_prompt_model_and_permission_flags() {
+        // Parsing these as cswitch options would drop Claude's flag values.
+        assert_eq!(
+            use_args(&[
+                "cswitch",
+                "use",
+                "personal",
+                "-p",
+                "two words",
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions",
+            ]),
+            [
+                "-p",
+                "two words",
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions"
+            ]
+        );
+    }
+
+    #[test]
+    fn use_passes_double_dash_verbatim() {
+        // Clap normally consumes its own argument separator.
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--", "-p", "two words"]),
+            ["--", "-p", "two words"]
+        );
+    }
+
+    #[test]
+    fn use_passes_help_short_help_and_version_to_claude() {
+        // Default help and version handlers would exit cswitch first.
+        for flag in ["--help", "-h", "--version"] {
+            assert_eq!(use_args(&["cswitch", "use", "personal", flag]), [flag]);
+        }
+    }
+
+    #[test]
+    fn sync_requires_exactly_one_profile_target() {
+        // Two optional target arguments would accept neither or both.
+        assert!(Cli::try_parse_from(["cswitch", "sync"]).is_err());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "personal", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "personal"]).is_ok());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "--all"]).is_ok());
+    }
+
+    #[test]
+    fn sync_output_aligns_columns_within_each_profile_block() {
+        // Fixed spaces between labels and details misalign mixed actions.
+        let tmp = TempDir::new().unwrap();
+        let report = SyncReport {
+            entries: vec![
+                SyncEntry {
+                    name: "a".into(),
+                    action: SyncAction::Linked,
+                },
+                SyncEntry {
+                    name: "longer-name".into(),
+                    action: SyncAction::Migrated {
+                        backup: tmp.path().join("backup"),
+                    },
+                },
+                SyncEntry {
+                    name: "local".into(),
+                    action: SyncAction::ProfileOnly,
+                },
+                SyncEntry {
+                    name: "err".into(),
+                    action: SyncAction::Failed {
+                        error: "permission denied".into(),
+                    },
+                },
+            ],
+        };
+        let output = format_sync_report("personal", &report, true, tmp.path());
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "personal (dry run):");
+        assert_eq!(lines[1], format!("  {:<13}  a", "would link"));
+        assert_eq!(
+            lines[2],
+            format!(
+                "  {:<13}  {:<11}  backup: ~/backup",
+                "would migrate", "longer-name"
+            )
+        );
+        assert_eq!(lines[3], format!("  {:<13}  local", "profile-only"));
+        assert_eq!(
+            lines[4],
+            format!("  {:<13}  {:<11}  permission denied", "FAILED", "err")
+        );
+        assert!(lines.iter().all(|line| !line.ends_with(' ')));
+        assert_eq!(
+            lines[5],
+            "  counts: linked 1, already linked 0, migrated 1, adopted 0, diverged 0, foreign link 0, removed 0, profile-only 1, failed 1"
+        );
+
+        let short = SyncReport {
+            entries: vec![SyncEntry {
+                name: "z".into(),
+                action: SyncAction::Linked,
+            }],
+        };
+        let short_output = format_sync_report("work", &short, false, tmp.path());
+        assert_eq!(short_output.lines().nth(1), Some("  linked  z"));
+    }
+
+    #[test]
+    fn sync_all_reports_one_profile_error_and_continues_to_the_next() {
+        // Propagating the first Err would skip later profiles.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude_home = home.join(".claude");
+        let manager =
+            ProfileManager::with_paths(home.join(".claude-switch"), claude_home.clone()).unwrap();
+        let seed = home.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        manager.add_profile_from("bad", &seed).unwrap();
+        manager.add_profile_from("good", &seed).unwrap();
+        fs::create_dir_all(claude_home.join("skills")).unwrap();
+        fs::write(claude_home.join("skills/alpha"), "shared").unwrap();
+        fs::write(manager.profile_dir("bad").join("skills"), "blocked").unwrap();
+        let opts = SyncOptions {
+            dry_run: false,
+            adopt: Vec::new(),
+        };
+
+        let (output, failed) =
+            sync_profile_blocks(&manager, &["bad".into(), "good".into()], &opts, home, true)
+                .unwrap();
+
+        assert!(failed);
+        assert!(output.starts_with("bad:\n  error: profile skills path is not a real directory\n"));
+        assert!(output.contains("good:\n  linked  alpha\n"), "{output}");
+        assert!(
+            manager
+                .profile_dir("good")
+                .join("skills/alpha")
+                .is_symlink()
+        );
+        assert!(sync_profile_blocks(&manager, &["bad".into()], &opts, home, false).is_err());
     }
 }

@@ -1,10 +1,13 @@
+use crate::skills_sync::{self, SyncAction, SyncOptions, SyncReport};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -46,6 +49,11 @@ pub struct ProfileManager {
     pub base_dir: PathBuf,
     pub profiles_dir: PathBuf,
     registry_path: PathBuf,
+    claude_home: PathBuf,
+}
+
+struct LaunchPreparation {
+    profile_dir: PathBuf,
 }
 
 impl ProfileManager {
@@ -59,6 +67,14 @@ impl ProfileManager {
     /// Exists so tests can drive a manager that cannot reach the real
     /// `~/.claude-switch`; `new()` is the same call with the home path.
     pub fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
+        let home = base_dir
+            .parent()
+            .context("Cannot determine parent of profile base directory")?;
+        Self::with_paths(base_dir.clone(), home.join(".claude"))
+    }
+
+    /// Inject both roots so tests never consult the caller's real home.
+    pub fn with_paths(base_dir: PathBuf, claude_home: PathBuf) -> Result<Self> {
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;
@@ -66,6 +82,7 @@ impl ProfileManager {
             base_dir,
             profiles_dir,
             registry_path,
+            claude_home,
         })
     }
 
@@ -81,7 +98,36 @@ impl ProfileManager {
 
     fn save_registry(&self, registry: &Registry) -> Result<()> {
         let content = serde_json::to_string_pretty(registry)?;
-        fs::write(&self.registry_path, content)?;
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let mut index = 0;
+        let (temp_path, mut file) = loop {
+            let path = self.base_dir.join(format!(
+                ".registry.json.{}.{}.{}.tmp",
+                std::process::id(),
+                stamp,
+                index
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => break (path, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => index += 1,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let result = (|| -> Result<()> {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, &self.registry_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result?;
         Ok(())
     }
 
@@ -113,25 +159,31 @@ impl ProfileManager {
     /// Copies `~/.claude/` dir, `~/.claude.json` (home root), and on macOS
     /// extracts Keychain credentials into `.credentials.json`.
     pub fn add_profile(&self, name: &str, include_history: bool) -> Result<Profile> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let src = home.join(".claude");
+        let home = self
+            .claude_home
+            .parent()
+            .context("Claude home has no parent")?;
+        let src = &self.claude_home;
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.copy_and_register(name, &src, include_history, false)?;
-        self.copy_extra_credentials(&home, name, &mut profile)?;
+        let mut profile = self.copy_and_register(name, src, include_history, false)?;
+        self.copy_extra_credentials(home, name, &mut profile)?;
         Ok(profile)
     }
 
     /// Same as `add_profile` but overwrites an existing profile.
     pub fn add_profile_force(&self, name: &str, include_history: bool) -> Result<Profile> {
-        let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let src = home.join(".claude");
+        let home = self
+            .claude_home
+            .parent()
+            .context("Claude home has no parent")?;
+        let src = &self.claude_home;
         if !src.exists() {
             bail!("~/.claude does not exist. Is Claude Code installed and logged in?");
         }
-        let mut profile = self.copy_and_register(name, &src, include_history, true)?;
-        self.copy_extra_credentials(&home, name, &mut profile)?;
+        let mut profile = self.copy_and_register(name, src, include_history, true)?;
+        self.copy_extra_credentials(home, name, &mut profile)?;
         Ok(profile)
     }
 
@@ -188,6 +240,16 @@ impl ProfileManager {
         self.profiles_dir.join(name)
     }
 
+    pub fn sync_skills(&self, name: &str, opts: &SyncOptions) -> Result<SyncReport> {
+        self.get_profile(name)?;
+        skills_sync::sync_skills(
+            &self.claude_home.join("skills"),
+            &self.profile_dir(name).join("skills"),
+            &self.base_dir.join("backups/skills").join(name),
+            opts,
+        )
+    }
+
     // ── Live-session detection ───────────────────────────────────────────────
 
     /// Seconds since a Claude session last wrote to this profile.
@@ -222,7 +284,29 @@ impl ProfileManager {
     }
 
     /// Launch `claude` with `CLAUDE_CONFIG_DIR` pointed at the named profile.
-    pub fn launch_claude(&self, name: &str, args: &[String]) -> Result<()> {
+    pub fn launch_claude(&self, name: &str, args: &[OsString]) -> Result<()> {
+        let preparation = self.prepare_launch(name)?;
+        let mut command = std::process::Command::new("claude");
+        command
+            .args(args)
+            .env("CLAUDE_CONFIG_DIR", &preparation.profile_dir);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = command.exec();
+            Err(error).context("Failed to launch claude. Is it installed and in your PATH?")
+        }
+        #[cfg(not(unix))]
+        {
+            let status = command
+                .status()
+                .context("Failed to launch claude. Is it installed and in your PATH?")?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    fn prepare_launch(&self, name: &str) -> Result<LaunchPreparation> {
         let profile_dir = self.profile_dir(name);
         if !profile_dir.exists() {
             bail!(
@@ -231,19 +315,52 @@ impl ProfileManager {
                 name
             );
         }
-        let mut registry = self.load_registry()?;
-        if let Some(p) = registry.profiles.get_mut(name) {
-            p.last_used = Some(Utc::now());
+        let mut warnings = Vec::new();
+        match self.sync_skills(
+            name,
+            &SyncOptions {
+                dry_run: false,
+                adopt: Vec::new(),
+            },
+        ) {
+            Ok(report) => {
+                let changed: Vec<&str> = report
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.action,
+                            SyncAction::Linked
+                                | SyncAction::Migrated { .. }
+                                | SyncAction::RemovedDangling
+                        )
+                    })
+                    .map(|entry| entry.name.as_str())
+                    .collect();
+                if let Some(summary) = launch_sync_summary(&changed) {
+                    eprintln!("{summary}");
+                }
+                if report.has_failures() {
+                    warnings.push("some skills could not be synced".to_string());
+                }
+            }
+            Err(e) => warnings.push(format!("could not sync skills: {e}")),
         }
-        self.save_registry(&registry)?;
-
-        let status = std::process::Command::new("claude")
-            .args(args)
-            .env("CLAUDE_CONFIG_DIR", &profile_dir)
-            .status()
-            .context("Failed to launch claude. Is it installed and in your PATH?")?;
-
-        std::process::exit(status.code().unwrap_or(0));
+        let bookkeeping = (|| -> Result<()> {
+            let mut registry = self.load_registry()?;
+            if let Some(profile) = registry.profiles.get_mut(name) {
+                profile.last_used = Some(Utc::now());
+                self.save_registry(&registry)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = bookkeeping {
+            warnings.push(format!("could not update last used time: {e}"));
+        }
+        if !warnings.is_empty() {
+            eprintln!("cswitch: warning: {}", warnings.join("; "));
+        }
+        Ok(LaunchPreparation { profile_dir })
     }
 
     /// Create a profile for a *different* account, pre-seeded with the current
@@ -421,16 +538,15 @@ impl ProfileManager {
             String::new(),
         ];
         for p in profiles {
-            let dir = self.profile_dir(&p.name);
             let comment = p
                 .email
                 .as_deref()
-                .map(|e| format!("  # {}", e))
+                .map(|e| format!("  # {}", e.replace(['\r', '\n'], " ")))
                 .unwrap_or_default();
             lines.push(format!(
-                "alias claude-{}=\"CLAUDE_CONFIG_DIR='{}' claude\"{}",
-                p.name,
-                dir.display(),
+                "alias {}={}{}",
+                shell_word(&format!("claude-{}", p.name)),
+                shell_quote(&format!("cswitch use {}", shell_word(&p.name))),
                 comment
             ));
         }
@@ -445,16 +561,15 @@ impl ProfileManager {
             String::new(),
         ];
         for p in profiles {
-            let dir = self.profile_dir(&p.name);
             let comment = p
                 .email
                 .as_deref()
-                .map(|e| format!("  # {}", e))
+                .map(|e| format!("  # {}", e.replace(['\r', '\n'], " ")))
                 .unwrap_or_default();
             lines.push(format!(
-                "function claude-{} {{ $env:CLAUDE_CONFIG_DIR='{}'; claude @args }}{}",
-                p.name,
-                dir.display(),
+                "function {} {{ cswitch use {} @args }}{}",
+                powershell_word(&format!("claude-{}", p.name)),
+                powershell_word(&p.name),
                 comment
             ));
         }
@@ -470,18 +585,19 @@ impl ProfileManager {
     /// `~/.claude` to seed from — a first-ever login is still a clean
     /// empty-directory login.
     fn seed_profile_dir(&self, profile_dir: &Path, include_history: bool) -> Result<bool> {
-        let Some(home) = dirs::home_dir() else {
-            return Ok(false);
-        };
-        let src = home.join(".claude");
+        let src = &self.claude_home;
         if !src.exists() {
             return Ok(false);
         }
 
-        copy_dir_all_filtered(&src, profile_dir, &seed_skip(include_history))?;
+        copy_dir_all_filtered(src, profile_dir, &seed_skip(include_history))?;
+        self.seed_skills_from(&src.join("skills"), profile_dir);
 
         // Account metadata lives at the home root, not inside ~/.claude.
-        let home_claude_json = home.join(".claude.json");
+        let home_claude_json = src
+            .parent()
+            .context("Claude home has no parent")?
+            .join(".claude.json");
         if home_claude_json.exists() {
             fs::copy(&home_claude_json, profile_dir.join(".claude.json"))?;
         }
@@ -507,6 +623,7 @@ impl ProfileManager {
         include_history: bool,
         force: bool,
     ) -> Result<Profile> {
+        let src = std::path::absolute(src)?;
         if !src.exists() {
             bail!("Source directory '{}' does not exist.", src.display());
         }
@@ -521,7 +638,8 @@ impl ProfileManager {
                 );
             }
         }
-        copy_dir_all_filtered(src, &dest, &seed_skip(include_history))?;
+        copy_dir_all_filtered(&src, &dest, &seed_skip(include_history))?;
+        self.seed_skills_from(&src.join("skills"), &dest);
         let email = read_email_from_dir(&dest);
         let profile = Profile {
             name: name.to_string(),
@@ -533,10 +651,76 @@ impl ProfileManager {
         Ok(profile)
     }
 
+    fn seed_skills_from(&self, source_skills: &Path, profile_dir: &Path) {
+        let Some(name) = profile_dir.file_name() else {
+            eprintln!("cswitch: warning: could not determine profile name for skills sync");
+            return;
+        };
+        let result = skills_sync::sync_skills(
+            source_skills,
+            &profile_dir.join("skills"),
+            &self.base_dir.join("backups/skills").join(name),
+            &SyncOptions {
+                dry_run: false,
+                adopt: Vec::new(),
+            },
+        );
+        match result {
+            Ok(report) if report.has_failures() => {
+                eprintln!("cswitch: warning: some skills could not be linked while seeding");
+            }
+            Err(e) => eprintln!("cswitch: warning: could not link skills while seeding: {e}"),
+            _ => {}
+        }
+    }
+
     fn upsert_profile(&self, profile: Profile) -> Result<()> {
         let mut registry = self.load_registry()?;
         registry.profiles.insert(profile.name.clone(), profile);
         self.save_registry(&registry)
+    }
+}
+
+fn safe_shell_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn launch_sync_summary(changed: &[&str]) -> Option<String> {
+    if changed.is_empty() {
+        return None;
+    }
+    let noun = if changed.len() == 1 {
+        "skill"
+    } else {
+        "skills"
+    };
+    Some(format!(
+        "cswitch: synced {} {noun} ({})",
+        changed.len(),
+        changed.join(", ")
+    ))
+}
+
+fn shell_word(value: &str) -> String {
+    if safe_shell_name(value) {
+        value.to_string()
+    } else {
+        shell_quote(value)
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_word(value: &str) -> String {
+    if safe_shell_name(value) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
     }
 }
 
@@ -597,6 +781,7 @@ const SEED_SKIP_HISTORY: &[&str] = &[
 /// Machine-local caches and runtime state. Never copied, under any flag —
 /// stale here at best, confusing at worst.
 const SEED_SKIP_ALWAYS: &[&str] = &[
+    "skills",
     "sessions",
     "session-env",
     "shell-snapshots",
@@ -961,14 +1146,7 @@ mod tests {
     /// Construct a ProfileManager fully isolated inside a temp directory.
     fn make_manager(tmp: &TempDir) -> ProfileManager {
         let base_dir = tmp.path().join(".claude-switch");
-        let profiles_dir = base_dir.join("profiles");
-        let registry_path = base_dir.join("registry.json");
-        fs::create_dir_all(&profiles_dir).unwrap();
-        ProfileManager {
-            base_dir,
-            profiles_dir,
-            registry_path,
-        }
+        ProfileManager::with_paths(base_dir, tmp.path().join(".claude")).unwrap()
     }
 
     /// Populate a fake `~/.claude` directory with the two files Claude Code
@@ -1351,7 +1529,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_aliases_includes_all_profiles_with_config_dir() {
+    fn generate_aliases_routes_each_profile_through_cswitch_use() {
+        // Direct CLAUDE_CONFIG_DIR aliases bypass the launch-time sync.
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
 
@@ -1360,10 +1539,22 @@ mod tests {
             mgr.add_profile_from(name, &src).unwrap();
         }
 
-        let out = mgr.generate_aliases().unwrap();
-        assert!(out.contains("alias claude-work="), "{out}");
-        assert!(out.contains("alias claude-personal="), "{out}");
-        assert!(out.contains("CLAUDE_CONFIG_DIR="), "{out}");
+        let profiles = mgr.list_profiles().unwrap();
+        let bash = mgr.generate_shell_aliases(&profiles).unwrap();
+        assert!(
+            bash.contains("alias claude-work='cswitch use work'"),
+            "{bash}"
+        );
+        assert!(
+            bash.contains("alias claude-personal='cswitch use personal'"),
+            "{bash}"
+        );
+        let powershell = mgr.generate_powershell_aliases(&profiles).unwrap();
+        assert!(
+            powershell.contains("function claude-work { cswitch use work @args }"),
+            "{powershell}"
+        );
+        assert!(!bash.contains("CLAUDE_CONFIG_DIR="), "{bash}");
     }
 
     // ── login_profile ──────────────────────────────────────────────────────
@@ -1558,7 +1749,7 @@ mod tests {
             dst.join("settings.json").exists(),
             "settings must be copied"
         );
-        assert!(dst.join("skills/a.md").exists(), "skills must be copied");
+        assert!(!dst.join("skills").exists(), "skills must be linked later");
     }
 
     #[test]
@@ -1567,13 +1758,13 @@ mod tests {
         // when it is nested — the filter is deliberately shallow.
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src");
-        fs::create_dir_all(src.join("skills/cache")).unwrap();
-        fs::write(src.join("skills/cache/keep.txt"), "nested").unwrap();
+        fs::create_dir_all(src.join("custom/skills/cache")).unwrap();
+        fs::write(src.join("custom/skills/cache/keep.txt"), "nested").unwrap();
 
         let dst = tmp.path().join("dst");
         copy_dir_all_filtered(&src, &dst, &seed_skip(false)).unwrap();
 
-        assert!(dst.join("skills/cache/keep.txt").exists());
+        assert!(dst.join("custom/skills/cache/keep.txt").exists());
     }
 
     #[test]
@@ -1897,6 +2088,83 @@ mod tests {
 
         let copied = mgr.profile_dir("work").join("skills/checkpoint/SKILL.md");
         assert_eq!(fs::read_to_string(copied).unwrap(), "v2");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn seeding_links_skills_and_never_carries_synced() {
+        // A recursive skills copy would carry account-managed synced state.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let source = make_claude_dir(&mgr.claude_home, "test-account");
+        let source_skills = source.join("skills");
+        fs::create_dir_all(source_skills.join("plain")).unwrap();
+        fs::write(source_skills.join("plain/SKILL.md"), "plain").unwrap();
+        fs::create_dir_all(source_skills.join("synced/bucket")).unwrap();
+        fs::write(source_skills.join("synced/bucket/SKILL.md"), "separate").unwrap();
+        let repo_skill = tmp.path().join("repo/linked");
+        fs::create_dir_all(&repo_skill).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "linked").unwrap();
+        std::os::unix::fs::symlink(&repo_skill, source_skills.join("linked")).unwrap();
+
+        let profile_dir = mgr.profile_dir("work");
+        fs::create_dir_all(&profile_dir).unwrap();
+        assert!(mgr.seed_profile_dir(&profile_dir, false).unwrap());
+        assert_eq!(
+            fs::read_link(profile_dir.join("skills/plain")).unwrap(),
+            source_skills.join("plain")
+        );
+        assert_eq!(
+            fs::read_link(profile_dir.join("skills/linked")).unwrap(),
+            source_skills.join("linked")
+        );
+        assert_eq!(
+            fs::read_to_string(profile_dir.join("skills/linked/SKILL.md")).unwrap(),
+            "linked"
+        );
+        assert!(!profile_dir.join("skills/synced").exists());
+    }
+
+    #[test]
+    fn sync_error_does_not_block_launch_preparation() {
+        // An eager sync error used to stop the launch before Claude could run.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let src = make_claude_dir(&tmp.path().join("seed"), "test-account");
+        mgr.add_profile_from("work", &src).unwrap();
+        fs::create_dir_all(&mgr.claude_home).unwrap();
+        fs::write(mgr.claude_home.join("skills"), "not a directory").unwrap();
+
+        let prepared = mgr.prepare_launch("work").unwrap();
+        assert_eq!(prepared.profile_dir, mgr.profile_dir("work"));
+        assert!(mgr.get_profile("work").unwrap().last_used.is_some());
+    }
+
+    #[test]
+    fn sync_requires_a_registered_profile() {
+        // A directory alone is not an account that `sync --all` should manage.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let opts = SyncOptions {
+            dry_run: false,
+            adopt: Vec::new(),
+        };
+        assert!(mgr.sync_skills("missing", &opts).is_err());
+        assert!(!mgr.profile_dir("missing").exists());
+    }
+
+    #[test]
+    fn launch_summary_uses_singular_for_one_skill_and_plural_for_more() {
+        // A fixed "skills" suffix produces the visible "1 skills" error.
+        assert_eq!(launch_sync_summary(&[]), None);
+        assert_eq!(
+            launch_sync_summary(&["x"]),
+            Some("cswitch: synced 1 skill (x)".to_string())
+        );
+        assert_eq!(
+            launch_sync_summary(&["x", "y"]),
+            Some("cswitch: synced 2 skills (x, y)".to_string())
+        );
     }
 
     #[test]

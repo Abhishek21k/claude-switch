@@ -73,7 +73,9 @@ cswitch
 | `cswitch add <name>` | Add a new profile (detects active session, asks to copy or login) |
 | `cswitch login <name>` | Create a profile by logging into a different account |
 | `cswitch login <name> --email <addr>` | Same, pre-filling the address on Claude's login page |
-| `cswitch use <name>` | Launch Claude Code with a specific profile |
+| `cswitch use <name> [claude flags...]` | Sync skills, then launch Claude Code with a specific profile; flags pass through unchanged |
+| `cswitch sync <name> [--dry-run] [--adopt <skill>]...` | Sync shared skills into one profile |
+| `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every profile |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name>` | Delete a profile |
@@ -131,7 +133,7 @@ Use this for one account with two environments: different MCP servers, different
 cswitch login business   # or press `a`, then [l]
 ```
 
-The new profile is seeded with your warm setup (settings, skills, project trust), then every trace of the old account is stripped so Claude has to authenticate from scratch.
+The new profile is seeded with your warm setup (settings, linked user-level skills, project trust), then every trace of the old account is stripped so Claude has to authenticate from scratch.
 
 ### What carries over — and what doesn't
 
@@ -140,14 +142,20 @@ A profile is a copy of your **config directory**. That boundary decides everythi
 | | Carries over |
 |---|---|
 | Settings (`settings.json`) | Yes |
-| **User-level** skills — `~/.claude/skills/` | Yes |
+| **User-level** skills — `~/.claude/skills/` | Yes, linked one by one |
 | Project trust and onboarding state | Yes |
 | MCP server **definitions** | Yes |
 | **Project-level** skills — `<your-repo>/.claude/skills/` | **No** — they belong to the repo, not the config directory |
 | MCP **authorizations** (OAuth) | **No** — a grant belongs to the account that gave it |
 | Conversation history and transcripts | No, unless you pass `--include-history` |
 
-Anything you've **symlinked** into `~/.claude` stays a symlink in the profile, pointing at the same place — so a skill linked out of a repository keeps tracking that repository from every profile, instead of each profile freezing its own stale copy.
+Each user-level skill in `~/.claude/skills/` is linked through its source entry. A skill linked from that directory into a repository remains reachable from every profile and keeps tracking edits in the repository.
+
+## Skills sync
+
+`~/.claude/skills/` is the read-only source for shared user-level skills. `cswitch sync --all` adds an absolute link for each eligible skill in each registered profile. Run `cswitch sync personal --dry-run` to preview changes. `cswitch use personal` also syncs before launching Claude; sync errors produce a warning and do not stop the launch. Arguments after the profile name, including `--resume`, `-p`, `--model`, `--help`, and `--`, pass through to Claude.
+
+Sync skips dotfiles and `synced/`. Each profile keeps its own `skills/synced/`; sync never reads or changes it. Existing links to the matching source entry stay in place. Links elsewhere stay in place and are reported as foreign. A real file or directory whose full tree is byte-identical to the source is moved to `~/.claude-switch/backups/skills/<profile>/<skill>-<UTC timestamp>` and replaced with a link. A differing copy is reported as diverged and kept; `cswitch sync personal --adopt <skill>` backs it up and links the source instead. Profile-only entries are kept, except dangling links into the source directory, which are removed when that source directory exists. A missing source directory causes no changes.
 
 Two consequences worth expecting:
 
@@ -188,7 +196,7 @@ After that, `a` in the TUI offers the same two choices for every additional prof
 
 ## Shell aliases
 
-Generate aliases so you can launch profiles directly without `cswitch use`:
+Generate aliases so you can launch profiles through `cswitch use`:
 
 ```bash
 cswitch aliases >> ~/.zshrc   # or ~/.bashrc
@@ -198,8 +206,8 @@ source ~/.zshrc
 This gives you commands like:
 
 ```bash
-claude-work       # launches Claude with the "work" profile
-claude-personal   # launches Claude with the "personal" profile
+claude-work --resume       # syncs skills, then launches Claude with the "work" profile
+claude-personal --model opus
 ```
 
 On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to your `$PROFILE`.
@@ -215,7 +223,7 @@ On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to 
 
 ## How profiles are stored
 
-Profiles live in `~/.claude-switch/profiles/<name>/`. Each profile is a self-contained Claude Code config directory. When you run `cswitch use <name>`, it simply sets `CLAUDE_CONFIG_DIR` to point at that directory — Claude reads its credentials and config from there instead of the default `~/.claude`.
+Profiles live in `~/.claude-switch/profiles/<name>/`. Each profile is a Claude Code config directory with its own credentials and settings. When you run `cswitch use <name>`, it syncs shared skills, sets `CLAUDE_CONFIG_DIR` to that directory, and launches Claude.
 
 Nothing in your original `~/.claude` is modified. Profiles are fully isolated from each other.
 
