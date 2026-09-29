@@ -82,6 +82,10 @@ cswitch
 | `cswitch aliases` | Print shell aliases for all profiles |
 | `cswitch --help` | Full CLI help |
 
+## Plan limits
+
+`cswitch list`, `cswitch info <name>`, and the TUI details panel show the 5-hour and 7-day plan limits from Claude Code's own cached snapshot. Each view shows when Claude Code fetched it, and marks a window as `reset` once its reset time has passed. A new profile may show `no data` until Claude Code writes a snapshot. `cswitch` reads the profile's cache without changing it, makes no network call, and never refreshes OAuth tokens.
+
 ## Interactive TUI
 
 Run `cswitch` with no arguments to open the TUI.

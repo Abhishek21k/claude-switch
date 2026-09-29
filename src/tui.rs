@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -8,7 +9,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use crate::limits::{Limits, Window, read_limits};
 use crate::profile::{Profile, ProfileManager, describe_age, detect_current_account};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -78,6 +82,10 @@ pub struct App {
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
     account_probe: AccountProbe,
+    limits: HashMap<String, Limits>,
+    limits_selection: Option<String>,
+    last_limits_refresh: Option<Instant>,
+    limits_now: DateTime<Utc>,
 }
 
 type AccountProbe = fn() -> Option<String>;
@@ -119,6 +127,10 @@ impl App {
             selected_has_history: false,
             pending: None,
             account_probe: live_account_email,
+            limits: HashMap::new(),
+            limits_selection: None,
+            last_limits_refresh: None,
+            limits_now: Utc::now(),
         })
     }
 
@@ -134,7 +146,24 @@ impl App {
             self.list_state
                 .select(Some(idx.min(self.filtered_indices.len() - 1)));
         }
+        self.last_limits_refresh = None;
         Ok(())
+    }
+
+    fn refresh_limits_if_due(&mut self, instant: Instant) {
+        let selected = self.selected_profile().map(|profile| profile.name.clone());
+        let changed = selected != self.limits_selection;
+        let due = self
+            .last_limits_refresh
+            .is_none_or(|last| instant.duration_since(last) >= Duration::from_secs(30));
+        if let Some(name) = &selected
+            && (changed || due)
+        {
+            self.limits
+                .insert(name.clone(), read_limits(&self.manager.profile_dir(name)));
+            self.last_limits_refresh = Some(instant);
+        }
+        self.limits_selection = selected;
     }
 
     fn apply_filter(&mut self) {
@@ -230,9 +259,13 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.limits_now = Utc::now();
+            self.refresh_limits_if_due(Instant::now());
             terminal.draw(|f| self.render(f))?;
 
-            if let Event::Key(key) = event::read()? {
+            if event::poll(Duration::from_secs(30))?
+                && let Event::Key(key) = event::read()?
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -1069,13 +1102,12 @@ impl App {
 
         let profile_dir = self.manager.profile_dir(&profile.name);
 
-        let lines: Vec<Line> = vec![
+        let mut lines: Vec<Line> = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Name         ", Style::default().fg(DIM)),
                 Span::styled(profile.name.clone(), Style::default().fg(ACCENT).bold()),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Email        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1083,7 +1115,6 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Added        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1091,7 +1122,6 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Last used    ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1102,6 +1132,41 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
+        ];
+        lines.push(Line::from(""));
+        match self.limits.get(&profile.name) {
+            Some(Limits::Snapshot(snapshot)) => {
+                lines.push(Line::from(vec![
+                    Span::styled("  Plan limits  ", Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("as of {}", snapshot.age(self.limits_now)),
+                        Style::default().fg(TEXT),
+                    ),
+                ]));
+                if snapshot.windows.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    No limit windows in this snapshot.",
+                        Style::default().fg(MUTED),
+                    )));
+                }
+                for window in &snapshot.windows {
+                    lines.push(limit_line(window, self.limits_now));
+                }
+            }
+            Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
+                "  Plan limits  mismatch: another account's snapshot",
+                Style::default().fg(MUTED),
+            ))),
+            Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
+                "  Plan limits  unreadable: file couldn't be read",
+                Style::default().fg(MUTED),
+            ))),
+            Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
+                "  Plan limits  no data: no cached snapshot yet",
+                Style::default().fg(MUTED),
+            ))),
+        }
+        lines.extend([
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Config dir   ", Style::default().fg(DIM)),
@@ -1128,7 +1193,7 @@ impl App {
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
-        ];
+        ]);
 
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -1560,6 +1625,44 @@ impl App {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+fn limit_line(window: &Window, now: DateTime<Utc>) -> Line<'static> {
+    let reset = window.rolled_over(now);
+    let color = if reset {
+        MUTED
+    } else {
+        match window.severity.as_deref() {
+            Some("normal") => SUCCESS,
+            Some("warning") => ACCENT,
+            Some("critical") => DANGER,
+            _ => MUTED,
+        }
+    };
+    let value = if reset {
+        format!("reset (was {:.0}%)", window.percent.round())
+    } else {
+        window.percent_label(now)
+    };
+    let bar = if reset {
+        "░".repeat(10)
+    } else {
+        window.bar()
+    };
+    let reset_time = window
+        .resets_at
+        .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string());
+    Line::from(Span::styled(
+        format!(
+            "  {:<14} {} {:<5} {}",
+            window.label(),
+            bar,
+            value,
+            reset_time
+        ),
+        Style::default().fg(color),
+    ))
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * percent_x / 100;
     Rect {
@@ -1623,6 +1726,72 @@ mod tests {
         for c in name.chars() {
             app.handle_add_name(KeyCode::Char(c)).unwrap();
         }
+    }
+
+    #[test]
+    fn limits_cache_refreshes_on_selection_or_after_thirty_seconds() {
+        // Known-bad: reading during render rereads every frame, while never refreshing leaves a stale panel.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("alpha", Some("a@example.com")),
+                ("beta", Some("b@example.com")),
+            ],
+        );
+        let path = app.manager.profile_dir("alpha");
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join(".claude.json");
+        let cache = serde_json::json!({
+            "cachedUsageUtilization": {
+                "fetchedAtMs": 1_894_021_200_000_i64,
+                "utilization": {"limits": [{"kind":"session", "group":"session", "percent":12}]}
+            }
+        });
+        std::fs::write(&file, serde_json::to_vec(&cache).unwrap()).unwrap();
+        std::fs::create_dir_all(app.manager.profile_dir("beta")).unwrap();
+        std::fs::write(app.manager.profile_dir("beta").join(".claude.json"), b"{}").unwrap();
+        let start = Instant::now();
+        app.refresh_limits_if_due(start);
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        std::fs::write(&file, b"{}").unwrap();
+        app.refresh_limits_if_due(start + Duration::from_secs(29));
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        app.refresh_limits_if_due(start + Duration::from_secs(30));
+        assert_eq!(app.limits.get("alpha"), Some(&Limits::NoSnapshot));
+        app.move_down();
+        app.refresh_limits_if_due(start + Duration::from_secs(31));
+        assert_eq!(app.limits.get("beta"), Some(&Limits::NoSnapshot));
+    }
+
+    #[test]
+    fn limit_lines_use_severity_palette_and_mute_reset() {
+        // Known-bad: a reset retains its old critical colour or unknown severity looks normal.
+        let now = DateTime::parse_from_rfc3339("2030-01-07T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut window = Window {
+            group: crate::limits::WindowGroup::Session,
+            kind: "session".to_string(),
+            percent: 40.0,
+            severity: Some("normal".to_string()),
+            resets_at: None,
+            is_active: None,
+        };
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(SUCCESS));
+        window.resets_at = Some(now + chrono::Duration::hours(1));
+        assert!(limit_line(&window, now).spans[0].content.chars().count() <= 46);
+        window.severity = Some("warning".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(ACCENT));
+        window.severity = Some("critical".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(DANGER));
+        window.severity = None;
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(MUTED));
+        window.severity = Some("critical".to_string());
+        window.resets_at = Some(now - chrono::Duration::hours(1));
+        let line = limit_line(&window, now);
+        assert_eq!(line.spans[0].style.fg, Some(MUTED));
+        assert!(line.spans[0].content.contains("reset (was 40%)"));
     }
 
     // ── `a` → name → choice ───────────────────────────────────────────────────

@@ -1155,6 +1155,7 @@ fn read_email_from_dir(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::{Limits, read_limits};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1888,6 +1889,34 @@ mod tests {
         fs::write(&bad, "not json at all").unwrap();
         sanitize_claude_json(&bad).unwrap();
         assert_eq!(fs::read_to_string(&bad).unwrap(), "not json at all");
+    }
+
+    #[test]
+    fn a_newly_seeded_profile_has_no_source_limit_snapshot() {
+        // Known-bad: removing cachedUsageUtilization from IDENTITY_KEYS leaks the source account's numbers.
+        let tmp = TempDir::new().unwrap();
+        let manager = make_manager(&tmp);
+        fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let source = serde_json::json!({
+            "oauthAccount": {"accountUuid": "00000000-0000-4000-8000-000000000001"},
+            "cachedUsageUtilization": {
+                "accountUuid": "00000000-0000-4000-8000-000000000001",
+                "fetchedAtMs": 1_894_021_200_000_i64,
+                "utilization": {"limits": [
+                    {"kind":"session", "group":"session", "percent":40}
+                ]}
+            },
+            "projects": {"/synthetic/project": {"trusted": true}}
+        });
+        let source_path = tmp.path().join(".claude.json");
+        fs::write(&source_path, serde_json::to_vec(&source).unwrap()).unwrap();
+        let dest = manager.profile_dir("new");
+        manager.seed_profile_dir(&dest, false).unwrap();
+        assert!(matches!(read_limits(tmp.path()), Limits::Snapshot(_)));
+        assert_eq!(read_limits(&dest), Limits::NoSnapshot);
+        let output: serde_json::Value =
+            serde_json::from_slice(&fs::read(dest.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(output["projects"], source["projects"]);
     }
 
     #[test]

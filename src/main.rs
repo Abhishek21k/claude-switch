@@ -1,9 +1,12 @@
+mod limits;
 mod profile;
 mod skills_sync;
 mod tui;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Parser, Subcommand};
+use limits::{Limits, Window, format_info, read_limits};
 use profile::{LoginOutcome, ProfileManager, detect_current_account};
 use skills_sync::{SyncAction, SyncOptions, SyncReport};
 use std::ffi::OsString;
@@ -139,23 +142,7 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::List) => {
-            let profiles = manager.list_profiles()?;
-            if profiles.is_empty() {
-                println!("No profiles found. Add one with:");
-                println!("  cswitch add <name>");
-                return Ok(());
-            }
-
-            println!("{:<20} {:<35} LAST USED", "NAME", "EMAIL");
-            println!("{}", "─".repeat(75));
-            for p in profiles {
-                let email = p.email.as_deref().unwrap_or("—");
-                let last_used = p
-                    .last_used
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or("never".to_string());
-                println!("{:<20} {:<35} {}", p.name, email, last_used);
-            }
+            print!("{}", list_output(&manager, Utc::now())?);
         }
 
         Some(Commands::Add {
@@ -225,6 +212,7 @@ fn main() -> Result<()> {
                         .unwrap_or("never".to_string())
                 );
                 println!("Directory: {}", dir.display());
+                print!("{}", format_info(&read_limits(&dir), Utc::now()));
                 println!();
                 println!("Launch:");
                 println!("  cswitch use {}", p.name);
@@ -241,6 +229,81 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
+    let profiles = manager.list_profiles()?;
+    if profiles.is_empty() {
+        return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".to_string());
+    }
+    let header = format!(
+        "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
+        "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+    );
+    let mut output = format!("{}\n{}\n", header, "─".repeat(header.chars().count()));
+    let mut saw_reset = false;
+    let mut saw_flag = false;
+
+    for profile in profiles {
+        let limits = read_limits(&manager.profile_dir(&profile.name));
+        let (session, weekly, age) = match &limits {
+            Limits::Snapshot(snapshot) => {
+                let session = list_window(snapshot.session(), now, false);
+                let weekly = list_window(snapshot.weekly(), now, true);
+                saw_reset |= session.1 || weekly.1;
+                saw_flag |= session.2 || weekly.2;
+                (session.0, weekly.0, snapshot.age(now))
+            }
+            Limits::NoSnapshot => ("—".to_string(), "—".to_string(), "no data".to_string()),
+            Limits::AccountMismatch => ("—".to_string(), "—".to_string(), "mismatch".to_string()),
+            Limits::Unreadable => ("—".to_string(), "—".to_string(), "unreadable".to_string()),
+        };
+        let last_used = profile
+            .last_used
+            .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".to_string());
+        output.push_str(&format!(
+            "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+            profile.name,
+            profile.email.as_deref().unwrap_or("—"),
+            session,
+            weekly,
+            age,
+            last_used
+        ));
+    }
+    if saw_reset || saw_flag {
+        let mut parts = Vec::new();
+        if saw_reset {
+            parts.push("reset = that window restarted after the snapshot was taken");
+        }
+        if saw_flag {
+            parts.push("! = Claude Code flags this limit");
+        }
+        output.push_str(&format!("\n{}\n", parts.join(" · ")));
+    }
+    Ok(output)
+}
+
+fn list_window(
+    window: Option<&Window>,
+    now: DateTime<Utc>,
+    with_bar: bool,
+) -> (String, bool, bool) {
+    let Some(window) = window else {
+        return ("—".to_string(), false, false);
+    };
+    let reset = window.rolled_over(now);
+    let flagged = window.flagged();
+    let mut output = window.percent_label(now);
+    if with_bar && !reset {
+        output.push(' ');
+        output.push_str(&window.bar());
+    }
+    if flagged {
+        output.push_str(" !");
+    }
+    (output, reset, flagged)
 }
 
 fn sync_profile_blocks(
@@ -480,9 +543,129 @@ fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{Profile, Registry};
     use crate::skills_sync::SyncEntry;
     use std::fs;
     use tempfile::TempDir;
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn list_uses_fixed_columns_and_only_needed_legend() {
+        // Known-bad: always printing the legend, flagging normal limits, or overflowing at a 30-character email.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".claude-switch");
+        let manager = ProfileManager::with_paths(base.clone(), tmp.path().join(".claude")).unwrap();
+        let now = at("2030-01-07T14:00:00Z");
+        let mut registry = Registry::default();
+        for (name, email, last_used) in [
+            (
+                "active",
+                "thirtyx.characters@example.com",
+                Some(at("2030-01-07T06:31:00Z")),
+            ),
+            ("fresh", "b@example.com", None),
+        ] {
+            registry.profiles.insert(
+                name.to_string(),
+                Profile {
+                    name: name.to_string(),
+                    email: Some(email.to_string()),
+                    added: now,
+                    last_used,
+                },
+            );
+            fs::create_dir_all(manager.profile_dir(name)).unwrap();
+        }
+        fs::write(
+            base.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let path = manager.profile_dir("active").join(".claude.json");
+        let fresh_path = manager.profile_dir("fresh").join(".claude.json");
+        fs::write(&fresh_path, b"{}").unwrap();
+        let mut cache = serde_json::json!({
+            "oauthAccount": {"accountUuid": "00000000-0000-4000-8000-000000000001"},
+            "cachedUsageUtilization": {
+                "accountUuid": "00000000-0000-4000-8000-000000000001",
+                "fetchedAtMs": at("2030-01-07T13:00:00Z").timestamp_millis(),
+                "utilization": {"limits": [
+                    {"kind":"session", "group":"session", "percent":12,
+                     "severity":"normal", "resets_at":"2030-01-07T15:00:00Z"},
+                    {"kind":"weekly_all", "group":"weekly", "percent":88,
+                     "severity":"normal", "resets_at":"2030-01-10T20:00:00Z"}
+                ]}
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        let header = format!(
+            "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
+            "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+        );
+        let expected = format!(
+            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+            "─".repeat(header.chars().count()),
+            "active",
+            "thirtyx.characters@example.com",
+            "12%",
+            "88% █████████░",
+            "1 h ago",
+            "2030-01-07 06:31",
+            "fresh",
+            "b@example.com",
+            "—",
+            "—",
+            "no data",
+            "never"
+        );
+        let output = list_output(&manager, now).unwrap();
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 120));
+
+        cache["cachedUsageUtilization"]["utilization"]["limits"][0]["resets_at"] =
+            serde_json::json!("2030-01-07T12:00:00Z");
+        cache["cachedUsageUtilization"]["utilization"]["limits"][1]["severity"] =
+            serde_json::json!("critical");
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let changed = list_output(&manager, now).unwrap();
+        let expected_changed = format!(
+            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
+            "─".repeat(header.chars().count()),
+            "active",
+            "thirtyx.characters@example.com",
+            "reset",
+            "88% █████████░ !",
+            "1 h ago",
+            "2030-01-07 06:31",
+            "fresh",
+            "b@example.com",
+            "—",
+            "—",
+            "no data",
+            "never"
+        );
+        assert_eq!(changed, expected_changed);
+        assert!(changed.lines().all(|line| line.chars().count() <= 120));
+
+        cache["cachedUsageUtilization"]["accountUuid"] =
+            serde_json::json!("00000000-0000-4000-8000-000000000002");
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let mismatch = list_output(&manager, now).unwrap();
+        let fields: Vec<&str> = mismatch
+            .lines()
+            .nth(2)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(fields[2..5], ["—", "—", "mismatch"]);
+        assert!(!mismatch.contains("88%"));
+    }
 
     fn use_args(input: &[&str]) -> Vec<String> {
         let cli = Cli::try_parse_from(input).unwrap();
