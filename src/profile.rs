@@ -1,4 +1,5 @@
 use crate::atomic;
+use crate::key::{remove_key, strip_copied_helper};
 use crate::skills_sync::{self, SyncAction, SyncOptions, SyncReport};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -34,6 +35,52 @@ pub struct Registry {
 pub struct LoginOutcome {
     pub email: Option<String>,
     pub same_account_as: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMethod {
+    ClaudeAi,
+    Console,
+}
+
+pub fn login_args(method: LoginMethod, email_hint: Option<&str>) -> Vec<String> {
+    let mut args = vec!["auth".to_string(), "login".to_string()];
+    if method == LoginMethod::Console {
+        args.push("--console".to_string());
+    }
+    if let Some(hint) = email_hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+        args.extend(["--email".to_string(), hint.to_string()]);
+    }
+    args
+}
+
+pub fn login_verdict(
+    method: LoginMethod,
+    status_json: &serde_json::Value,
+) -> Result<Option<String>> {
+    if status_json
+        .get("loggedIn")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        bail!("Claude did not report an authenticated session.");
+    }
+    let email = status_json
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match method {
+        LoginMethod::ClaudeAi if email.is_some() => Ok(email),
+        LoginMethod::Console
+            if status_json
+                .get("apiKeySource")
+                .and_then(serde_json::Value::as_str)
+                == Some("/login managed key") =>
+        {
+            Ok(email)
+        }
+        _ => bail!("Claude did not report the requested login method."),
+    }
 }
 
 impl LoginOutcome {
@@ -194,6 +241,7 @@ impl ProfileManager {
             fs::remove_dir_all(&dest)?;
         }
         registry.profiles.remove(name);
+        remove_key(&self.base_dir, name)?;
         self.save_registry(&registry)
     }
 
@@ -365,6 +413,7 @@ impl ProfileManager {
         name: &str,
         include_history: bool,
         email_hint: Option<&str>,
+        method: LoginMethod,
     ) -> Result<LoginOutcome> {
         let profile_dir = self.profiles_dir.join(name);
         // Never authenticate into a directory we did not just create: a
@@ -402,25 +451,22 @@ impl ProfileManager {
             "Opening your browser — sign in as the account for profile '{}'.",
             name
         );
-        // The OAuth grant follows the *browser's* claude.ai session, not this
-        // directory. A signed-in browser authorises that account with no picker,
-        // which is precisely how a "new" profile ends up cloning the old one.
-        println!(
-            "  If claude.ai is already signed in as another account, sign out first\n  \
-             or complete this login in a private window.\n"
-        );
+        if method == LoginMethod::ClaudeAi {
+            // The OAuth grant follows the browser's claude.ai session.
+            println!(
+                "  If claude.ai is already signed in as another account, sign out first\n  \
+                 or complete this login in a private window.\n"
+            );
+        } else {
+            println!("  Anthropic Console login uses API billing.\n");
+        }
 
         // `claude auth login` is the purpose-built flow: it opens the browser,
         // waits for the OAuth round-trip, and exits. Launching the full TUI
         // instead would leave the user to remember `/exit`, and would trip
         // Claude's nested-session guard when run from inside a Claude session.
         let mut cmd = std::process::Command::new("claude");
-        cmd.args(["auth", "login"]);
-        // `--email` only pre-fills the login page; it does not override a live
-        // browser session. Treated as a convenience, never as a guarantee.
-        if let Some(hint) = email_hint.map(str::trim).filter(|h| !h.is_empty()) {
-            cmd.args(["--email", hint]);
-        }
+        cmd.args(login_args(method, email_hint));
         let status = cmd
             .env("CLAUDE_CONFIG_DIR", &profile_dir)
             .status()
@@ -446,7 +492,8 @@ impl ProfileManager {
 
         // Ask Claude who it ended up as, rather than re-parsing the config we
         // just sanitized. A successful exit code is not proof of a session.
-        let email = read_account_email(&profile_dir).or_else(|| read_email_from_dir(&profile_dir));
+        let email =
+            read_login_status(&profile_dir).and_then(|json| login_verdict(method, &json).ok());
         if email.is_none() {
             abort_login(&profile_dir, we_created_dir);
             bail!(
@@ -459,6 +506,7 @@ impl ProfileManager {
 
         // Same Claude account under two profile names is legitimate (isolated
         // settings, separate MCP trust), so this warns rather than fails.
+        let email = email.expect("login verdict checked");
         let same_account_as = match email.as_deref() {
             Some(e) => self.profiles_with_email(e)?,
             None => Vec::new(),
@@ -590,6 +638,7 @@ impl ProfileManager {
             fs::remove_file(&creds)?;
         }
         sanitize_claude_json(&profile_dir.join(".claude.json"))?;
+        strip_copied_helper(&profile_dir.join("settings.json"))?;
 
         Ok(true)
     }
@@ -621,6 +670,10 @@ impl ProfileManager {
             }
         }
         copy_dir_all_filtered(&src, &dest, &seed_skip(include_history))?;
+        strip_copied_helper(&dest.join("settings.json"))?;
+        if force {
+            remove_key(&self.base_dir, name)?;
+        }
         self.seed_skills_from(&src.join("skills"), &dest);
         let email = read_email_from_dir(&dest);
         let profile = Profile {
@@ -694,7 +747,7 @@ fn shell_word(value: &str) -> String {
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
@@ -857,6 +910,8 @@ const IDENTITY_KEYS: &[&str] = &[
     "modelAccessCache",
     "additionalModelCostsCache",
     "additionalModelOptionsCache",
+    "primaryApiKey",
+    "customApiKeyResponses",
 ];
 
 /// Recursive copy that skips a set of **top-level** entry names.
@@ -1059,7 +1114,7 @@ fn extract_windows_credentials() -> Option<String> {
 /// Authoritative where the config files are not: it reflects the live
 /// credential, not whatever metadata happens to be on disk. Returns `None` if
 /// the profile is logged out or the CLI is too old to have `auth status`.
-fn read_account_email(profile_dir: &Path) -> Option<String> {
+fn read_login_status(profile_dir: &Path) -> Option<serde_json::Value> {
     let output = std::process::Command::new("claude")
         .args(["auth", "status", "--json"])
         .env("CLAUDE_CONFIG_DIR", profile_dir)
@@ -1068,13 +1123,7 @@ fn read_account_email(profile_dir: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    if val.get("loggedIn").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
-    }
-    val.get("email")
-        .and_then(|e| e.as_str())
-        .map(|s| s.to_string())
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Read email from `~/.claude.json` at home root (macOS stores account metadata here).
@@ -1646,7 +1695,10 @@ mod tests {
         let registry_before = fs::read_to_string(&mgr.registry_path).unwrap();
 
         // Refusing a taken name is the failure path a user hits most often.
-        assert!(mgr.login_profile("keep", false, None).is_err());
+        assert!(
+            mgr.login_profile("keep", false, None, LoginMethod::ClaudeAi)
+                .is_err()
+        );
 
         assert_eq!(fs::read(&creds).unwrap(), before);
         assert_eq!(
@@ -1663,7 +1715,9 @@ mod tests {
         mgr.add_profile_from("taken", &src).unwrap();
 
         // login_profile should refuse because the dir is non-empty
-        let err = mgr.login_profile("taken", false, None).unwrap_err();
+        let err = mgr
+            .login_profile("taken", false, None, LoginMethod::ClaudeAi)
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
@@ -2242,5 +2296,101 @@ mod tests {
         assert_eq!(describe_age(90), "seconds ago");
         assert_eq!(describe_age(240), "4 min ago");
         assert_eq!(describe_age(7_200), "2 h ago");
+    }
+
+    #[test]
+    fn login_args_include_console_only_when_requested() {
+        // Known-bad: the Console flag is dropped while keeping the email hint.
+        assert_eq!(
+            login_args(LoginMethod::Console, Some(" user@example.com ")),
+            ["auth", "login", "--console", "--email", "user@example.com"]
+        );
+        assert_eq!(
+            login_args(LoginMethod::ClaudeAi, Some("user@example.com")),
+            ["auth", "login", "--email", "user@example.com"]
+        );
+    }
+
+    #[test]
+    fn console_login_verdict_allows_null_email_but_requires_managed_source() {
+        // Known-bad: requiring an email for Console rejects a valid managed-key login.
+        let console = serde_json::json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","apiKeySource":"/login managed key","email":null});
+        assert_eq!(login_verdict(LoginMethod::Console, &console).unwrap(), None);
+        assert!(login_verdict(LoginMethod::ClaudeAi, &console).is_err());
+        let subscription = serde_json::json!({"loggedIn":true,"authMethod":"claude.ai","email":"user@example.com"});
+        assert_eq!(
+            login_verdict(LoginMethod::ClaudeAi, &subscription).unwrap(),
+            Some("user@example.com".to_string())
+        );
+        assert!(login_verdict(LoginMethod::Console, &subscription).is_err());
+        let logged_out = serde_json::json!({"loggedIn":false,"apiKeySource":"/login managed key"});
+        assert!(login_verdict(LoginMethod::Console, &logged_out).is_err());
+        let wrong_source = serde_json::json!({"loggedIn":true,"apiKeySource":"apiKeyHelper"});
+        assert!(login_verdict(LoginMethod::Console, &wrong_source).is_err());
+    }
+
+    #[test]
+    fn login_seed_strips_new_identity_keys() {
+        // Known-bad: omitting either primaryApiKey or customApiKeyResponses leaks the source login.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        fs::create_dir_all(&mgr.claude_home).unwrap();
+        fs::write(mgr.claude_home.parent().unwrap().join(".claude.json"), serde_json::json!({
+            "primaryApiKey":"synthetic", "customApiKeyResponses":{"approved":["synthetic"]}, "projects":{"/synthetic": {"trusted":true}}
+        }).to_string()).unwrap();
+        let dest = mgr.profile_dir("new");
+        fs::create_dir_all(&dest).unwrap();
+        mgr.seed_profile_dir(&dest, false).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_slice(&fs::read(dest.join(".claude.json")).unwrap()).unwrap();
+        assert!(result.get("primaryApiKey").is_none());
+        assert!(result.get("customApiKeyResponses").is_none());
+        assert_eq!(result["projects"]["/synthetic"]["trusted"], true);
+    }
+
+    #[test]
+    fn seeded_and_copied_settings_drop_source_managed_helper() {
+        // Known-bad: a copied helper bills the source profile's key.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        fs::create_dir_all(&mgr.claude_home).unwrap();
+        let settings = serde_json::json!({"theme":"dark", "apiKeyHelper":"'/opt/tools/cswitch' key print source"});
+        fs::write(mgr.claude_home.join("settings.json"), settings.to_string()).unwrap();
+        let dest = mgr.profile_dir("seeded");
+        fs::create_dir_all(&dest).unwrap();
+        mgr.seed_profile_dir(&dest, false).unwrap();
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&fs::read(dest.join("settings.json")).unwrap()).unwrap();
+        assert!(seeded.get("apiKeyHelper").is_none());
+        assert_eq!(seeded["theme"], "dark");
+        mgr.add_profile_from("copied", &mgr.claude_home).unwrap();
+        let copied: serde_json::Value = serde_json::from_slice(
+            &fs::read(mgr.profile_dir("copied").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(copied.get("apiKeyHelper").is_none());
+        assert_eq!(copied["theme"], "dark");
+    }
+
+    #[test]
+    fn remove_and_refresh_delete_saved_key() {
+        // Known-bad: deleting or refreshing a profile leaves its key orphaned.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        mgr.add_profile_from("remove", &source).unwrap();
+        mgr.add_profile_from("refresh", &source).unwrap();
+        fs::create_dir_all(mgr.base_dir.join("keys")).unwrap();
+        fs::write(crate::key::key_path(&mgr.base_dir, "remove"), "synthetic\n").unwrap();
+        fs::write(
+            crate::key::key_path(&mgr.base_dir, "refresh"),
+            "synthetic\n",
+        )
+        .unwrap();
+        mgr.remove_profile("remove").unwrap();
+        assert!(!crate::key::has_key(&mgr, "remove"));
+        mgr.add_profile_from_force("refresh", &source).unwrap();
+        assert!(!crate::key::has_key(&mgr, "refresh"));
     }
 }

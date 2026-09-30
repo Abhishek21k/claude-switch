@@ -125,22 +125,30 @@ fn parse_reset(value: Option<&Value>) -> Option<DateTime<Utc>> {
 }
 
 /// A read can race Claude Code's replacement of `.claude.json`. Retry once.
-pub fn read_limits(profile_dir: &Path) -> Limits {
+pub fn read_claude_json(profile_dir: &Path) -> Result<Option<Value>, ()> {
     let path = profile_dir.join(".claude.json");
+    if !path.exists() {
+        return Ok(None);
+    }
     for attempt in 0..2 {
         if let Ok(bytes) = fs::read(&path)
             && let Ok(json) = serde_json::from_slice::<Value>(&bytes)
         {
-            let limits = parse_limits(&json);
-            if limits != Limits::Unreadable {
-                return limits;
-            }
+            return Ok(Some(json));
         }
         if attempt == 0 {
             thread::sleep(Duration::from_millis(50));
         }
     }
-    Limits::Unreadable
+    Err(())
+}
+
+#[cfg(test)]
+pub fn read_limits(profile_dir: &Path) -> Limits {
+    match read_claude_json(profile_dir) {
+        Ok(Some(json)) => parse_limits(&json),
+        _ => Limits::Unreadable,
+    }
 }
 
 impl Snapshot {

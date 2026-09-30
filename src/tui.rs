@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -9,9 +9,11 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::limits::{Limits, Window, read_limits};
-use crate::profile::{Profile, ProfileManager, describe_age, detect_current_account};
+use crate::key::{self, AuthMode, InputStep};
+use crate::limits::{Limits, Window, parse_limits, read_claude_json};
+use crate::profile::{LoginMethod, Profile, ProfileManager, describe_age, detect_current_account};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -35,6 +37,8 @@ enum Mode {
     Help,
     ConfirmDelete,
     ConfirmRefresh,
+    ConfirmKeyClear,
+    KeyEntry,
     AddName,
     /// Name accepted; now choosing *how* the profile gets its account.
     /// Split from `AddName` so Esc backs out one step at a time and the
@@ -50,7 +54,7 @@ enum Mode {
 #[derive(Debug, Clone, PartialEq)]
 enum PendingAction {
     /// Authenticate a brand-new profile as a different Claude account.
-    Login { name: String },
+    Login { name: String, method: LoginMethod },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -60,6 +64,8 @@ pub struct App {
     list_state: ListState,
     mode: Mode,
     input_buffer: String,
+    key_buffer: String,
+    executable: PathBuf,
     search_query: String,
     /// Indices into `profiles` matching the current search.
     filtered_indices: Vec<usize>,
@@ -78,11 +84,13 @@ pub struct App {
     /// reason: the confirmation should name every consequence, not just the
     /// credential one.
     selected_has_history: bool,
+    selected_has_key: bool,
     pending: Option<PendingAction>,
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
     account_probe: AccountProbe,
     limits: HashMap<String, Limits>,
+    auth_modes: HashMap<String, AuthMode>,
     limits_selection: Option<String>,
     last_limits_refresh: Option<Instant>,
     limits_now: DateTime<Utc>,
@@ -118,6 +126,8 @@ impl App {
             list_state,
             mode,
             input_buffer,
+            key_buffer: String::new(),
+            executable: PathBuf::new(),
             search_query: String::new(),
             filtered_indices,
             detected_email,
@@ -125,13 +135,20 @@ impl App {
             current_account: None,
             selected_in_use: None,
             selected_has_history: false,
+            selected_has_key: false,
             pending: None,
             account_probe: live_account_email,
             limits: HashMap::new(),
+            auth_modes: HashMap::new(),
             limits_selection: None,
             last_limits_refresh: None,
             limits_now: Utc::now(),
         })
+    }
+
+    pub fn with_executable(mut self, executable: PathBuf) -> Self {
+        self.executable = executable;
+        self
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -159,8 +176,17 @@ impl App {
         if let Some(name) = &selected
             && (changed || due)
         {
-            self.limits
-                .insert(name.clone(), read_limits(&self.manager.profile_dir(name)));
+            let claude = read_claude_json(&self.manager.profile_dir(name));
+            self.auth_modes.insert(
+                name.clone(),
+                key::read_auth_mode(&self.manager, name, claude.clone()),
+            );
+            self.limits.insert(
+                name.clone(),
+                claude
+                    .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+                    .unwrap_or(Limits::Unreadable),
+            );
             self.last_limits_refresh = Some(instant);
         }
         self.limits_selection = selected;
@@ -295,6 +321,8 @@ impl App {
                     Mode::ConfirmRefresh => {
                         self.handle_confirm_refresh(key.code)?;
                     }
+                    Mode::ConfirmKeyClear => self.handle_confirm_key_clear(key.code)?,
+                    Mode::KeyEntry => self.handle_key_entry(key)?,
                     Mode::AddName => {
                         if self.handle_add_name(key.code)? {
                             return Ok(());
@@ -333,8 +361,8 @@ impl App {
         // `select` is only set when a profile actually landed in the registry,
         // so a failed attempt leaves the current selection alone.
         let (select, message) = match action {
-            PendingAction::Login { name } => {
-                match self.manager.login_profile(&name, false, None) {
+            PendingAction::Login { name, method } => {
+                match self.manager.login_profile(&name, false, None, method) {
                     Ok(result) => {
                         let others: Vec<&str> = result
                             .same_account_as
@@ -343,7 +371,11 @@ impl App {
                             .filter(|n| *n != name)
                             .collect();
 
-                        let msg = if others.is_empty() {
+                        let msg = if method == LoginMethod::Console && result.email.is_none() {
+                            format!(
+                                "Console login completed for profile '{name}' (email unavailable)."
+                            )
+                        } else if others.is_empty() {
                             format!(
                                 "Profile '{}' logged in as {}.",
                                 name,
@@ -429,7 +461,10 @@ impl App {
                 self.detected_email = None;
                 self.claude_dir_found = false;
                 self.mode = Mode::Normal;
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
             }
 
             KeyCode::Backspace => {
@@ -448,7 +483,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
 
-            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+            KeyCode::Up => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
 
             KeyCode::Char('/') => {
@@ -475,6 +510,14 @@ impl App {
                 self.input_buffer.clear();
             }
 
+            KeyCode::Char('k') if self.selected_profile().is_some() => {
+                self.key_buffer.clear();
+                self.mode = Mode::KeyEntry;
+            }
+            KeyCode::Char('K') if self.selected_profile().is_some() => {
+                self.mode = Mode::ConfirmKeyClear;
+            }
+
             KeyCode::Char('a') => {
                 self.mode = Mode::AddName;
                 self.input_buffer.clear();
@@ -495,6 +538,9 @@ impl App {
                 self.current_account = (self.account_probe)();
                 self.selected_in_use = self.selected_session_age();
                 self.selected_has_history = self.selected_holds_history();
+                self.selected_has_key = self
+                    .selected_profile()
+                    .is_some_and(|p| key::has_key(&self.manager, &p.name));
                 self.mode = Mode::ConfirmRefresh;
             }
 
@@ -529,6 +575,71 @@ impl App {
             }
             _ => self.mode = Mode::Normal,
         }
+        Ok(())
+    }
+
+    fn handle_key_entry(&mut self, event: KeyEvent) -> Result<()> {
+        match key::apply_key_event(&mut self.key_buffer, event) {
+            InputStep::Continue => {}
+            InputStep::Abort => self.mode = Mode::Normal,
+            InputStep::Complete => {
+                let input = std::mem::take(&mut self.key_buffer);
+                if let Some(profile) = self.selected_profile() {
+                    let name = profile.name.clone();
+                    self.mode = match key::set_key(
+                        &self.manager,
+                        &name,
+                        &input,
+                        &self.executable,
+                        false,
+                        Utc::now(),
+                    ) {
+                        Ok(outcome) => {
+                            self.last_limits_refresh = None;
+                            let mut message = format!("API key saved for profile '{name}'.");
+                            if outcome.running_session {
+                                message.push_str(" Restart running sessions.");
+                            }
+                            if outcome.overrides_subscription {
+                                message.push_str(" Billing moves to the API.");
+                            }
+                            if outcome.build_path {
+                                message.push_str(" Helper uses a build directory; install cswitch and rerun key set.");
+                            }
+                            Mode::Message(message, false)
+                        }
+                        Err(error) => Mode::Message(error.to_string(), true),
+                    };
+                } else {
+                    self.mode = Mode::Normal;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_key_clear(&mut self, code: KeyCode) -> Result<()> {
+        if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && let Some(profile) = self.selected_profile()
+        {
+            let name = profile.name.clone();
+            self.mode = match key::clear_key(&self.manager, &name, Utc::now()) {
+                Ok(result) => {
+                    self.last_limits_refresh = None;
+                    let mut message = format!(
+                        "API key removed for '{name}'. Fallback: {}.",
+                        result.fallback
+                    );
+                    if result.foreign_helper {
+                        message.push_str(" A foreign helper remains active.");
+                    }
+                    Mode::Message(message, false)
+                }
+                Err(error) => Mode::Message(error.to_string(), true),
+            };
+            return Ok(());
+        }
+        self.mode = Mode::Normal;
         Ok(())
     }
 
@@ -648,7 +759,16 @@ impl App {
                 }
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::Console,
+                });
             }
             // Esc steps back to the name, not out of the flow — a typo in the
             // name should not cost the whole interaction.
@@ -673,7 +793,10 @@ impl App {
                     self.mode = Mode::Message(existing, true);
                     return Ok(false);
                 }
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Backspace => {
@@ -737,6 +860,8 @@ impl App {
             Mode::Help => self.render_help(f),
             Mode::ConfirmDelete => self.render_confirm_delete_popup(f),
             Mode::ConfirmRefresh => self.render_confirm_refresh_popup(f),
+            Mode::ConfirmKeyClear => self.render_confirm_key_clear_popup(f),
+            Mode::KeyEntry => self.render_key_entry_popup(f),
             Mode::AddName => self.render_add_name_popup(f),
             Mode::AddChoice => self.render_add_choice_popup(f),
             Mode::LoginName => self.render_login_name_popup(f),
@@ -1116,6 +1241,16 @@ impl App {
                 ),
             ]),
             Line::from(vec![
+                Span::styled("  Auth         ", Style::default().fg(DIM)),
+                Span::styled(
+                    self.auth_modes
+                        .get(&profile.name)
+                        .map(AuthMode::label)
+                        .unwrap_or("unreadable"),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("  Added        ", Style::default().fg(DIM)),
                 Span::styled(
                     profile.added.format("%Y-%m-%d %H:%M UTC").to_string(),
@@ -1209,11 +1344,13 @@ impl App {
             vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
         } else {
             vec![
-                ("↑↓/jk", "nav"),
+                ("↑↓/j", "nav"),
                 ("enter", "launch"),
                 ("/", "search"),
                 ("a", "add account"),
                 ("l", "login"),
+                ("k", "set key"),
+                ("K", "clear key"),
                 ("r", "refresh"),
                 ("d", "delete"),
                 ("?", "help"),
@@ -1252,11 +1389,13 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("↑/↓  j/k", "Navigate profiles"),
+            ("↑/↓  j", "Navigate profiles"),
             ("Enter", "Launch Claude with selected profile"),
             ("/", "Search profiles by name or email"),
-            ("a", "Add account — then choose copy or login"),
+            ("a", "Add account — choose copy, subscription, or Console"),
             ("l", "Login — straight to a different account"),
+            ("k", "Set API key for selected profile"),
+            ("K", "Clear API key after confirmation"),
             ("r", "Refresh — overwrite with current session"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
@@ -1384,7 +1523,7 @@ impl App {
 
     /// The step that makes the side effect explicit before it happens.
     fn render_add_choice_popup(&self, f: &mut Frame) {
-        let area = centered_rect(66, 12, f.area());
+        let area = centered_rect(66, 15, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -1432,6 +1571,14 @@ impl App {
                     "      or it will grant the account already signed in there.",
                     Style::default().fg(DIM),
                 )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [p] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        "Log in with the Anthropic Console (API billing)",
+                        Style::default().fg(TEXT),
+                    ),
+                ]),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Esc back · q cancel",
@@ -1539,6 +1686,14 @@ impl App {
             lines.push(Line::from(""));
         }
 
+        if self.selected_has_key {
+            lines.push(Line::from(Span::styled(
+                "  Its saved API key will be deleted.",
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(""));
+        }
+
         lines.push(Line::from(Span::styled(
             "  [y] Confirm   ·   any other key cancels",
             Style::default().fg(MUTED),
@@ -1581,6 +1736,43 @@ impl App {
                     Style::default().fg(DIM),
                 )),
             ]))
+            .block(block),
+            area,
+        );
+    }
+
+    fn render_key_entry_popup(&self, f: &mut Frame) {
+        let area = centered_rect(60, 7, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Set API key ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!(
+                "  API key: {}",
+                "•".repeat(self.key_buffer.chars().count())
+            )),
+            Line::from(""),
+            Line::from("  Enter saves · Esc or Ctrl-C cancels"),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_confirm_key_clear_popup(&self, f: &mut Frame) {
+        let area = centered_rect(60, 6, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Clear API key ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DANGER))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(
+            Paragraph::new(
+                "\n  Delete this profile's saved API key?\n\n  [y] Confirm · any other key cancels",
+            )
             .block(block),
             area,
         );
@@ -1680,6 +1872,8 @@ mod tests {
     use super::*;
     use crate::profile::Profile;
     use chrono::Utc;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::fs;
     use tempfile::TempDir;
 
     const STUB_EMAIL: &str = "current@example.com";
@@ -1720,6 +1914,68 @@ mod tests {
         app.mode = Mode::Normal;
         app.input_buffer.clear();
         app
+    }
+
+    fn render_text(app: &mut App) -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn console_choice_routes_through_pending_action() {
+        // Known-bad: [p] falling through to the subscription login.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "api".to_string();
+        app.handle_add_choice(KeyCode::Char('p')).unwrap();
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Login {
+                name: "api".to_string(),
+                method: LoginMethod::Console
+            })
+        );
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn key_popup_masks_secret_and_escape_clears_it() {
+        // Known-bad: the entered key appears in a TUI frame or survives Escape.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        app.handle_normal_key(KeyCode::Char('k'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::KeyEntry);
+        app.key_buffer = "sk-ant-api03-TESTKEY000".to_string();
+        let frame = render_text(&mut app);
+        assert!(!frame.contains("sk-ant-api03-TESTKEY000"));
+        assert!(frame.contains('•'));
+        app.handle_key_entry(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.key_buffer.is_empty());
+    }
+
+    #[test]
+    fn refresh_confirmation_names_saved_key_loss() {
+        // Known-bad: refresh deletes a key without warning in the confirmation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        fs::create_dir_all(app.manager.base_dir.join("keys")).unwrap();
+        fs::write(key::key_path(&app.manager.base_dir, "api"), "synthetic\n").unwrap();
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmRefresh);
+        assert!(render_text(&mut app).contains("Its saved API key will be deleted."));
     }
 
     fn type_name(app: &mut App, name: &str) {
@@ -1900,7 +2156,8 @@ mod tests {
         assert_eq!(
             app.pending,
             Some(PendingAction::Login {
-                name: "business".to_string()
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
             })
         );
         // Login must not register anything until Claude has authenticated.
@@ -1935,7 +2192,8 @@ mod tests {
         assert_eq!(
             app.pending,
             Some(PendingAction::Login {
-                name: "business".to_string()
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
             })
         );
     }
@@ -2027,7 +2285,8 @@ mod tests {
         assert_eq!(
             app.pending,
             Some(PendingAction::Login {
-                name: "business".to_string()
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
             })
         );
     }

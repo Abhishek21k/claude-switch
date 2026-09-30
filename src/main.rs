@@ -1,4 +1,5 @@
 mod atomic;
+mod key;
 mod limits;
 mod profile;
 mod skills_sync;
@@ -8,11 +9,11 @@ mod usage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Parser, Subcommand};
-use limits::{Limits, Window, format_info, read_limits};
-use profile::{LoginOutcome, ProfileManager, detect_current_account};
+use limits::{Limits, Window, format_info, parse_limits, read_claude_json};
+use profile::{LoginMethod, LoginOutcome, ProfileManager, detect_current_account};
 use skills_sync::{SyncAction, SyncOptions, SyncReport};
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -89,6 +90,15 @@ enum Commands {
         /// the account granted is whichever one the browser is signed in as.
         #[arg(long)]
         email: Option<String>,
+        /// Authenticate using Anthropic Console API billing
+        #[arg(long)]
+        console: bool,
+    },
+
+    /// Manage a profile's local Anthropic API key
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
     },
 
     /// Remove a saved profile
@@ -168,13 +178,46 @@ enum UsageAction {
     Verify,
 }
 
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Save a key read from hidden terminal input or one stdin line
+    Set {
+        name: String,
+        #[arg(long)]
+        replace_helper: bool,
+    },
+    /// Remove the saved key and cswitch-managed helper
+    Clear { name: String },
+    /// Print a saved key for Claude Code's apiKeyHelper
+    #[command(hide = true)]
+    Print { name: String },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    if let Some(Commands::Key {
+        action: KeyAction::Print { name },
+    }) = &cli.command
+    {
+        let base_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+            .join(".claude-switch");
+        if let Err((code, phrase)) = key::print_key(
+            &base_dir,
+            name,
+            io::stdout().is_terminal(),
+            &mut io::stdout(),
+        ) {
+            eprintln!("{phrase}");
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     let manager = ProfileManager::new()?;
 
     match cli.command {
         None | Some(Commands::Ui) => {
-            let app = tui::App::new(manager)?;
+            let app = tui::App::new(manager)?.with_executable(std::env::current_exe()?);
             app.run()?;
         }
 
@@ -194,10 +237,58 @@ fn main() -> Result<()> {
             name,
             include_history,
             email,
+            console,
         }) => {
-            let outcome = manager.login_profile(&name, include_history, email.as_deref())?;
+            let method = if console {
+                LoginMethod::Console
+            } else {
+                LoginMethod::ClaudeAi
+            };
+            let outcome =
+                manager.login_profile(&name, include_history, email.as_deref(), method)?;
             report_login(&name, &outcome);
         }
+
+        Some(Commands::Key { action }) => match action {
+            KeyAction::Set {
+                name,
+                replace_helper,
+            } => {
+                let input = key::read_key_input()?;
+                let executable = std::env::current_exe()?;
+                let result = key::set_key(
+                    &manager,
+                    &name,
+                    &input,
+                    &executable,
+                    replace_helper,
+                    Utc::now(),
+                )?;
+                println!("API key saved for profile '{name}'.");
+                if result.running_session {
+                    println!("Restart this profile's running Claude sessions to use the key.");
+                }
+                if result.overrides_subscription {
+                    println!("The key overrides the subscription; billing moves to the API.");
+                }
+                if result.build_path {
+                    println!(
+                        "Warning: this helper points at a build directory; install cswitch and rerun `key set`."
+                    );
+                }
+            }
+            KeyAction::Clear { name } => {
+                let result = key::clear_key(&manager, &name, Utc::now())?;
+                println!(
+                    "API key removed for profile '{name}'. Fallback: {}.",
+                    result.fallback
+                );
+                if result.foreign_helper {
+                    println!("A foreign apiKeyHelper remains in settings.json.");
+                }
+            }
+            KeyAction::Print { .. } => unreachable!("handled before manager setup"),
+        },
 
         Some(Commands::Remove { name, purge_usage }) => {
             if purge_usage {
@@ -248,6 +339,9 @@ fn main() -> Result<()> {
                 let dir = manager.profile_dir(&p.name);
                 println!("Name:      {}", p.name);
                 println!("Email:     {}", p.email.as_deref().unwrap_or("unknown"));
+                let claude = read_claude_json(&dir);
+                let auth = key::read_auth_mode(&manager, &p.name, claude.clone());
+                println!("Auth:      {}", auth.label());
                 println!("Added:     {}", p.added.format("%Y-%m-%d %H:%M UTC"));
                 println!(
                     "Last used: {}",
@@ -256,7 +350,10 @@ fn main() -> Result<()> {
                         .unwrap_or("never".to_string())
                 );
                 println!("Directory: {}", dir.display());
-                print!("{}", format_info(&read_limits(&dir), Utc::now()));
+                let limits = claude
+                    .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+                    .unwrap_or(Limits::Unreadable);
+                print!("{}", format_info(&limits, Utc::now()));
                 println!();
                 println!("Launch:");
                 println!("  cswitch use {}", p.name);
@@ -326,9 +423,39 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     let mut output = format!("{}\n{}\n", header, "─".repeat(header.chars().count()));
     let mut saw_reset = false;
     let mut saw_flag = false;
+    let mut saw_api = false;
 
     for profile in profiles {
-        let limits = read_limits(&manager.profile_dir(&profile.name));
+        let name: String = profile.name.chars().take(20).collect();
+        let email: String = profile
+            .email
+            .as_deref()
+            .unwrap_or("—")
+            .chars()
+            .take(32)
+            .collect();
+        let dir = manager.profile_dir(&profile.name);
+        let claude = read_claude_json(&dir);
+        let auth = key::read_auth_mode(manager, &profile.name, claude.clone());
+        let limits = claude
+            .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+            .unwrap_or(Limits::Unreadable);
+        if auth.api_billed() {
+            saw_api = true;
+            output.push_str(&format!(
+                "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+                name,
+                email,
+                "—",
+                "—",
+                "api",
+                profile
+                    .last_used
+                    .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "never".to_string())
+            ));
+            continue;
+        }
         let (session, weekly, age) = match &limits {
             Limits::Snapshot(snapshot) => {
                 let session = list_window(snapshot.session(), now, false);
@@ -347,13 +474,11 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             .unwrap_or_else(|| "never".to_string());
         output.push_str(&format!(
             "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
-            profile.name,
-            profile.email.as_deref().unwrap_or("—"),
-            session,
-            weekly,
-            age,
-            last_used
+            name, email, session, weekly, age, last_used
         ));
+    }
+    if saw_api {
+        output.push_str("\napi = billed per token, no plan limits\n");
     }
     if saw_reset || saw_flag {
         let mut parts = Vec::new();
@@ -523,9 +648,10 @@ fn handle_add(
             println!("Active Claude session detected: {}\n", email);
             println!("  [c]  Copy this session as profile '{}'", name);
             println!("  [l]  Login to a different account for profile '{}'", name);
+            println!("  [p]  Log in with the Anthropic Console (API billing)");
             println!();
 
-            let choice = prompt_choice("Choice [c/l]: ", &['c', 'l'])?;
+            let choice = prompt_choice("Choice [c/l/p]: ", &['c', 'l', 'p'])?;
 
             match choice {
                 'c' => {
@@ -549,7 +675,17 @@ fn handle_add(
                     }
                 }
                 'l' => {
-                    let outcome = manager.login_profile(name, include_history, None)?;
+                    let outcome = manager.login_profile(
+                        name,
+                        include_history,
+                        None,
+                        LoginMethod::ClaudeAi,
+                    )?;
+                    report_login(name, &outcome);
+                }
+                'p' => {
+                    let outcome =
+                        manager.login_profile(name, include_history, None, LoginMethod::Console)?;
                     report_login(name, &outcome);
                 }
                 _ => unreachable!(),
@@ -558,7 +694,14 @@ fn handle_add(
         None => {
             // No active session — go straight to login
             println!("No active Claude session found. Opening Claude for login…\n");
-            let outcome = manager.login_profile(name, include_history, None)?;
+            println!("  [l]  Log in with a Claude subscription");
+            println!("  [p]  Log in with the Anthropic Console (API billing)");
+            let method = if prompt_choice("Choice [l/p]: ", &['l', 'p'])? == 'p' {
+                LoginMethod::Console
+            } else {
+                LoginMethod::ClaudeAi
+            };
+            let outcome = manager.login_profile(name, include_history, None, method)?;
             report_login(name, &outcome);
         }
     }
@@ -630,6 +773,64 @@ mod tests {
     use crate::skills_sync::SyncEntry;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn console_and_key_cli_surfaces_parse_without_key_argument() {
+        // Known-bad: dropping --console or accepting a secret as a positional argument.
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "login", "n", "--console"])
+                .unwrap()
+                .command,
+            Some(Commands::Login { console: true, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "key", "set", "n", "--replace-helper"])
+                .unwrap()
+                .command,
+            Some(Commands::Key {
+                action: KeyAction::Set {
+                    replace_helper: true,
+                    ..
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["cswitch", "key", "set", "n", "synthetic-secret"]).is_err());
+    }
+
+    #[test]
+    fn list_marks_api_billed_rows_and_keeps_width() {
+        // Known-bad: API-billed profiles show no data instead of api.
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let manager = ProfileManager::with_paths(tmp.path().join("base"), source.clone()).unwrap();
+        manager.add_profile_from("console", &source).unwrap();
+        manager.add_profile_from("key", &source).unwrap();
+        fs::write(
+            manager.profile_dir("console").join(".claude.json"),
+            r#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        fs::write(
+            manager.profile_dir("key").join("settings.json"),
+            r#"{"apiKeyHelper":"cswitch key print key"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(manager.base_dir.join("keys")).unwrap();
+        fs::write(key::key_path(&manager.base_dir, "key"), "synthetic\n").unwrap();
+        let output = list_output(&manager, Utc::now()).unwrap();
+        let rows: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("console") || line.starts_with("key "))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|line| line.split_whitespace().any(|field| field == "api"))
+        );
+        assert!(output.contains("api = billed per token, no plan limits"));
+        assert!(output.lines().all(|line| line.chars().count() <= 120));
+    }
 
     #[test]
     fn usage_cli_accepts_report_label_verify_and_purge_surfaces() {

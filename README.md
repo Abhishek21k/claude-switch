@@ -73,6 +73,9 @@ cswitch
 | `cswitch add <name>` | Add a new profile (detects active session, asks to copy or login) |
 | `cswitch login <name>` | Create a profile by logging into a different account |
 | `cswitch login <name> --email <addr>` | Same, pre-filling the address on Claude's login page |
+| `cswitch login <name> --console` | Create a profile through Anthropic Console (API billing) |
+| `cswitch key set <name> [--replace-helper]` | Read a key from hidden terminal input or one stdin line and enable it for the profile |
+| `cswitch key clear <name>` | Remove the saved key and return to the profile's prior login |
 | `cswitch use <name> [claude flags...]` | Sync skills, then launch Claude Code with a specific profile; flags pass through unchanged |
 | `cswitch sync <name> [--dry-run] [--adopt <skill>]...` | Sync shared skills into one profile |
 | `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every profile |
@@ -84,6 +87,14 @@ cswitch
 | `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
 | `cswitch aliases` | Print shell aliases for all profiles |
 | `cswitch --help` | Full CLI help |
+
+## API key
+
+Create a profile with `cswitch login <name> --console`, or choose `[p]` after `cswitch add <name>` or in the TUI Add menu. Console login uses API billing. Later, `cswitch key set <name>` reads your own Anthropic key without echoing it. A pipe can provide one line on stdin. The key is never a command argument.
+
+The key is stored outside the profile at `~/.claude-switch/keys/<name>.key` (`0700` directory, `0600` file on Unix). The profile's `settings.json` stores only an `apiKeyHelper` command that asks cswitch for the key. That helper overrides a Console login or subscription while present; `cswitch key clear <name>` removes it and reports the fallback. If an unrelated helper already exists, `key set` refuses to replace it unless you pass `--replace-helper`.
+
+`key print` is a hidden command used only by Claude Code's helper. It refuses to print to a terminal and refuses an exposed key file on Unix. `cswitch info` and the TUI show the active authentication source; API-billed rows in `cswitch list` show `api` instead of plan limits.
 
 ## Plan limits
 
@@ -139,18 +150,20 @@ Run `cswitch` with no arguments to open the TUI.
 │   client          ││  CLAUDE_CONFIG_DIR='...' claude   │
 │   dev@client.io   ││                                   │
 └───────────────────┘└───────────────────────────────────┘
-┌ ↑↓/jk nav  enter launch  / search  a add account ...  ┐
+┌ ↑↓/j nav  enter launch  / search  a add account ...  ┐
 ```
 
 ### TUI keybindings
 
 | Key | Action |
 |---|---|
-| `↑/↓` or `j/k` | Navigate profiles |
+| `↑/↓` or `j` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
 | `/` | Search profiles by name or email |
 | `a` | Add account — enter a name, then choose copy or login |
 | `l` | Login — shortcut straight to a different account |
+| `k` | Enter a masked API key for the selected profile |
+| `K` | Clear the selected profile's API key after confirmation |
 | `r` | Refresh — overwrite the selected profile with the current session (confirmed) |
 | `d` | Delete selected profile (confirmed) |
 | `?` | Help overlay |
@@ -158,7 +171,7 @@ Run `cswitch` with no arguments to open the TUI.
 
 ## Copy vs Login
 
-A profile is a **config environment**, not an identity. Its name is a local label you choose; the Claude account inside it comes from authentication and nothing else. So `a` always asks which of two things you want:
+A profile is a **config environment**, not an identity. Its name is a local label you choose; the Claude account inside it comes from authentication and nothing else. The `a` menu offers copy, subscription login, and Console login.
 
 **Copy current session** — same Claude account, separate setup.
 
@@ -233,7 +246,7 @@ When you run `cswitch` for the first time, it detects your active Claude session
 1. **Copy active session** — saves your current credentials as a profile, no re-login needed
 2. **Login to a new account** — opens Claude so you can authenticate with a different account
 
-After that, `a` in the TUI offers the same two choices for every additional profile.
+After that, `a` in the TUI also offers Anthropic Console login for every additional profile.
 
 ## Shell aliases
 
