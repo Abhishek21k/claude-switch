@@ -78,13 +78,47 @@ cswitch
 | `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every profile |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
-| `cswitch remove <name>` | Delete a profile |
+| `cswitch remove <name> [--purge-usage]` | Delete a profile; keep its usage ledger unless explicitly purged |
+| `cswitch usage` | Ingest local transcripts and show a 7-day token and API-equivalent cost report |
+| `cswitch usage label <session> <project>` | Label a past session without reopening it |
+| `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
 | `cswitch aliases` | Print shell aliases for all profiles |
 | `cswitch --help` | Full CLI help |
 
 ## Plan limits
 
 `cswitch list`, `cswitch info <name>`, and the TUI details panel show the 5-hour and 7-day plan limits from Claude Code's own cached snapshot. Each view shows when Claude Code fetched it, and marks a window as `reset` once its reset time has passed. A new profile may show `no data` until Claude Code writes a snapshot. `cswitch` reads the profile's cache without changing it, makes no network call, and never refreshes OAuth tokens.
+
+## Token usage
+
+`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
+
+```bash
+cswitch usage --since 30d --by project
+cswitch usage --since all --profile work --json
+cswitch usage --explain <session-id>
+cswitch usage --unattributed
+cswitch usage label <session-id> <workspace/project>
+cswitch usage verify
+```
+
+`--since` accepts `7d` (default), `30d`, `all`, or `YYYY-MM-DD`; `--by` accepts `profile`, `workspace`, `project`, `session`, `model`, or `day`. The default view is a workspace › project › session tree. Set `CSWITCH_USAGE_DIR` to use another ledger directory, for example when ingesting into a temporary directory. The ledger survives profile removal; `cswitch remove <name> --purge-usage` opts into deleting that profile's rows.
+
+Without configuration, attribution uses the nearest Git root. A private `~/.claude-switch/usage/config.json` can add project folders, workspace names, and aliases. This synthetic example uses only placeholder paths:
+
+```json
+{
+  "superproject": "/srv/example/atlas",
+  "project_globs": ["teams/*/apps/*", "teams/*/sites/*"],
+  "workspaces": [
+    { "glob": "teams/*", "segment": 1 },
+    { "glob": "notes", "name": "notes" }
+  ],
+  "aliases": { "blue/old-ui": "blue/site" }
+}
+```
+
+Nested Git repositories take priority over folder globs. Explicit labels and `/rename` titles take priority over request `cwd`; then file paths can attribute requests whose session has at least 60% of its file touches in one project. `--explain` shows the chosen signal. The report footer gives the earliest ingested timestamp, since deleted transcripts cannot be recovered from the ledger.
 
 ## Interactive TUI
 

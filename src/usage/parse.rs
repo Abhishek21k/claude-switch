@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -24,17 +25,29 @@ pub struct Request {
     pub version: Option<String>,
     pub cwd: Option<String>,
     pub touched: Vec<String>,
+    #[serde(default)]
+    pub cwd_project: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub touched_projects: Vec<String>,
     pub sidechain: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CostState {
     pub time: DateTime<Utc>,
+    pub total_usd: Option<f64>,
+    pub models: BTreeMap<String, ModelCost>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelCost {
     pub usd: f64,
-    pub input: Option<u64>,
-    pub output: Option<u64>,
-    pub cache_write: Option<u64>,
-    pub cache_read: Option<u64>,
+    pub input: u64,
+    pub output: u64,
+    pub cache_write: u64,
+    pub cache_read: u64,
 }
 
 #[derive(Debug)]
@@ -124,6 +137,9 @@ fn request(
         version: string(context.row, "version").map(str::to_string),
         cwd: string(context.row, "cwd").map(str::to_string),
         touched,
+        cwd_project: None,
+        workspace: None,
+        touched_projects: Vec::new(),
         sidechain: context.row.get("isSidechain").and_then(Value::as_bool) == Some(true),
     }
 }
@@ -154,22 +170,33 @@ fn cost(row: &Value, time: DateTime<Utc>) -> Option<CostState> {
         return None;
     }
     let value = row.get("cost").unwrap_or(row);
-    let usd = value
-        .get("costUSD")
-        .or_else(|| value.get("total_cost_usd"))?
-        .as_f64()?;
-    let token = |names: &[&str]| {
-        names
-            .iter()
-            .find_map(|name| value.get(*name).and_then(Value::as_u64))
-    };
+    let model_usage = value.get("modelUsage")?.as_object()?;
+    let mut models = BTreeMap::new();
+    for (model, usage) in model_usage {
+        let token = |camel: &str, snake: &str| {
+            usage
+                .get(camel)
+                .or_else(|| usage.get(snake))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        if let Some(usd) = usage.get("costUSD").and_then(Value::as_f64) {
+            models.insert(
+                model.clone(),
+                ModelCost {
+                    usd,
+                    input: token("inputTokens", "input_tokens"),
+                    output: token("outputTokens", "output_tokens"),
+                    cache_write: token("cacheCreationInputTokens", "cache_creation_input_tokens"),
+                    cache_read: token("cacheReadInputTokens", "cache_read_input_tokens"),
+                },
+            );
+        }
+    }
     Some(CostState {
         time,
-        usd,
-        input: token(&["inputTokens", "input_tokens"]),
-        output: token(&["outputTokens", "output_tokens"]),
-        cache_write: token(&["cacheCreationInputTokens", "cache_creation_input_tokens"]),
-        cache_read: token(&["cacheReadInputTokens", "cache_read_input_tokens"]),
+        total_usd: value.get("totalCostUSD").and_then(Value::as_f64),
+        models,
     })
 }
 
@@ -213,7 +240,7 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
                 usage,
                 model,
                 key.clone(),
-                Some(id.to_string()),
+                (!id.is_empty()).then(|| id.to_string()),
                 touched,
             ));
             if let Some(iterations) = usage.get("iterations").and_then(Value::as_array) {
@@ -223,7 +250,7 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
                     {
                         requests.push(request(
                             &context,
-                            iteration,
+                            iteration.get("usage").unwrap_or(iteration),
                             advisor_model,
                             format!("{key}:advisor:{index}"),
                             None,
@@ -241,4 +268,42 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
         cost: cost(&row, time),
         requests,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn advisor_usage_counts_once_and_synthetic_model_is_skipped() {
+        // Known-bad: adding `message` iterations repeats top-level usage;
+        // ignoring `advisor_message` loses a separately billed request.
+        let mut row = json!({"type":"assistant","timestamp":"2030-01-01T12:00:00Z","sessionId":"sample",
+        "requestId":"req-1","message":{"id":"msg-1","model":"claude-opus-5","usage":{
+            "input_tokens":10,"output_tokens":20,"iterations":[
+                {"type":"message","model":"claude-opus-5","input_tokens":10,"output_tokens":20},
+                {"type":"advisor_message","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":3,"output_tokens":4}}
+            ]}}});
+        let parsed = parse(row.to_string().as_bytes(), "sample")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.requests.len(), 2);
+        assert_eq!(
+            (parsed.requests[0].input, parsed.requests[0].output),
+            (10, 20)
+        );
+        assert_eq!(
+            (parsed.requests[1].model.as_str(), parsed.requests[1].input),
+            ("claude-haiku-4-5-20251001", 3)
+        );
+        row["message"]["model"] = json!("<synthetic>");
+        assert!(
+            parse(row.to_string().as_bytes(), "sample")
+                .unwrap()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+    }
 }

@@ -1,6 +1,7 @@
+use super::attribute::{capture_signals, load_config};
 use super::parse::{CostState, Request, parse};
 use crate::atomic;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
@@ -118,7 +119,11 @@ fn transcript_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if metadata.is_dir() {
             transcript_files(&path, out)?;
         } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
@@ -177,6 +182,18 @@ impl Store {
                 .or_default()
                 .push(request);
         }
+        let requests_dir = self.dir.join("requests");
+        if requests_dir.exists() {
+            for entry in fs::read_dir(&requests_dir)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "jsonl")
+                    && let Some(month) = path.file_stem().and_then(|stem| stem.to_str())
+                    && !months.contains_key(month)
+                {
+                    atomic::write(&path, b"")?;
+                }
+            }
+        }
         for (month, rows) in months {
             save_jsonl(
                 &self.dir.join("requests").join(format!("{month}.jsonl")),
@@ -221,7 +238,7 @@ impl Store {
         save_json(&self.dir.join("cursors.json"), &ledger.cursors)
     }
 
-    fn try_lock(&self) -> Result<Option<File>> {
+    pub(crate) fn try_lock(&self) -> Result<Option<File>> {
         fs::create_dir_all(&self.dir)?;
         let file = OpenOptions::new()
             .create(true)
@@ -243,6 +260,7 @@ impl Store {
             });
         };
         let mut ledger = self.load()?;
+        let config = load_config(&self.dir)?;
         let mut report = IngestReport::default();
         let mut keys = ledger
             .requests
@@ -255,7 +273,12 @@ impl Store {
             .iter()
             .enumerate()
             .filter_map(|(index, request)| {
-                request.message_id.as_ref().map(|id| (id.clone(), index))
+                request.message_id.as_ref().map(|id| {
+                    (
+                        (request.profile.clone(), request.session.clone(), id.clone()),
+                        index,
+                    )
+                })
             })
             .collect::<HashMap<_, _>>();
         let mut sessions = ledger
@@ -271,7 +294,12 @@ impl Store {
             transcript_files(&source.directory.join("projects"), &mut files)?;
             files.sort();
             for path in files {
-                let metadata = fs::metadata(&path)?;
+                let mut file = match File::open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let metadata = file.metadata()?;
                 let (device, inode) = device_inode(&metadata);
                 let path_key = path.to_string_lossy().into_owned();
                 let previous = ledger.cursors.files.get(&path_key).cloned();
@@ -279,6 +307,7 @@ impl Store {
                     cursor.device == device
                         && cursor.inode == inode
                         && cursor.size == metadata.len()
+                        && cursor.offset <= metadata.len()
                 }) {
                     continue;
                 }
@@ -290,8 +319,6 @@ impl Store {
                             && metadata.len() >= cursor.size
                     })
                     .map_or(0, |cursor| cursor.offset);
-                let mut file =
-                    File::open(&path).with_context(|| format!("reading {}", path.display()))?;
                 file.seek(SeekFrom::Start(offset))?;
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
@@ -359,11 +386,18 @@ impl Store {
                     {
                         session.cost_state = Some(cost);
                     }
-                    for request in parsed.requests {
+                    for mut request in parsed.requests {
+                        capture_signals(&mut request, &config);
                         let replay = request
                             .message_id
                             .as_ref()
-                            .and_then(|id| sidechain_ids.get(id))
+                            .and_then(|id| {
+                                sidechain_ids.get(&(
+                                    request.profile.clone(),
+                                    request.session.clone(),
+                                    id.clone(),
+                                ))
+                            })
                             .copied()
                             .filter(|&index| ledger.requests[index].sidechain || request.sidechain);
                         if let Some(existing) = keys.get(&request.key).copied().or(replay) {
@@ -381,7 +415,10 @@ impl Store {
                             }
                         } else {
                             if let Some(id) = &request.message_id {
-                                sidechain_ids.insert(id.clone(), ledger.requests.len());
+                                sidechain_ids.insert(
+                                    (request.profile.clone(), request.session.clone(), id.clone()),
+                                    ledger.requests.len(),
+                                );
                             }
                             keys.insert(request.key.clone(), ledger.requests.len());
                             ledger.requests.push(request);
@@ -417,20 +454,9 @@ impl Store {
         ledger.sessions.retain(|row| row.profile != profile);
         ledger.cursors.files.retain(|path, _| {
             !self.sources.iter().any(|source| {
-                source.profile == profile
-                    && path.starts_with(&source.directory.to_string_lossy().to_string())
+                source.profile == profile && Path::new(path).starts_with(&source.directory)
             })
         });
-        // Remove old month files too; an empty month must not survive a purge.
-        let requests_dir = self.dir.join("requests");
-        if requests_dir.exists() {
-            for entry in fs::read_dir(&requests_dir)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl") {
-                    fs::remove_file(path)?;
-                }
-            }
-        }
         self.save(&ledger)?;
         Ok(before - ledger.requests.len())
     }
@@ -552,6 +578,25 @@ mod tests {
         fs::remove_file(path).unwrap();
         store.ingest().unwrap();
         assert_eq!(store.load().unwrap().requests.len(), 1);
+    }
+
+    #[test]
+    fn ingest_is_read_only_toward_source_and_purge_removes_only_selected_profile() {
+        // Known-bad: rewriting a transcript during ingest, or deleting ledger
+        // rows as a side effect of ordinary source disappearance.
+        let (_tmp, store, projects) = setup();
+        let path = projects.join("source.jsonl");
+        fs::write(&path, row("m1", "r1", "s1")).unwrap();
+        let before_bytes = fs::read(&path).unwrap();
+        let before_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        store.ingest().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before_bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        assert_eq!(store.purge_profile("sample").unwrap(), 1);
+        assert!(store.load().unwrap().requests.is_empty());
     }
 
     #[test]

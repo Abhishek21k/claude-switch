@@ -136,7 +136,36 @@ enum Commands {
     Aliases,
 
     /// Read local Claude Code transcripts into an offline token ledger
-    Usage,
+    Usage {
+        /// Range: 7d, 30d, all, or YYYY-MM-DD
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Only include one profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Group by profile, workspace, project, session, model, or day
+        #[arg(long, value_parser = ["profile", "workspace", "project", "session", "model", "day"])]
+        by: Option<String>,
+        /// Emit machine-readable report rows and footer
+        #[arg(long)]
+        json: bool,
+        /// Show each attribution signal for a session
+        #[arg(long, conflicts_with = "unattributed")]
+        explain: Option<String>,
+        /// Show sessions without a project and their candidates
+        #[arg(long, conflicts_with = "explain")]
+        unattributed: bool,
+        #[command(subcommand)]
+        action: Option<UsageAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageAction {
+    /// Save a project label for a session
+    Label { session: String, project: String },
+    /// Compare priced requests with matching cost-state snapshots
+    Verify,
 }
 
 fn main() -> Result<()> {
@@ -174,7 +203,7 @@ fn main() -> Result<()> {
             if purge_usage {
                 manager.get_profile(&name)?;
                 let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
-                usage::store(&manager, directory)?.purge_profile(&name)?;
+                usage::report::purge_profile(&usage::store(&manager, directory)?, &name)?;
             }
             match manager.remove_profile(&name) {
                 Ok(_) => println!("Profile '{}' removed.", name),
@@ -241,12 +270,44 @@ fn main() -> Result<()> {
         Some(Commands::Aliases) => {
             println!("{}", manager.generate_aliases()?);
         }
-        Some(Commands::Usage) => {
+        Some(Commands::Usage {
+            since,
+            profile,
+            by,
+            json,
+            explain,
+            unattributed,
+            action,
+        }) => {
             let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
-            print!(
-                "{}",
-                usage::plain_report(&usage::store(&manager, directory)?)?
-            );
+            let store = usage::store(&manager, directory)?;
+            let mut verify_failed = false;
+            let output = match action {
+                Some(UsageAction::Label { session, project }) => {
+                    usage::report::label(&store, &session, &project)?
+                }
+                Some(UsageAction::Verify) => {
+                    let (output, failed) = usage::report::verify(&store)?;
+                    verify_failed = failed;
+                    output
+                }
+                None => usage::report::run(
+                    &store,
+                    &usage::report::Options {
+                        since,
+                        profile,
+                        by,
+                        json,
+                        explain,
+                        unattributed,
+                    },
+                    Utc::now(),
+                )?,
+            };
+            print!("{output}");
+            if verify_failed {
+                std::process::exit(1);
+            }
         }
     }
 
@@ -569,6 +630,69 @@ mod tests {
     use crate::skills_sync::SyncEntry;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn usage_cli_accepts_report_label_verify_and_purge_surfaces() {
+        // Known-bad: a nested usage command consuming report flags or a remove
+        // command that cannot opt into purging ledger rows.
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cswitch", "usage", "--since", "all", "--by", "model", "--json"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Usage {
+                by: Some(_),
+                json: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "--explain", "sample"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                explain: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "--unattributed"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                unattributed: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "label", "sample", "blue/site"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                action: Some(UsageAction::Label { .. }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "verify"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                action: Some(UsageAction::Verify),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "remove", "sample", "--purge-usage"])
+                .unwrap()
+                .command,
+            Some(Commands::Remove {
+                purge_usage: true,
+                ..
+            })
+        ));
+    }
 
     fn at(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
