@@ -329,30 +329,30 @@ fn by(rows: &[ReportRow], grouping: &str) -> Result<String> {
 }
 
 fn explain(rows: &[ReportRow], session: &str) -> String {
-    let mut grouped = BTreeMap::<(String, String, String), (Totals, BTreeSet<String>)>::new();
+    let mut grouped = BTreeMap::<(String, String, String), Totals>::new();
+    let mut candidates = BTreeSet::new();
     for row in rows.iter().filter(|row| row.session == session) {
-        let entry = grouped
+        grouped
             .entry((row.profile.clone(), row.project.clone(), row.signal.clone()))
-            .or_default();
-        entry.0.add(row);
-        entry.1.extend(row.candidates.iter().cloned());
+            .or_default()
+            .add(row);
+        candidates.extend(row.candidates.iter().cloned());
     }
     let mut out = format!("Attribution for session {session}:\n");
     if grouped.is_empty() {
         out.push_str("  no matching requests\n");
     }
-    for ((profile, project, signal), (totals, candidates)) in grouped {
+    for ((profile, project, signal), totals) in grouped {
         out.push_str(&format!(
-            "  {profile}: {project} via {signal} ({} requests)",
+            "  {profile}: {project} via {signal} ({} requests)\n",
             totals.requests
         ));
-        if !candidates.is_empty() {
-            out.push_str(&format!(
-                "; candidates: {}",
-                candidates.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-        out.push('\n');
+    }
+    if !candidates.is_empty() {
+        out.push_str(&format!(
+            "  candidates: {}\n",
+            candidates.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
     out
 }
@@ -764,10 +764,13 @@ mod tests {
             cache_read: 0,
             cost_usd: Some(0.0),
         };
-        let output = explain(&[row.clone(), row], "sample");
-        assert!(output.contains(
-            "via none (2 requests); candidates: file touch 'blue/alpha', unresolved label 'unknown'"
-        ));
+        let mut other_slice = row.clone();
+        other_slice.project = "blue/beta".into();
+        other_slice.signal = "cwd".into();
+        let output = explain(&[row.clone(), row, other_slice], "sample");
+        assert!(output.contains("via none (2 requests)"));
+        assert!(output.contains("via cwd (1 requests)"));
+        assert!(output.contains("candidates: file touch 'blue/alpha', unresolved label 'unknown'"));
         assert_eq!(output.matches("file touch 'blue/alpha'").count(), 1);
         assert_eq!(output.matches("unresolved label 'unknown'").count(), 1);
     }
