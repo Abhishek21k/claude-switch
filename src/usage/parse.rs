@@ -150,6 +150,9 @@ fn title(row: &Value, message: &Value) -> Option<(String, String)> {
         "custom-title" => string(row, "customTitle")
             .or_else(|| string(row, "title"))
             .map(|value| (value.to_string(), "rename".to_string())),
+        "ai-title" => string(row, "title")
+            .or_else(|| string(row, "aiTitle"))
+            .map(|value| (value.to_string(), "ai-title".to_string())),
         "system" if string(row, "subtype") == Some("ai-title") => string(row, "title")
             .or_else(|| string(row, "aiTitle"))
             .map(|value| (value.to_string(), "ai-title".to_string())),
@@ -304,6 +307,20 @@ mod tests {
                 .unwrap()
                 .requests
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn ai_title_record_provides_a_fallback_session_name() {
+        // Known-bad: recognizing only custom-title leaves unrenamed sessions as IDs.
+        let row = json!({"type":"ai-title","timestamp":"2030-01-01T12:00:00Z",
+            "sessionId":"sample","title":"synthetic task"});
+        assert_eq!(
+            parse(row.to_string().as_bytes(), "sample")
+                .unwrap()
+                .unwrap()
+                .title,
+            Some(("synthetic task".into(), "ai-title".into()))
         );
     }
 }

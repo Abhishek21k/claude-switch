@@ -597,7 +597,8 @@ mod tests {
 
     #[test]
     fn explain_names_the_attribution_signal_and_json_has_footer() {
-        // Known-bad: --explain omits the signal, or JSON drops the report footer.
+        // Known-bad: --explain omits the signal, JSON drops the footer, or a
+        // renamed session appears only as its opaque ID in the default tree.
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path().join("profile");
         let projects = profile.join("projects/demo");
