@@ -6,7 +6,7 @@ use crate::atomic;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub struct Options {
     pub since: String,
@@ -94,6 +94,7 @@ struct Footer {
     requests_counted: usize,
     duplicates_collapsed: u64,
     unreadable_lines: u64,
+    synthetic_skipped: u64,
     earliest_ingested: Option<String>,
     sidechain_replays: Vec<String>,
     ingest_skipped_lock: bool,
@@ -202,11 +203,21 @@ fn write_summary(store: &Store, rows: &[ReportRow]) -> Result<()> {
     )
 }
 
+pub(crate) fn refresh_summary(store: &Store, ledger: &Ledger) -> Result<Vec<ReportRow>> {
+    let config = load_config(&store.dir)?;
+    let labels = load_labels(&store.dir)?;
+    let rates = load_or_seed(&store.dir)?;
+    let rows = make_rows(ledger, &config, &labels, &rates);
+    write_summary(store, &rows)?;
+    Ok(rows)
+}
+
 fn footer(ledger: &Ledger, ingest: &IngestReport, rows: usize) -> Footer {
     Footer {
         requests_counted: rows,
         duplicates_collapsed: ledger.cursors.duplicates,
         unreadable_lines: ledger.cursors.malformed + ingest.partial,
+        synthetic_skipped: ledger.cursors.synthetic_skipped,
         earliest_ingested: ledger
             .requests
             .iter()
@@ -220,10 +231,11 @@ fn footer(ledger: &Ledger, ingest: &IngestReport, rows: usize) -> Footer {
 
 fn footer_text(footer: &Footer) -> String {
     format!(
-        "\n{} requests counted · {} duplicates collapsed · {} unreadable lines · earliest ingested {}{}\n",
+        "\n{} requests counted · {} duplicates collapsed · {} unreadable lines · {} synthetic skipped · earliest ingested {}{}\n",
         footer.requests_counted,
         footer.duplicates_collapsed,
         footer.unreadable_lines,
+        footer.synthetic_skipped,
         footer.earliest_ingested.as_deref().unwrap_or("none"),
         if footer.ingest_skipped_lock {
             " · ingest skipped (locked)"
@@ -317,13 +329,13 @@ fn by(rows: &[ReportRow], grouping: &str) -> Result<String> {
 }
 
 fn explain(rows: &[ReportRow], session: &str) -> String {
-    let mut grouped = BTreeMap::<(String, String, String), (Totals, Vec<String>)>::new();
+    let mut grouped = BTreeMap::<(String, String, String), (Totals, BTreeSet<String>)>::new();
     for row in rows.iter().filter(|row| row.session == session) {
         let entry = grouped
             .entry((row.profile.clone(), row.project.clone(), row.signal.clone()))
             .or_default();
         entry.0.add(row);
-        entry.1.extend(row.candidates.clone());
+        entry.1.extend(row.candidates.iter().cloned());
     }
     let mut out = format!("Attribution for session {session}:\n");
     if grouped.is_empty() {
@@ -336,8 +348,8 @@ fn explain(rows: &[ReportRow], session: &str) -> String {
         ));
         if !candidates.is_empty() {
             out.push_str(&format!(
-                "; unresolved label candidates: {}",
-                candidates.join(", ")
+                "; candidates: {}",
+                candidates.into_iter().collect::<Vec<_>>().join(", ")
             ));
         }
         out.push('\n');
@@ -387,9 +399,6 @@ pub fn run(store: &Store, options: &Options, now: DateTime<Utc>) -> Result<Strin
         load_or_seed(&store.dir)?
     };
     let all = make_rows(&ledger, &config, &labels, &rates);
-    if !ingest.skipped_lock {
-        write_summary(store, &all)?;
-    }
     let rows = all
         .into_iter()
         .zip(&ledger.requests)
@@ -445,42 +454,13 @@ pub fn label(store: &Store, session: &str, project: &str) -> Result<String> {
         &serde_json::to_vec_pretty(&labels)?,
     )?;
     let ledger = store.load()?;
-    let config = load_config(&store.dir)?;
-    let rates = load_or_seed(&store.dir)?;
-    let rows = make_rows(&ledger, &config, &labels, &rates);
-    write_summary(store, &rows)?;
+    let rows = refresh_summary(store, &ledger)?;
     let explanations = explain(&rows, session);
     Ok(format!("Label saved in labels.json.\n{explanations}"))
 }
 
 pub fn purge_profile(store: &Store, profile: &str) -> Result<usize> {
-    let before = store.load()?;
-    let removed_sessions = before
-        .sessions
-        .iter()
-        .filter(|session| session.profile == profile)
-        .map(|session| session.id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    let removed = store.purge_profile(profile)?;
-    let ledger = store.load()?;
-    let mut labels = load_labels(&store.dir)?;
-    labels.sessions.retain(|session, _| {
-        !removed_sessions.contains(session)
-            || ledger
-                .sessions
-                .iter()
-                .any(|remaining| &remaining.id == session)
-    });
-    if store.dir.join("labels.json").exists() {
-        atomic::write(
-            &store.dir.join("labels.json"),
-            &serde_json::to_vec_pretty(&labels)?,
-        )?;
-    }
-    let config = load_config(&store.dir)?;
-    let rates = load_or_seed(&store.dir)?;
-    write_summary(store, &make_rows(&ledger, &config, &labels, &rates))?;
-    Ok(removed)
+    store.purge_profile(profile)
 }
 
 pub fn verify(store: &Store) -> Result<(String, i32)> {
@@ -681,6 +661,14 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&run(&store, &options, now).unwrap()).unwrap();
         assert_eq!(value["footer"]["requests_counted"], 2);
+        assert_eq!(value["footer"]["synthetic_skipped"], 1);
+        assert_eq!(
+            value["footer"]["sidechain_replays"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(store.dir.join("summary.json").exists());
         options.json = false;
         options.explain = None;
@@ -723,6 +711,12 @@ mod tests {
         assert_eq!(exit_code, 0, "{good}");
         assert!(good.contains("OK $37.2000 vs $37.2000"));
         assert!(good.contains("Cost-state sessions 1; checked sessions 1"));
+        // Known-bad: the ingest placeholder overwrites the attributed
+        // summary with a flat, incompatible row during verify.
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.dir.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary[0]["totals"]["requests"], 1);
+        assert!(summary[0].get("requests").is_none());
         let before = fs::read(store.dir.join("rates.json")).unwrap();
         writeln!(
             fs::OpenOptions::new().append(true).open(&path).unwrap(),
@@ -744,6 +738,38 @@ mod tests {
         let (output, exit_code) = verify(&store).unwrap();
         assert_eq!(exit_code, 2, "{output}");
         assert!(output.contains("Cost-state sessions 0; checked sessions 0"));
+    }
+
+    #[test]
+    fn explain_lists_each_typed_candidate_once() {
+        // Known-bad: one candidate is printed for every request in a
+        // multi-request session, and file touches are called label candidates.
+        let row = ReportRow {
+            day: "2030-01-01".into(),
+            profile: "sample".into(),
+            workspace: "(unattributed)".into(),
+            project: "(unattributed)".into(),
+            session: "sample".into(),
+            title: None,
+            model: "claude-sonnet-5".into(),
+            signal: "none".into(),
+            candidates: vec![
+                "unresolved label 'unknown'".into(),
+                "file touch 'blue/alpha'".into(),
+            ],
+            input: 1,
+            output: 2,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+            cost_usd: Some(0.0),
+        };
+        let output = explain(&[row.clone(), row], "sample");
+        assert!(output.contains(
+            "via none (2 requests); candidates: file touch 'blue/alpha', unresolved label 'unknown'"
+        ));
+        assert_eq!(output.matches("file touch 'blue/alpha'").count(), 1);
+        assert_eq!(output.matches("unresolved label 'unknown'").count(), 1);
     }
 
     #[test]

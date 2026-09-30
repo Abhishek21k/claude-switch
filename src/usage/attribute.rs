@@ -170,19 +170,23 @@ pub fn capture_signals(request: &mut Request, config: &Config) {
         .cwd
         .as_deref()
         .and_then(|cwd| workspace_for_path(Path::new(cwd), config));
-    request.touched_projects = request
-        .touched
-        .iter()
-        .filter_map(|path| {
-            let path = Path::new(path);
-            let absolute = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                Path::new(request.cwd.as_deref()?).join(path)
-            };
-            project_for_path(&absolute, config).map(|(_, project)| project)
-        })
-        .collect();
+    request.touch_count = request.touched.len();
+    for path in &request.touched {
+        let path = Path::new(path);
+        let absolute = if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            request.cwd.as_deref().map(|cwd| Path::new(cwd).join(path))
+        };
+        if let Some(absolute) = absolute {
+            if let Some((_, project)) = project_for_path(&absolute, config) {
+                request.touched_projects.push(project);
+            }
+            if let Some(workspace) = workspace_for_path(&absolute, config) {
+                request.touched_workspaces.push(workspace);
+            }
+        }
+    }
 }
 
 fn alias<'a>(project: &'a str, config: &'a Config) -> &'a str {
@@ -246,7 +250,7 @@ impl<'a> Resolver<'a> {
             let entry = counts
                 .entry((row.profile.clone(), row.session.clone()))
                 .or_default();
-            entry.0 += row.touched.len();
+            entry.0 += row.touch_count;
             for project in &row.touched_projects {
                 *entry
                     .1
@@ -304,7 +308,11 @@ impl<'a> Resolver<'a> {
                 }
                 Err(found) => {
                     candidates.push(format!("unresolved label '{label}'"));
-                    candidates.extend(found);
+                    candidates.extend(
+                        found
+                            .into_iter()
+                            .map(|project| format!("label match '{project}'")),
+                    );
                 }
             }
         }
@@ -333,7 +341,7 @@ impl<'a> Resolver<'a> {
                 .get(&(request.profile.clone(), request.session.clone()))
                 .into_iter()
                 .flatten()
-                .cloned(),
+                .map(|project| format!("file touch '{project}'")),
         );
         if let Some(workspace) = &request.workspace {
             return Attribution {
@@ -429,7 +437,10 @@ mod tests {
             let got = resolver.attribute(request, None);
             assert_eq!((got.project.as_str(), got.signal), (project, signal));
             if session == "weak" {
-                assert_eq!(got.candidates, vec!["blue/alpha", "blue/beta"]);
+                assert_eq!(
+                    got.candidates,
+                    vec!["file touch 'blue/alpha'", "file touch 'blue/beta'"]
+                );
             }
         }
     }

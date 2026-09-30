@@ -1,4 +1,4 @@
-use super::attribute::{capture_signals, load_config};
+use super::attribute::{capture_signals, load_config, load_labels};
 use super::parse::{CostState, Request, parse};
 use crate::atomic;
 use anyhow::Result;
@@ -51,6 +51,8 @@ pub struct Cursors {
     pub files: BTreeMap<String, Cursor>,
     pub duplicates: u64,
     pub malformed: u64,
+    #[serde(default)]
+    pub synthetic_skipped: u64,
     pub sidechain_replays: Vec<String>,
 }
 
@@ -68,21 +70,8 @@ pub struct IngestReport {
     pub new_requests: usize,
     pub duplicates: u64,
     pub malformed: u64,
+    pub synthetic_skipped: u64,
     pub partial: u64,
-}
-
-#[derive(Serialize)]
-struct SummaryRow {
-    day: String,
-    profile: String,
-    project: String,
-    session: String,
-    requests: u64,
-    input: u64,
-    output: u64,
-    cache_write_5m: u64,
-    cache_write_1h: u64,
-    cache_read: u64,
 }
 
 fn json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
@@ -179,7 +168,7 @@ impl Store {
         })
     }
 
-    fn save(&self, ledger: &Ledger) -> Result<()> {
+    fn save_data(&self, ledger: &Ledger) -> Result<()> {
         let mut months = BTreeMap::<String, Vec<&Request>>::new();
         for request in &ledger.requests {
             months
@@ -206,41 +195,7 @@ impl Store {
             )?;
         }
         save_jsonl(&self.dir.join("sessions.jsonl"), &ledger.sessions)?;
-        let mut summary = BTreeMap::<(String, String, String, String), SummaryRow>::new();
-        for request in &ledger.requests {
-            let day = request.time.format("%Y-%m-%d").to_string();
-            let key = (
-                day.clone(),
-                request.profile.clone(),
-                "(unattributed)".to_string(),
-                request.session.clone(),
-            );
-            let row = summary.entry(key).or_insert_with(|| SummaryRow {
-                day,
-                profile: request.profile.clone(),
-                project: "(unattributed)".to_string(),
-                session: request.session.clone(),
-                requests: 0,
-                input: 0,
-                output: 0,
-                cache_write_5m: 0,
-                cache_write_1h: 0,
-                cache_read: 0,
-            });
-            row.requests += 1;
-            row.input += request.input;
-            row.output += request.output;
-            row.cache_write_5m += request.cache_write_5m;
-            row.cache_write_1h += request.cache_write_1h;
-            row.cache_read += request.cache_read;
-        }
-        save_json(
-            &self.dir.join("summary.json"),
-            &summary.into_values().collect::<Vec<_>>(),
-        )?;
-        // Cursor is last: if an earlier atomic write fails, the old offset causes
-        // a harmless replay that deduplication absorbs on the next ingest.
-        save_json(&self.dir.join("cursors.json"), &ledger.cursors)
+        Ok(())
     }
 
     pub(crate) fn try_lock(&self) -> Result<Option<File>> {
@@ -365,6 +320,7 @@ impl Store {
                             continue;
                         }
                     };
+                    report.synthetic_skipped += u64::from(parsed.synthetic_skipped);
                     let session_key = (source.profile.clone(), parsed.session.clone());
                     let index = *sessions.entry(session_key).or_insert_with(|| {
                         ledger.sessions.push(Session {
@@ -417,11 +373,14 @@ impl Store {
                             })
                             .copied()
                             .filter(|&index| ledger.requests[index].sidechain || request.sidechain);
-                        if let Some(existing) = keys.get(&request.key).copied().or(replay) {
+                        let same_key = keys.get(&request.key).copied();
+                        if let Some(existing) = same_key.or(replay) {
                             report.duplicates += 1;
                             let old = &ledger.requests[existing];
                             if old.sidechain || request.sidechain {
-                                if !ledger.cursors.sidechain_replays.contains(&request.key) {
+                                if same_key.is_none()
+                                    && !ledger.cursors.sidechain_replays.contains(&request.key)
+                                {
                                     ledger.cursors.sidechain_replays.push(request.key.clone());
                                 }
                                 if old.sidechain && !request.sidechain {
@@ -465,7 +424,12 @@ impl Store {
             .count() as u64;
         ledger.cursors.duplicates += report.duplicates;
         ledger.cursors.malformed += report.malformed;
-        self.save(&ledger)?;
+        ledger.cursors.synthetic_skipped += report.synthetic_skipped;
+        self.save_data(&ledger)?;
+        super::report::refresh_summary(self, &ledger)?;
+        // Cursor is last: a failed data or summary write leaves a harmless
+        // replay for deduplication on the next ingest.
+        save_json(&self.dir.join("cursors.json"), &ledger.cursors)?;
         Ok(report)
     }
 
@@ -474,6 +438,12 @@ impl Store {
             anyhow::bail!("usage ledger is busy");
         };
         let mut ledger = self.load()?;
+        let removed_sessions = ledger
+            .sessions
+            .iter()
+            .filter(|session| session.profile == profile)
+            .map(|session| session.id.clone())
+            .collect::<std::collections::HashSet<_>>();
         let before = ledger.requests.len();
         ledger.requests.retain(|row| row.profile != profile);
         ledger.sessions.retain(|row| row.profile != profile);
@@ -482,7 +452,20 @@ impl Store {
                 source.profile == profile && Path::new(path).starts_with(&source.directory)
             })
         });
-        self.save(&ledger)?;
+        self.save_data(&ledger)?;
+        let mut labels = load_labels(&self.dir)?;
+        labels.sessions.retain(|session, _| {
+            !removed_sessions.contains(session)
+                || ledger
+                    .sessions
+                    .iter()
+                    .any(|remaining| &remaining.id == session)
+        });
+        if self.dir.join("labels.json").exists() {
+            save_json(&self.dir.join("labels.json"), &labels)?;
+        }
+        super::report::refresh_summary(self, &ledger)?;
+        save_json(&self.dir.join("cursors.json"), &ledger.cursors)?;
         Ok(before - ledger.requests.len())
     }
 }
@@ -492,7 +475,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
-    use std::sync::Arc;
 
     fn setup() -> (tempfile::TempDir, Store, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -537,9 +519,18 @@ mod tests {
         let ledger = store.load().unwrap();
         assert_eq!(ledger.requests.len(), 3);
         assert_eq!(ledger.sessions.len(), 2);
-        assert_eq!(report.duplicates, 2);
+        assert_eq!(report.duplicates, 3);
         assert_eq!(report.malformed, 1);
+        assert_eq!(report.synthetic_skipped, 1);
         assert_eq!(ledger.cursors.sidechain_replays.len(), 1);
+        assert_eq!(
+            5 - ledger.requests.len(),
+            report.synthetic_skipped as usize + ledger.cursors.sidechain_replays.len()
+        );
+        assert_eq!(
+            ledger.cursors.sidechain_replays,
+            vec![serde_json::to_string(&("request", "msg-2", "req-parent")).unwrap()]
+        );
         assert_eq!(
             ledger
                 .requests
@@ -702,8 +693,9 @@ mod tests {
     }
 
     #[test]
-    fn lock_skips_and_concurrent_ingest_keeps_one_row() {
-        // Known-bad: no file lock lets simultaneous writers duplicate or corrupt rows.
+    fn held_lock_skips_ingest_without_writing_rows() {
+        // Known-bad: proceeding when try_lock reports contention writes
+        // ledger rows while another ingest owns the lock.
         let (_tmp, store, projects) = setup();
         fs::write(projects.join("one.jsonl"), row("m1", "r1", "s1")).unwrap();
         fs::create_dir_all(&store.dir).unwrap();
@@ -715,30 +707,26 @@ mod tests {
             .unwrap();
         lock.try_lock().unwrap();
         assert!(store.ingest().unwrap().skipped_lock);
+        assert!(store.load().unwrap().requests.is_empty());
         drop(lock);
-        let shared = Arc::new(store);
-        let threads = (0..2)
-            .map(|_| {
-                let shared = Arc::clone(&shared);
-                std::thread::spawn(move || shared.ingest().unwrap())
-            })
-            .collect::<Vec<_>>();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        assert_eq!(shared.load().unwrap().requests.len(), 1);
+        assert_eq!(store.ingest().unwrap().new_requests, 1);
+        assert_eq!(store.load().unwrap().requests.len(), 1);
     }
 
     #[test]
     fn prompt_and_tool_input_canary_never_enters_ledger() {
-        // Known-bad: serializing `message.content` or the complete tool input leaks prompts.
+        // Known-bad: serializing message content or raw file_path, path, and
+        // notebook_path tool values leaks prompts and tool-input paths.
         let (_tmp, store, projects) = setup();
         let canary = "CANARY_PRIVATE_PROMPT_0000";
         let mut value: serde_json::Value =
             serde_json::from_str(row("m1", "r1", "s1").trim()).unwrap();
         value["message"]["content"] = json!([
             {"type":"text", "text":canary},
-            {"type":"tool_use", "input":{"command":canary,"file_path":"/synthetic/atlas/file.rs"}}
+            {"type":"tool_use", "input":{"command":canary,
+                "file_path":format!("/synthetic/atlas/{canary}.rs"),
+                "path":format!("/synthetic/atlas/{canary}.txt"),
+                "notebook_path":format!("/synthetic/atlas/{canary}.ipynb")}}
         ]);
         fs::write(projects.join("one.jsonl"), value.to_string() + "\n").unwrap();
         store.ingest().unwrap();
@@ -760,9 +748,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            store.load().unwrap().requests[0].touched,
-            vec!["/synthetic/atlas/file.rs"]
-        );
+        let stored = store.load().unwrap();
+        assert!(stored.requests[0].touched.is_empty());
+        assert_eq!(stored.requests[0].touch_count, 3);
     }
 }

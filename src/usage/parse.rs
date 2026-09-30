@@ -24,6 +24,7 @@ pub struct Request {
     pub inference_geo: Option<String>,
     pub version: Option<String>,
     pub cwd: Option<String>,
+    #[serde(skip)]
     pub touched: Vec<String>,
     #[serde(default)]
     pub cwd_project: Option<String>,
@@ -31,6 +32,10 @@ pub struct Request {
     pub workspace: Option<String>,
     #[serde(default)]
     pub touched_projects: Vec<String>,
+    #[serde(default)]
+    pub touched_workspaces: Vec<String>,
+    #[serde(default)]
+    pub touch_count: usize,
     pub sidechain: bool,
 }
 
@@ -60,6 +65,7 @@ pub struct ParsedLine {
     pub title: Option<(String, String)>,
     pub cost: Option<CostState>,
     pub requests: Vec<Request>,
+    pub synthetic_skipped: bool,
 }
 
 fn number(value: &Value, name: &str) -> u64 {
@@ -143,6 +149,8 @@ fn request(
         cwd_project: None,
         workspace: None,
         touched_projects: Vec::new(),
+        touched_workspaces: Vec::new(),
+        touch_count: 0,
         sidechain: context.row.get("isSidechain").and_then(Value::as_bool) == Some(true),
     }
 }
@@ -241,10 +249,13 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
         None
     };
     let mut requests = Vec::new();
+    let mut synthetic_skipped = false;
     if assistant_usage {
         let usage = &message["usage"];
         let model = string(message, "model").ok_or(())?;
-        if model != "<synthetic>" {
+        if model == "<synthetic>" {
+            synthetic_skipped = true;
+        } else {
             let context = RequestContext {
                 row: &row,
                 profile,
@@ -291,6 +302,7 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
         title,
         cost,
         requests,
+        synthetic_skipped,
     }))
 }
 

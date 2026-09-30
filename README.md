@@ -120,6 +120,8 @@ Without configuration, attribution uses the nearest Git root. A private `~/.clau
 
 Nested Git repositories take priority over folder globs. Explicit labels and `/rename` titles take priority over request `cwd`; then file paths can attribute requests whose session has at least 60% of its file touches in one project. `--explain` shows the chosen signal. The report footer gives the earliest ingested timestamp, since deleted transcripts cannot be recovered from the ledger.
 
+`config.json` applies when a row is ingested, so re-attributing old rows means deleting the ledger and re-ingesting while the transcripts still exist.
+
 ## Interactive TUI
 
 Run `cswitch` with no arguments to open the TUI.
