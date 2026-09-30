@@ -1,7 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug)]
+pub struct ToolTouch {
+    pub id: String,
+    pub paths: Vec<String>,
+    pub count: usize,
+    pub projects: Vec<String>,
+    pub workspaces: Vec<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -25,7 +34,7 @@ pub struct Request {
     pub version: Option<String>,
     pub cwd: Option<String>,
     #[serde(skip)]
-    pub touched: Vec<String>,
+    pub tool_touches: Vec<ToolTouch>,
     #[serde(default)]
     pub cwd_project: Option<String>,
     #[serde(default)]
@@ -36,6 +45,8 @@ pub struct Request {
     pub touched_workspaces: Vec<String>,
     #[serde(default)]
     pub touch_count: usize,
+    #[serde(default)]
+    pub seen_tool_use_ids: BTreeSet<String>,
     pub sidechain: bool,
 }
 
@@ -94,18 +105,29 @@ fn paths_from_input(input: &Value, found: &mut Vec<String>) {
     }
 }
 
-fn touched_paths(message: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
+fn tool_touches(message: &Value) -> Vec<ToolTouch> {
+    let mut touches = Vec::new();
     if let Some(blocks) = message.get("content").and_then(Value::as_array) {
         for block in blocks {
             if string(block, "type") == Some("tool_use")
+                && let Some(id) = string(block, "id")
                 && let Some(input) = block.get("input")
             {
+                let mut paths = Vec::new();
                 paths_from_input(input, &mut paths);
+                if !paths.is_empty() {
+                    touches.push(ToolTouch {
+                        id: id.to_string(),
+                        paths,
+                        count: 0,
+                        projects: Vec::new(),
+                        workspaces: Vec::new(),
+                    });
+                }
             }
         }
     }
-    paths
+    touches
 }
 
 struct RequestContext<'a> {
@@ -121,7 +143,7 @@ fn request(
     model: &str,
     key: String,
     message_id: Option<String>,
-    touched: Vec<String>,
+    tool_touches: Vec<ToolTouch>,
 ) -> Request {
     let cache = &usage["cache_creation"];
     let tools = &usage["server_tool_use"];
@@ -145,12 +167,13 @@ fn request(
         inference_geo: string(usage, "inference_geo").map(str::to_string),
         version: string(context.row, "version").map(str::to_string),
         cwd: string(context.row, "cwd").map(str::to_string),
-        touched,
+        tool_touches,
         cwd_project: None,
         workspace: None,
         touched_projects: Vec::new(),
         touched_workspaces: Vec::new(),
         touch_count: 0,
+        seen_tool_use_ids: BTreeSet::new(),
         sidechain: context.row.get("isSidechain").and_then(Value::as_bool) == Some(true),
     }
 }
@@ -269,14 +292,14 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
                 serde_json::to_string(&("fallback", id, session, time.ok_or(())?.to_rfc3339()))
                     .unwrap()
             };
-            let touched = touched_paths(message);
+            let touches = tool_touches(message);
             requests.push(request(
                 &context,
                 usage,
                 model,
                 key.clone(),
                 (!id.is_empty()).then(|| id.to_string()),
-                touched,
+                touches,
             ));
             if let Some(iterations) = usage.get("iterations").and_then(Value::as_array) {
                 for (index, iteration) in iterations.iter().enumerate() {

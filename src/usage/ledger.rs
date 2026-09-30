@@ -1,4 +1,6 @@
-use super::attribute::{capture_signals, load_config, load_labels};
+use super::attribute::{
+    capture_signals, load_config, load_labels, merge_touch_signals, transfer_touch_signals,
+};
 use super::parse::{CostState, Request, parse};
 use crate::atomic;
 use anyhow::Result;
@@ -376,7 +378,8 @@ impl Store {
                         let same_key = keys.get(&request.key).copied();
                         if let Some(existing) = same_key.or(replay) {
                             report.duplicates += 1;
-                            let old = &ledger.requests[existing];
+                            let old = &mut ledger.requests[existing];
+                            merge_touch_signals(old, &request);
                             if old.sidechain || request.sidechain {
                                 if same_key.is_none()
                                     && !ledger.cursors.sidechain_replays.contains(&request.key)
@@ -384,18 +387,22 @@ impl Store {
                                     ledger.cursors.sidechain_replays.push(request.key.clone());
                                 }
                                 if old.sidechain && !request.sidechain {
-                                    keys.remove(&old.key);
+                                    let old_key = old.key.clone();
+                                    transfer_touch_signals(old, &mut request);
+                                    keys.remove(&old_key);
                                     keys.insert(request.key.clone(), existing);
-                                    ledger.requests[existing] = request;
+                                    *old = request;
                                 } else if old.sidechain == request.sidechain
                                     && request.output > old.output
                                 {
-                                    ledger.requests[existing] = request;
+                                    transfer_touch_signals(old, &mut request);
+                                    *old = request;
                                 }
                             } else if request.output > old.output {
                                 // Streamed copies carry cumulative output. Keep the
                                 // largest count, including across separate ingest runs.
-                                ledger.requests[existing] = request;
+                                transfer_touch_signals(old, &mut request);
+                                *old = request;
                             }
                         } else {
                             if let Some(id) = &request.message_id {
@@ -509,6 +516,45 @@ mod tests {
         assert_eq!(store.sources.len(), 1);
     }
 
+    fn configured_projects(tmp: &tempfile::TempDir, store: &Store) -> (PathBuf, PathBuf, PathBuf) {
+        let root = tmp.path().join("atlas");
+        let alpha = root.join("teams/blue/apps/alpha");
+        let beta = root.join("teams/blue/apps/beta");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(alpha.join(".git")).unwrap();
+        fs::create_dir_all(beta.join(".git")).unwrap();
+        fs::create_dir_all(&store.dir).unwrap();
+        fs::write(
+            store.dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "superproject":root,
+                "project_globs":["teams/*/apps/*"],
+                "workspaces":[{"glob":"teams/*","segment":1}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (root, alpha, beta)
+    }
+
+    fn streamed_copy(
+        time: &str,
+        request_id: &str,
+        output: u64,
+        cwd: &Path,
+        block: serde_json::Value,
+        sidechain: bool,
+    ) -> String {
+        json!({
+            "type":"assistant","timestamp":time,"sessionId":"sample",
+            "requestId":request_id,"isSidechain":sidechain,"cwd":cwd,
+            "message":{"id":"msg-union","model":"claude-sonnet-5","content":[block],
+                "usage":{"input_tokens":10,"output_tokens":output}}
+        })
+        .to_string()
+            + "\n"
+    }
+
     #[test]
     fn parity_cross_file_dedup_and_sidechain_parent_wins() {
         // Known-bad: no dedup inflates requests; file-local dedup misses resumed copies;
@@ -586,6 +632,134 @@ mod tests {
         assert_eq!(ledger.requests.len(), 1);
         assert_eq!(ledger.requests[0].output, 240);
         assert_eq!(ledger.cursors.duplicates, 2);
+    }
+
+    #[test]
+    fn streamed_tool_ids_union_across_runs_files_and_rereads() {
+        // Known-bad: taking touches from the final copy loses the first Read;
+        // summing every copy without tool ids double-counts a replay on re-read.
+        let (tmp, store, projects) = setup();
+        let (root, alpha, beta) = configured_projects(&tmp, &store);
+        let path = projects.join("a.jsonl");
+        let thinking = streamed_copy(
+            "2030-01-01T12:00:00Z",
+            "req-union",
+            5,
+            &root,
+            json!({"type":"thinking","thinking":"synthetic"}),
+            false,
+        );
+        let read = streamed_copy(
+            "2030-01-01T12:00:01Z",
+            "req-union",
+            40,
+            &root,
+            json!({"type":"tool_use","id":"toolu_synthetic_read","name":"Read",
+                "input":{"file_path":alpha.join("a.rs")}}),
+            false,
+        );
+        let edit = streamed_copy(
+            "2030-01-01T12:00:02Z",
+            "req-union",
+            90,
+            &root,
+            json!({"type":"tool_use","id":"toolu_synthetic_edit","name":"Edit",
+                "input":{"file_path":beta.join("b.rs")}}),
+            false,
+        );
+        fs::write(&path, format!("{thinking}{read}")).unwrap();
+        store.ingest().unwrap();
+        let first = store.load().unwrap();
+        assert_eq!(
+            (first.requests[0].output, first.requests[0].touch_count),
+            (40, 1)
+        );
+        assert_eq!(first.requests[0].touched_projects, vec!["blue/alpha"]);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(edit.as_bytes())
+            .unwrap();
+        store.ingest().unwrap();
+        let second = store.load().unwrap();
+        assert_eq!(
+            (second.requests[0].output, second.requests[0].touch_count),
+            (90, 2)
+        );
+        assert_eq!(
+            second.requests[0].touched_projects,
+            vec!["blue/alpha", "blue/beta"]
+        );
+        assert_eq!(second.requests[0].touched_workspaces, vec!["blue", "blue"]);
+        assert_eq!(second.requests[0].seen_tool_use_ids.len(), 2);
+
+        fs::write(projects.join("b.jsonl"), &read).unwrap();
+        store.ingest().unwrap();
+        assert_eq!(store.load().unwrap().requests[0].touch_count, 2);
+
+        fs::write(&path, format!("{thinking}{read}")).unwrap();
+        store.ingest().unwrap();
+        assert_eq!(store.load().unwrap().requests[0].touch_count, 2);
+
+        let replacement = projects.join("replacement.tmp");
+        fs::write(&replacement, format!("{thinking}{read}{edit}")).unwrap();
+        fs::rename(replacement, &path).unwrap();
+        store.ingest().unwrap();
+        let final_row = &store.load().unwrap().requests[0];
+        assert_eq!((final_row.output, final_row.touch_count), (90, 2));
+        assert_eq!(final_row.touched_projects, vec!["blue/alpha", "blue/beta"]);
+        assert!(final_row.tool_touches.is_empty());
+        let ledger_bytes = fs::read_to_string(store.dir.join("requests/2030-01.jsonl")).unwrap();
+        assert!(!ledger_bytes.contains(alpha.join("a.rs").to_str().unwrap()));
+        assert!(!ledger_bytes.contains(beta.join("b.rs").to_str().unwrap()));
+    }
+
+    #[test]
+    fn parent_replacement_keeps_sidechain_tool_union() {
+        // Known-bad: replacing a sidechain row with its parent discards the
+        // sidechain's already-counted tool id and project touch.
+        let (tmp, store, projects) = setup();
+        let (root, alpha, beta) = configured_projects(&tmp, &store);
+        let path = projects.join("sidechain.jsonl");
+        let sidechain = streamed_copy(
+            "2030-01-01T12:00:00Z",
+            "req-side",
+            40,
+            &root,
+            json!({"type":"tool_use","id":"toolu_synthetic_side","name":"Read",
+                "input":{"file_path":alpha.join("a.rs")}}),
+            true,
+        );
+        let parent = streamed_copy(
+            "2030-01-01T12:00:01Z",
+            "req-parent",
+            90,
+            &root,
+            json!({"type":"tool_use","id":"toolu_synthetic_parent","name":"Edit",
+                "input":{"file_path":beta.join("b.rs")}}),
+            false,
+        );
+        fs::write(&path, sidechain).unwrap();
+        store.ingest().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(parent.as_bytes())
+            .unwrap();
+        store.ingest().unwrap();
+        let ledger = store.load().unwrap();
+        assert_eq!(ledger.requests.len(), 1);
+        let row = &ledger.requests[0];
+        assert_eq!(
+            row.key,
+            serde_json::to_string(&("request", "msg-union", "req-parent")).unwrap()
+        );
+        assert_eq!((row.output, row.touch_count), (90, 2));
+        assert_eq!(row.touched_projects, vec!["blue/alpha", "blue/beta"]);
+        assert_eq!(row.seen_tool_use_ids.len(), 2);
     }
 
     #[test]
@@ -723,7 +897,7 @@ mod tests {
             serde_json::from_str(row("m1", "r1", "s1").trim()).unwrap();
         value["message"]["content"] = json!([
             {"type":"text", "text":canary},
-            {"type":"tool_use", "input":{"command":canary,
+            {"type":"tool_use", "id":"toolu_synthetic_canary", "input":{"command":canary,
                 "file_path":format!("/synthetic/atlas/{canary}.rs"),
                 "path":format!("/synthetic/atlas/{canary}.txt"),
                 "notebook_path":format!("/synthetic/atlas/{canary}.ipynb")}}
@@ -749,7 +923,7 @@ mod tests {
             }
         }
         let stored = store.load().unwrap();
-        assert!(stored.requests[0].touched.is_empty());
+        assert!(stored.requests[0].tool_touches.is_empty());
         assert_eq!(stored.requests[0].touch_count, 3);
     }
 }

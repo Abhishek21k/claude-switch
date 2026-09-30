@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn timestamp_free_titles_name_a_metadata_only_session() {
         // Known-bad: requiring metadata timestamps leaves a title-only session
-        // unnamed, or choosing the first title ignores later file-order updates.
+        // unnamed; min_by_key on the rename branch displays the first rename.
         let tmp = tempfile::tempdir().unwrap();
         let profile = tmp.path().join("profile");
         let projects = profile.join("projects/demo");
@@ -605,6 +605,7 @@ mod tests {
             concat!(
                 "{\"type\":\"ai-title\",\"sessionId\":\"sample\",\"aiTitle\":\"first idea\"}\n",
                 "{\"type\":\"ai-title\",\"sessionId\":\"sample\",\"aiTitle\":\"current idea\"}\n",
+                "{\"type\":\"custom-title\",\"sessionId\":\"sample\",\"customTitle\":\"first name\"}\n",
                 "{\"type\":\"custom-title\",\"sessionId\":\"sample\",\"customTitle\":\"current name\"}\n"
             )).unwrap();
         let store = Store::new(

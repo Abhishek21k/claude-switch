@@ -193,31 +193,63 @@ pub fn capture_signals(request: &mut Request, config: &Config) {
         .cwd
         .as_deref()
         .and_then(|cwd| workspace_for_path(Path::new(cwd), config));
-    request.touch_count = 0;
-    for path in &request.touched {
-        let path = Path::new(path);
-        let absolute = if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            cwd.as_deref().map(|cwd| cwd.join(path))
-        };
-        if absolute
-            .as_deref()
-            .is_some_and(|path| ignored(path, config))
-        {
-            continue;
+    for touch in &mut request.tool_touches {
+        for raw_path in touch.paths.drain(..) {
+            let path = Path::new(&raw_path);
+            let absolute = if path.is_absolute() {
+                Some(path.to_path_buf())
+            } else {
+                cwd.as_deref().map(|cwd| cwd.join(path))
+            };
+            if absolute
+                .as_deref()
+                .is_some_and(|path| ignored(path, config))
+            {
+                continue;
+            }
+            touch.count += 1;
+            if let Some(absolute) = absolute {
+                if let Some((_, project)) = project_for_path(&absolute, config) {
+                    touch.projects.push(project);
+                }
+                if let Some(workspace) = workspace_for_path(&absolute, config) {
+                    touch.workspaces.push(workspace);
+                }
+            }
         }
-        request.touch_count += 1;
-        if let Some(absolute) = absolute {
-            if let Some((_, project)) = project_for_path(&absolute, config) {
-                request.touched_projects.push(project);
-            }
-            if let Some(workspace) = workspace_for_path(&absolute, config) {
-                request.touched_workspaces.push(workspace);
-            }
+        if touch.count > 0 && request.seen_tool_use_ids.insert(touch.id.clone()) {
+            request.touch_count += touch.count;
+            request
+                .touched_projects
+                .extend(touch.projects.iter().cloned());
+            request
+                .touched_workspaces
+                .extend(touch.workspaces.iter().cloned());
         }
     }
-    request.touched.clear();
+}
+
+/// Add only tool ids the stored request has not counted yet.
+pub fn merge_touch_signals(stored: &mut Request, copy: &Request) {
+    for touch in &copy.tool_touches {
+        if touch.count > 0 && stored.seen_tool_use_ids.insert(touch.id.clone()) {
+            stored.touch_count += touch.count;
+            stored
+                .touched_projects
+                .extend(touch.projects.iter().cloned());
+            stored
+                .touched_workspaces
+                .extend(touch.workspaces.iter().cloned());
+        }
+    }
+}
+
+/// Carry the union through a counter or sidechain replacement.
+pub fn transfer_touch_signals(stored: &mut Request, replacement: &mut Request) {
+    replacement.touch_count = stored.touch_count;
+    replacement.touched_projects = std::mem::take(&mut stored.touched_projects);
+    replacement.touched_workspaces = std::mem::take(&mut stored.touched_workspaces);
+    replacement.seen_tool_use_ids = std::mem::take(&mut stored.seen_tool_use_ids);
 }
 
 fn alias<'a>(project: &'a str, config: &'a Config) -> &'a str {
@@ -428,7 +460,12 @@ mod tests {
     fn row(cwd: &Path, touched: &[&Path], session: &str) -> Request {
         let tools = touched
             .iter()
-            .map(|path| json!({"type":"tool_use","input":{"file_path":path}}))
+            .enumerate()
+            .map(|(index, path)| {
+                json!({"type":"tool_use",
+                "id":format!("toolu_synthetic_{session}_{index}"),
+                "input":{"file_path":path}})
+            })
             .collect::<Vec<_>>();
         let line = json!({"type":"assistant","timestamp":"2030-01-01T12:00:00Z","sessionId":session,
             "requestId":format!("req-{session}"),"cwd":cwd,"message":{"id":format!("msg-{session}"),
@@ -638,5 +675,23 @@ mod tests {
             (result.project.as_str(), result.signal),
             ("blue/alpha", "files")
         );
+    }
+
+    #[test]
+    fn ignore_prefix_matches_path_components() {
+        // Known-bad: a string-prefix check drops scratchpad when only scratch
+        // is listed; Path::starts_with keeps these components distinct.
+        let config = Config {
+            ignore_paths: vec![PathBuf::from("/synthetic/scratch")],
+            ..Config::default()
+        };
+        let mut request = row(
+            Path::new("/synthetic/scratchpad"),
+            &[Path::new("/synthetic/scratchpad/a.rs")],
+            "prefix",
+        );
+        capture_signals(&mut request, &config);
+        assert_eq!(request.cwd.as_deref(), Some("/synthetic/scratchpad"));
+        assert_eq!(request.touch_count, 1);
     }
 }
