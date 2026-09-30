@@ -819,6 +819,130 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn valid_settings_symlink_is_refused_by_reader() {
+        // Known-bad: stamp() follows a symlink to valid JSON and treats it as a normal file.
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("shared-settings.json");
+        fs::write(&target, br#"{"theme":"dark"}"#).unwrap();
+        let link = tmp.path().join("settings.json");
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            read_settings(&link).err().unwrap().to_string(),
+            "settings.json is a symlink."
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_settings_symlink_is_refused_before_storing_key() {
+        // Known-bad: stamp() follows symlinks, so set_key stores a key through unsafe settings.
+        use std::os::unix::fs::symlink;
+
+        let (tmp, manager, executable) = manager_with_profile();
+        let target = tmp.path().join("shared-settings.json");
+        let original = br#"{"theme":"dark"}"#;
+        fs::write(&target, original).unwrap();
+        let link = manager.profile_dir("n").join("settings.json");
+        symlink(&target, &link).unwrap();
+
+        let error = set_key(
+            &manager,
+            "n",
+            "sk-ant-api03-TESTKEY000",
+            &executable,
+            false,
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "settings.json is a symlink.");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_directory_symlink_is_refused_without_writing_target() {
+        // Known-bad: the store_key directory check follows a link to a valid 0700 directory.
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (tmp, manager, executable) = manager_with_profile();
+        let target = tmp.path().join("external-keys");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = manager.base_dir.join("keys");
+        symlink(&target, &link).unwrap();
+
+        let error = set_key(
+            &manager,
+            "n",
+            "sk-ant-api03-TESTKEY000",
+            &executable,
+            false,
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Key directory is not a regular directory."
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_symlink_is_refused_without_output() {
+        // Known-bad: print_key uses metadata() and follows a valid 0600 key file link.
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let (tmp, manager, _) = manager_with_profile();
+        let target = tmp.path().join("external-key");
+        let original = b"sk-ant-api03-TESTKEY000\n";
+        fs::write(&target, original).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::create_dir_all(manager.base_dir.join("keys")).unwrap();
+        let link = key_path(&manager.base_dir, "n");
+        symlink(&target, &link).unwrap();
+
+        let mut output = Vec::new();
+        assert_eq!(
+            print_key(&manager.base_dir, "n", false, &mut output),
+            Err((1, "cswitch: key unavailable"))
+        );
+        assert!(output.is_empty());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), original);
+    }
+
     #[test]
     fn helper_recognition_requires_exact_shell_words() {
         // Known-bad: contains("key print") treats another command as ours.

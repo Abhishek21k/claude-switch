@@ -236,12 +236,12 @@ impl ProfileManager {
         if !registry.profiles.contains_key(name) {
             bail!("Profile '{}' not found.", name);
         }
+        remove_key(&self.base_dir, name)?;
         let dest = self.profiles_dir.join(name);
         if dest.exists() {
             fs::remove_dir_all(&dest)?;
         }
         registry.profiles.remove(name);
-        remove_key(&self.base_dir, name)?;
         self.save_registry(&registry)
     }
 
@@ -1522,6 +1522,32 @@ mod tests {
         let profiles = mgr.list_profiles().unwrap();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "keep");
+    }
+
+    #[test]
+    fn failed_key_deletion_preserves_profile_and_registry() {
+        // Known-bad: remove_profile deletes the profile directory before a key removal error.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        mgr.add_profile_from("saved", &source).unwrap();
+        let profile_dir = mgr.profile_dir("saved");
+        let registry_before = fs::read(&mgr.registry_path).unwrap();
+        let settings_before = fs::read(profile_dir.join("settings.json")).unwrap();
+
+        let key_as_directory = crate::key::key_path(&mgr.base_dir, "saved");
+        fs::create_dir_all(&key_as_directory).unwrap();
+        fs::write(key_as_directory.join("child"), "synthetic").unwrap();
+
+        assert!(mgr.remove_profile("saved").is_err());
+        assert_eq!(fs::read(&mgr.registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read(profile_dir.join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert!(key_as_directory.join("child").exists());
     }
 
     // ── get_profile ───────────────────────────────────────────────────────────
