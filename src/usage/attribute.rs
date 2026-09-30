@@ -16,6 +16,8 @@ pub struct Config {
     pub workspaces: Vec<WorkspaceRule>,
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ignore_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,11 +45,15 @@ pub struct Attribution {
 
 pub fn load_config(dir: &Path) -> Result<Config> {
     let path = dir.join("config.json");
-    if path.exists() {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let config: Config = if path.exists() {
+        serde_json::from_slice(&fs::read(path)?)?
     } else {
-        Ok(Config::default())
+        Config::default()
+    };
+    if config.ignore_paths.iter().any(|path| !path.is_absolute()) {
+        anyhow::bail!("ignore_paths entries must be absolute");
     }
+    Ok(config)
 }
 
 pub fn load_labels(dir: &Path) -> Result<Labels> {
@@ -119,7 +125,17 @@ fn repo_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn ignored(path: &Path, config: &Config) -> bool {
+    config
+        .ignore_paths
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 pub fn project_for_path(path: &Path, config: &Config) -> Option<(String, String)> {
+    if ignored(path, config) {
+        return None;
+    }
     let superproject = config.superproject.as_deref();
     if let Some(root) = repo_root(path)
         && superproject != Some(root.as_path())
@@ -149,6 +165,9 @@ pub fn project_for_path(path: &Path, config: &Config) -> Option<(String, String)
 }
 
 pub fn workspace_for_path(path: &Path, config: &Config) -> Option<String> {
+    if ignored(path, config) {
+        return None;
+    }
     if let Some(superproject) = &config.superproject
         && let Ok(relative) = path.strip_prefix(superproject)
     {
@@ -162,6 +181,10 @@ pub fn workspace_for_path(path: &Path, config: &Config) -> Option<String> {
 
 /// Resolve path signals while the source directories still exist.
 pub fn capture_signals(request: &mut Request, config: &Config) {
+    let cwd = request.cwd.as_deref().map(PathBuf::from);
+    if cwd.as_deref().is_some_and(|path| ignored(path, config)) {
+        request.cwd = None;
+    }
     request.cwd_project = request
         .cwd
         .as_deref()
@@ -170,14 +193,21 @@ pub fn capture_signals(request: &mut Request, config: &Config) {
         .cwd
         .as_deref()
         .and_then(|cwd| workspace_for_path(Path::new(cwd), config));
-    request.touch_count = request.touched.len();
+    request.touch_count = 0;
     for path in &request.touched {
         let path = Path::new(path);
         let absolute = if path.is_absolute() {
             Some(path.to_path_buf())
         } else {
-            request.cwd.as_deref().map(|cwd| Path::new(cwd).join(path))
+            cwd.as_deref().map(|cwd| cwd.join(path))
         };
+        if absolute
+            .as_deref()
+            .is_some_and(|path| ignored(path, config))
+        {
+            continue;
+        }
+        request.touch_count += 1;
         if let Some(absolute) = absolute {
             if let Some((_, project)) = project_for_path(&absolute, config) {
                 request.touched_projects.push(project);
@@ -187,6 +217,7 @@ pub fn capture_signals(request: &mut Request, config: &Config) {
             }
         }
     }
+    request.touched.clear();
 }
 
 fn alias<'a>(project: &'a str, config: &'a Config) -> &'a str {
@@ -240,12 +271,16 @@ pub struct Resolver<'a> {
     labels: &'a Labels,
     known: BTreeSet<String>,
     dominant: HashMap<(String, String), String>,
+    dominant_workspace: HashMap<(String, String), String>,
     best: HashMap<(String, String), Vec<String>>,
 }
 
 impl<'a> Resolver<'a> {
     pub fn new(requests: &[Request], config: &'a Config, labels: &'a Labels) -> Self {
-        let mut counts = HashMap::<(String, String), (usize, HashMap<String, usize>)>::new();
+        let mut counts = HashMap::<
+            (String, String),
+            (usize, HashMap<String, usize>, HashMap<String, usize>),
+        >::new();
         for row in requests {
             let entry = counts
                 .entry((row.profile.clone(), row.session.clone()))
@@ -257,10 +292,14 @@ impl<'a> Resolver<'a> {
                     .entry(alias(project, config).to_string())
                     .or_default() += 1;
             }
+            for workspace in &row.touched_workspaces {
+                *entry.2.entry(workspace.clone()).or_default() += 1;
+            }
         }
         let mut dominant = HashMap::new();
+        let mut dominant_workspace = HashMap::new();
         let mut best = HashMap::new();
-        for (session, (total, projects)) in counts {
+        for (session, (total, projects, workspaces)) in counts {
             let mut ranked = projects.into_iter().collect::<Vec<_>>();
             ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             if let Some((project, count)) = ranked.first()
@@ -270,19 +309,28 @@ impl<'a> Resolver<'a> {
                 dominant.insert(session.clone(), project.clone());
             }
             best.insert(
-                session,
+                session.clone(),
                 ranked
                     .into_iter()
                     .take(3)
                     .map(|(project, _)| project)
                     .collect(),
             );
+            let mut ranked_workspaces = workspaces.into_iter().collect::<Vec<_>>();
+            ranked_workspaces.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if let Some((workspace, count)) = ranked_workspaces.first()
+                && total > 0
+                && count * 10 >= total * 6
+            {
+                dominant_workspace.insert(session, workspace.clone());
+            }
         }
         Self {
             config,
             labels,
             known: catalog(requests, config),
             dominant,
+            dominant_workspace,
             best,
         }
     }
@@ -351,6 +399,17 @@ impl<'a> Resolver<'a> {
                 candidates,
             };
         }
+        if let Some(workspace) = self
+            .dominant_workspace
+            .get(&(request.profile.clone(), request.session.clone()))
+        {
+            return Attribution {
+                workspace: workspace.clone(),
+                project: format!("{workspace}/(workspace files)"),
+                signal: "files workspace",
+                candidates,
+            };
+        }
         Attribution {
             workspace: "(unattributed)".into(),
             project: "(unattributed)".into(),
@@ -404,6 +463,7 @@ mod tests {
                 segment: Some(1),
             }],
             aliases: BTreeMap::new(),
+            ignore_paths: Vec::new(),
         };
         let mut rows = vec![
             row(&beta, &[&alpha.join("a.rs")], "labelled"),
@@ -467,6 +527,7 @@ mod tests {
                 segment: Some(1),
             }],
             aliases: BTreeMap::from([("blue/site".into(), "blue/web".into())]),
+            ignore_paths: Vec::new(),
         };
         let mut rows = vec![
             row(&one, &[Path::new("src/main.rs")], "one"),
@@ -488,6 +549,94 @@ mod tests {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.contains("unresolved label"))
+        );
+    }
+
+    #[test]
+    fn file_touches_can_choose_the_session_workspace_bucket() {
+        // Known-bad: reading the workspace only from cwd leaves this request
+        // unattributed even though all session file touches are in one workspace.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("atlas");
+        let files = root.join("teams/blue/scratch");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&files).unwrap();
+        let config = Config {
+            superproject: Some(root),
+            project_globs: vec!["teams/*/apps/*".into()],
+            workspaces: vec![WorkspaceRule {
+                glob: "teams/*".into(),
+                name: None,
+                segment: Some(1),
+            }],
+            aliases: BTreeMap::new(),
+            ignore_paths: Vec::new(),
+        };
+        let mut request = row(
+            &tmp.path().join("outside"),
+            &[&files.join("a.md"), &files.join("b.md")],
+            "sample",
+        );
+        request.cwd = None;
+        capture_signals(&mut request, &config);
+        assert!(request.cwd_project.is_none());
+        assert!(request.workspace.is_none());
+        assert!(request.touched_projects.is_empty());
+        assert_eq!(request.touched_workspaces, vec!["blue", "blue"]);
+        let rows = [request];
+        let labels = Labels::default();
+        let resolver = Resolver::new(&rows, &config, &labels);
+        let result = resolver.attribute(&rows[0], None);
+        assert_eq!(result.project, "blue/(workspace files)");
+        assert_eq!(result.signal, "files workspace");
+    }
+
+    #[test]
+    fn ignored_paths_leave_no_cwd_signal_or_denominator_weight() {
+        // Known-bad: an ignored cwd still wins attribution, or ignored file
+        // touches count against the 60% denominator.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("atlas");
+        let alpha = root.join("teams/blue/apps/alpha");
+        let beta = root.join("teams/blue/apps/beta");
+        let ignored = beta.join("scratch");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(alpha.join(".git")).unwrap();
+        fs::create_dir_all(beta.join(".git")).unwrap();
+        fs::create_dir_all(&ignored).unwrap();
+        let config = Config {
+            superproject: Some(root),
+            project_globs: vec!["teams/*/apps/*".into()],
+            workspaces: vec![WorkspaceRule {
+                glob: "teams/*".into(),
+                name: None,
+                segment: Some(1),
+            }],
+            aliases: BTreeMap::new(),
+            ignore_paths: vec![ignored.clone()],
+        };
+        let mut request = row(
+            &ignored,
+            &[
+                &ignored.join("a.rs"),
+                &ignored.join("b.rs"),
+                &alpha.join("c.rs"),
+            ],
+            "sample",
+        );
+        capture_signals(&mut request, &config);
+        assert!(request.cwd.is_none());
+        assert!(request.cwd_project.is_none());
+        assert!(request.workspace.is_none());
+        assert_eq!(request.touch_count, 1);
+        assert_eq!(request.touched_projects, vec!["blue/alpha"]);
+        let rows = [request];
+        let labels = Labels::default();
+        let resolver = Resolver::new(&rows, &config, &labels);
+        let result = resolver.attribute(&rows[0], None);
+        assert_eq!(
+            (result.project.as_str(), result.signal),
+            ("blue/alpha", "files")
         );
     }
 }

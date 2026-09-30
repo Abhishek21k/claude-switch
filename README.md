@@ -114,11 +114,12 @@ Without configuration, attribution uses the nearest Git root. A private `~/.clau
     { "glob": "teams/*", "segment": 1 },
     { "glob": "notes", "name": "notes" }
   ],
+  "ignore_paths": ["/srv/example/scratch"],
   "aliases": { "blue/old-ui": "blue/site" }
 }
 ```
 
-Nested Git repositories take priority over folder globs. Explicit labels and `/rename` titles take priority over request `cwd`; then file paths can attribute requests whose session has at least 60% of its file touches in one project. `--explain` shows the chosen signal. The report footer gives the earliest ingested timestamp, since deleted transcripts cannot be recovered from the ledger.
+Nested Git repositories take priority over folder globs. Explicit labels and `/rename` titles take priority over request `cwd`; then file paths can attribute requests whose session has at least 60% of its file touches in one project. `--explain` shows the chosen signal. The report footer gives the earliest ingested timestamp, since deleted transcripts cannot be recovered from the ledger. Absolute `ignore_paths` prefixes remove matching working directories and file touches from attribution and its 60% denominator.
 
 `config.json` applies when a row is ingested, so re-attributing old rows means deleting the ledger and re-ingesting while the transcripts still exist.
 
