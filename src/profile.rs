@@ -1,3 +1,4 @@
+use crate::atomic;
 use crate::skills_sync::{self, SyncAction, SyncOptions, SyncReport};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -5,9 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -98,37 +98,7 @@ impl ProfileManager {
 
     fn save_registry(&self, registry: &Registry) -> Result<()> {
         let content = serde_json::to_string_pretty(registry)?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let mut index = 0;
-        let (temp_path, mut file) = loop {
-            let path = self.base_dir.join(format!(
-                ".registry.json.{}.{}.{}.tmp",
-                std::process::id(),
-                stamp,
-                index
-            ));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => break (path, file),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => index += 1,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let result = (|| -> Result<()> {
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp_path, &self.registry_path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result?;
-        Ok(())
+        atomic::write(&self.registry_path, content.as_bytes())
     }
 
     // ── Public API ────────────────────────────────────────────────────────────

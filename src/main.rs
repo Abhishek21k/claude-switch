@@ -1,7 +1,9 @@
+mod atomic;
 mod limits;
 mod profile;
 mod skills_sync;
 mod tui;
+mod usage;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -93,6 +95,9 @@ enum Commands {
     Remove {
         /// Profile name to remove
         name: String,
+        /// Also delete this profile's token ledger rows
+        #[arg(long)]
+        purge_usage: bool,
     },
 
     /// Launch Claude Code with a specific profile
@@ -129,6 +134,9 @@ enum Commands {
 
     /// Print shell aliases for all profiles
     Aliases,
+
+    /// Read local Claude Code transcripts into an offline token ledger
+    Usage,
 }
 
 fn main() -> Result<()> {
@@ -162,13 +170,20 @@ fn main() -> Result<()> {
             report_login(&name, &outcome);
         }
 
-        Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
-            Ok(_) => println!("Profile '{}' removed.", name),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Some(Commands::Remove { name, purge_usage }) => {
+            if purge_usage {
+                manager.get_profile(&name)?;
+                let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
+                usage::store(&manager, directory)?.purge_profile(&name)?;
             }
-        },
+            match manager.remove_profile(&name) {
+                Ok(_) => println!("Profile '{}' removed.", name),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
 
         Some(Commands::Use { name, args }) => {
             manager.launch_claude(&name, &args)?;
@@ -225,6 +240,13 @@ fn main() -> Result<()> {
 
         Some(Commands::Aliases) => {
             println!("{}", manager.generate_aliases()?);
+        }
+        Some(Commands::Usage) => {
+            let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
+            print!(
+                "{}",
+                usage::plain_report(&usage::store(&manager, directory)?)?
+            );
         }
     }
 
