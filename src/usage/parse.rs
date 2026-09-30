@@ -36,7 +36,10 @@ pub struct Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CostState {
-    pub time: DateTime<Utc>,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub offset: u64,
     pub total_usd: Option<f64>,
     pub models: BTreeMap<String, ModelCost>,
 }
@@ -53,7 +56,7 @@ pub struct ModelCost {
 #[derive(Debug)]
 pub struct ParsedLine {
     pub session: String,
-    pub time: DateTime<Utc>,
+    pub time: Option<DateTime<Utc>>,
     pub title: Option<(String, String)>,
     pub cost: Option<CostState>,
     pub requests: Vec<Request>,
@@ -166,12 +169,7 @@ fn title(row: &Value, message: &Value) -> Option<(String, String)> {
     }
 }
 
-fn cost(row: &Value, time: DateTime<Utc>) -> Option<CostState> {
-    let kind = string(row, "type");
-    let subtype = string(row, "subtype");
-    if kind != Some("cost-state") && subtype != Some("cost-state") {
-        return None;
-    }
+fn cost(row: &Value) -> Option<CostState> {
     let value = row.get("cost").unwrap_or(row);
     let model_usage = value.get("modelUsage")?.as_object()?;
     let mut models = BTreeMap::new();
@@ -197,7 +195,8 @@ fn cost(row: &Value, time: DateTime<Utc>) -> Option<CostState> {
         }
     }
     Some(CostState {
-        time,
+        file: String::new(),
+        offset: 0,
         total_usd: value.get("totalCostUSD").and_then(Value::as_f64),
         models,
     })
@@ -208,34 +207,56 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
     // Known-bad: a substring match on bare `"model":"sonnet"` inside tool input
     // must not decide the request model; only parsed `message.model` does.
     let row: Value = serde_json::from_slice(line).map_err(|_| ())?;
-    let Some(session) = string(&row, "sessionId") else {
-        return Ok(None);
-    };
-    let Some(time) = string(&row, "timestamp")
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.with_timezone(&Utc))
-    else {
-        return Ok(None);
-    };
+    let kind = string(&row, "type");
     let message = &row["message"];
+    let metadata = matches!(kind, Some("ai-title" | "custom-title" | "cost-state"))
+        || kind == Some("system") && string(&row, "subtype") == Some("ai-title")
+        || string(&row, "subtype") == Some("cost-state");
+    let assistant_usage = kind == Some("assistant") && message["usage"].is_object();
+    let rename = kind == Some("user")
+        && message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("/rename "));
+    if !metadata && !assistant_usage && !rename {
+        return Ok(None);
+    }
+    let session = string(&row, "sessionId").ok_or(())?;
+    let time = string(&row, "timestamp")
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc));
+    if (assistant_usage || rename) && time.is_none() {
+        return Err(());
+    }
+    let title = if metadata || rename {
+        title(&row, message)
+    } else {
+        None
+    };
+    if (matches!(kind, Some("ai-title" | "custom-title")) || rename) && title.is_none() {
+        return Err(());
+    }
+    let cost = if kind == Some("cost-state") || string(&row, "subtype") == Some("cost-state") {
+        Some(cost(&row).ok_or(())?)
+    } else {
+        None
+    };
     let mut requests = Vec::new();
-    if string(&row, "type") == Some("assistant") {
+    if assistant_usage {
         let usage = &message["usage"];
-        if usage.is_object()
-            && let Some(model) = string(message, "model")
-            && model != "<synthetic>"
-        {
+        let model = string(message, "model").ok_or(())?;
+        if model != "<synthetic>" {
             let context = RequestContext {
                 row: &row,
                 profile,
                 session,
-                time,
+                time: time.ok_or(())?,
             };
             let id = string(message, "id").unwrap_or("");
             let key = if let Some(request_id) = string(&row, "requestId") {
                 serde_json::to_string(&("request", id, request_id)).unwrap()
             } else {
-                serde_json::to_string(&("fallback", id, session, time.to_rfc3339())).unwrap()
+                serde_json::to_string(&("fallback", id, session, time.ok_or(())?.to_rfc3339()))
+                    .unwrap()
             };
             let touched = touched_paths(message);
             requests.push(request(
@@ -267,8 +288,8 @@ pub fn parse(line: &[u8], profile: &str) -> Result<Option<ParsedLine>, ()> {
     Ok(Some(ParsedLine {
         session: session.to_string(),
         time,
-        title: title(&row, message),
-        cost: cost(&row, time),
+        title,
+        cost,
         requests,
     }))
 }
@@ -312,9 +333,8 @@ mod tests {
 
     #[test]
     fn ai_title_record_provides_a_fallback_session_name() {
-        // Known-bad: recognizing only custom-title leaves unrenamed sessions as IDs.
-        let row = json!({"type":"ai-title","timestamp":"2030-01-01T12:00:00Z",
-            "sessionId":"sample","title":"synthetic task"});
+        // Known-bad: requiring a timestamp on title metadata loses real-shape titles.
+        let row = json!({"type":"ai-title","sessionId":"sample","aiTitle":"synthetic task"});
         assert_eq!(
             parse(row.to_string().as_bytes(), "sample")
                 .unwrap()

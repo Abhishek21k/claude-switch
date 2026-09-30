@@ -17,7 +17,12 @@ pub struct Source {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Title {
-    pub time: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub offset: u64,
     pub value: String,
     pub source: String,
 }
@@ -26,8 +31,8 @@ pub struct Title {
 pub struct Session {
     pub profile: String,
     pub id: String,
-    pub first: DateTime<Utc>,
-    pub last: DateTime<Utc>,
+    pub first: Option<DateTime<Utc>>,
+    pub last: Option<DateTime<Utc>>,
     pub titles: Vec<Title>,
     pub cost_state: Option<CostState>,
 }
@@ -335,7 +340,10 @@ impl Store {
                     offset: offset + complete_len as u64,
                     partial,
                 };
+                let mut line_offset = offset;
                 for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
+                    let current_offset = line_offset;
+                    line_offset += line.len() as u64 + 1;
                     if line.is_empty() {
                         continue;
                     }
@@ -349,28 +357,36 @@ impl Store {
                     {
                         continue;
                     }
-                    let Ok(Some(parsed)) = parse(line, &source.profile) else {
-                        report.malformed += 1;
-                        continue;
+                    let parsed = match parse(line, &source.profile) {
+                        Ok(Some(parsed)) => parsed,
+                        Ok(None) => continue,
+                        Err(()) => {
+                            report.malformed += 1;
+                            continue;
+                        }
                     };
                     let session_key = (source.profile.clone(), parsed.session.clone());
                     let index = *sessions.entry(session_key).or_insert_with(|| {
                         ledger.sessions.push(Session {
                             profile: source.profile.clone(),
                             id: parsed.session.clone(),
-                            first: parsed.time,
-                            last: parsed.time,
+                            first: None,
+                            last: None,
                             titles: Vec::new(),
                             cost_state: None,
                         });
                         ledger.sessions.len() - 1
                     });
                     let session = &mut ledger.sessions[index];
-                    session.first = session.first.min(parsed.time);
-                    session.last = session.last.max(parsed.time);
+                    if let Some(time) = parsed.time {
+                        session.first = Some(session.first.map_or(time, |first| first.min(time)));
+                        session.last = Some(session.last.map_or(time, |last| last.max(time)));
+                    }
                     if let Some((value, source)) = parsed.title {
                         let title = Title {
                             time: parsed.time,
+                            file: path_key.clone(),
+                            offset: current_offset,
                             value,
                             source,
                         };
@@ -378,13 +394,14 @@ impl Store {
                             session.titles.push(title);
                         }
                     }
-                    if let Some(cost) = parsed.cost
-                        && session
-                            .cost_state
-                            .as_ref()
-                            .is_none_or(|old| cost.time >= old.time)
-                    {
-                        session.cost_state = Some(cost);
+                    if let Some(mut cost) = parsed.cost {
+                        cost.file = path_key.clone();
+                        cost.offset = current_offset;
+                        if session.cost_state.as_ref().is_none_or(|old| {
+                            (cost.file.as_str(), cost.offset) >= (old.file.as_str(), old.offset)
+                        }) {
+                            session.cost_state = Some(cost);
+                        }
                     }
                     for mut request in parsed.requests {
                         capture_signals(&mut request, &config);
@@ -411,7 +428,15 @@ impl Store {
                                     keys.remove(&old.key);
                                     keys.insert(request.key.clone(), existing);
                                     ledger.requests[existing] = request;
+                                } else if old.sidechain == request.sidechain
+                                    && request.output > old.output
+                                {
+                                    ledger.requests[existing] = request;
                                 }
+                            } else if request.output > old.output {
+                                // Streamed copies carry cumulative output. Keep the
+                                // largest count, including across separate ingest runs.
+                                ledger.requests[existing] = request;
                             }
                         } else {
                             if let Some(id) = &request.message_id {
@@ -532,6 +557,83 @@ mod tests {
                 .unwrap()
                 .model,
             "claude-haiku-4-5-20251001"
+        );
+    }
+
+    #[test]
+    fn streamed_copies_keep_largest_output_across_ingest_runs() {
+        // Known-bad: keeping the first streamed copy leaves output at 8 even
+        // after the final 240-token copy arrives in a later ingest run.
+        let (_tmp, store, projects) = setup();
+        let path = projects.join("stream.jsonl");
+        let copy = |time: &str, output: u64| {
+            json!({"type":"assistant","timestamp":time,"sessionId":"sample",
+                "requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-5",
+                    "usage":{"input_tokens":10,"output_tokens":output}}})
+            .to_string()
+                + "\n"
+        };
+        fs::write(
+            &path,
+            format!(
+                "{}{}",
+                copy("2030-01-01T12:00:00Z", 8),
+                copy("2030-01-01T12:00:01Z", 8)
+            ),
+        )
+        .unwrap();
+        assert_eq!(store.ingest().unwrap().duplicates, 1);
+        assert_eq!(store.load().unwrap().requests[0].output, 8);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(copy("2030-01-01T12:00:02Z", 240).as_bytes())
+            .unwrap();
+        assert_eq!(store.ingest().unwrap().duplicates, 1);
+        let ledger = store.load().unwrap();
+        assert_eq!(ledger.requests.len(), 1);
+        assert_eq!(ledger.requests[0].output, 240);
+        assert_eq!(ledger.cursors.duplicates, 2);
+    }
+
+    #[test]
+    fn metadata_only_session_uses_last_title_in_file_order() {
+        // Known-bad: requiring timestamps on title metadata discards these
+        // rows; sorting by invented times cannot identify the last title.
+        let (_tmp, store, projects) = setup();
+        let path = projects.join("titles.jsonl");
+        let titles = [
+            json!({"type":"ai-title","sessionId":"sample","aiTitle":"first idea"}),
+            json!({"type":"ai-title","sessionId":"sample","aiTitle":"current idea"}),
+            json!({"type":"custom-title","sessionId":"sample","customTitle":"first name"}),
+        ];
+        fs::write(
+            &path,
+            titles
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(store.ingest().unwrap().malformed, 0);
+        OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(b"{\"type\":\"custom-title\",\"sessionId\":\"sample\",\"customTitle\":\"current name\"}\n")
+            .unwrap();
+        assert_eq!(store.ingest().unwrap().malformed, 0);
+        let ledger = store.load().unwrap();
+        let session = &ledger.sessions[0];
+        assert_eq!((session.first, session.last), (None, None));
+        assert_eq!(session.titles.len(), 4);
+        assert_eq!(
+            session
+                .titles
+                .iter()
+                .filter(|title| title.source == "rename")
+                .max_by_key(|title| (&title.file, title.offset))
+                .unwrap()
+                .value,
+            "current name"
         );
     }
 

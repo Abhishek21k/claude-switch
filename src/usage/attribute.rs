@@ -219,7 +219,7 @@ fn session_title_label(session: Option<&Session>) -> Option<&str> {
         .titles
         .iter()
         .filter(|title| title.source == "rename")
-        .max_by_key(|title| title.time)
+        .max_by_key(|title| (&title.file, title.offset))
         .and_then(|title| title.value.split_once(':').map(|(label, _)| label.trim()))
 }
 

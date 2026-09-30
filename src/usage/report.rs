@@ -125,13 +125,13 @@ fn display_title(session: Option<&Session>) -> Option<String> {
         .titles
         .iter()
         .filter(|title| title.source == "rename")
-        .max_by_key(|title| title.time)
+        .max_by_key(|title| (&title.file, title.offset))
         .or_else(|| {
             session
                 .titles
                 .iter()
                 .filter(|title| title.source == "ai-title")
-                .max_by_key(|title| title.time)
+                .max_by_key(|title| (&title.file, title.offset))
         })
         .map(|title| title.value.clone())
 }
@@ -483,7 +483,7 @@ pub fn purge_profile(store: &Store, profile: &str) -> Result<usize> {
     Ok(removed)
 }
 
-pub fn verify(store: &Store) -> Result<(String, bool)> {
+pub fn verify(store: &Store) -> Result<(String, i32)> {
     let ingest = store.ingest()?;
     let ledger = store.load()?;
     let rates = if ingest.skipped_lock {
@@ -499,12 +499,16 @@ pub fn verify(store: &Store) -> Result<(String, bool)> {
             .push(row);
     }
     let mut output = String::from("Cost-state verification (API-equivalent USD):\n");
+    let mut cost_state_sessions = 0;
+    let mut checked_sessions = 0;
     let mut checked = 0;
     let mut failed = 0;
     for session in &ledger.sessions {
         let Some(state) = &session.cost_state else {
             continue;
         };
+        cost_state_sessions += 1;
+        let checked_before = checked;
         let name = format!("{} {}", session.profile, session.id);
         let session_requests = ledger
             .requests
@@ -577,14 +581,28 @@ pub fn verify(store: &Store) -> Result<(String, bool)> {
                 ));
             }
         }
+        if checked > checked_before {
+            checked_sessions += 1;
+        }
     }
-    output.push_str(&format!("Checked {checked}; failed {failed}."));
+    output.push_str(&format!(
+        "Cost-state sessions {cost_state_sessions}; checked sessions {checked_sessions}; rate checks {checked}; failed {failed}."
+    ));
     output.push_str(&footer_text(&footer(
         &ledger,
         &ingest,
         ledger.requests.len(),
     )));
-    Ok((output, failed > 0))
+    Ok((
+        output,
+        if failed > 0 {
+            1
+        } else if checked == 0 {
+            2
+        } else {
+            0
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -594,6 +612,37 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn timestamp_free_titles_name_a_metadata_only_session() {
+        // Known-bad: requiring metadata timestamps leaves a title-only session
+        // unnamed, or choosing the first title ignores later file-order updates.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        let projects = profile.join("projects/demo");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(projects.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"sample\",\"aiTitle\":\"first idea\"}\n",
+                "{\"type\":\"ai-title\",\"sessionId\":\"sample\",\"aiTitle\":\"current idea\"}\n",
+                "{\"type\":\"custom-title\",\"sessionId\":\"sample\",\"customTitle\":\"current name\"}\n"
+            )).unwrap();
+        let store = Store::new(
+            tmp.path().join("usage"),
+            vec![Source {
+                profile: "sample".into(),
+                directory: profile,
+            }],
+        );
+        assert_eq!(store.ingest().unwrap().malformed, 0);
+        let ledger = store.load().unwrap();
+        assert_eq!(
+            display_title(ledger.sessions.first()),
+            Some("current name".into())
+        );
+        assert_eq!(ledger.sessions[0].first, None);
+        assert_eq!(ledger.sessions[0].last, None);
+    }
 
     #[test]
     fn explain_names_the_attribution_signal_and_json_has_footer() {
@@ -656,17 +705,13 @@ mod tests {
                 "input_tokens":1_000_000,"output_tokens":1_000_000,"cache_creation_input_tokens":2_000_000,
                 "cache_creation":{"ephemeral_5m_input_tokens":1_000_000,"ephemeral_1h_input_tokens":1_000_000},
                 "cache_read_input_tokens":1_000_000,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0}}}});
-        let state = |time: &str, usd: f64| {
-            json!({"type":"cost-state","timestamp":time,"sessionId":"sample",
+        let state = |usd: f64| {
+            json!({"type":"cost-state","sessionId":"sample",
             "modelUsage":{"claude-opus-5-5":{"inputTokens":1_000_000,"outputTokens":1_000_000,
                 "cacheCreationInputTokens":2_000_000,"cacheReadInputTokens":1_000_000,"costUSD":usd}},
             "totalCostUSD":usd})
         };
-        fs::write(
-            &path,
-            format!("{}\n{}\n", assistant, state("2030-01-01T12:01:00Z", 37.2)),
-        )
-        .unwrap();
+        fs::write(&path, format!("{}\n{}\n", assistant, state(37.2))).unwrap();
         let store = Store::new(
             tmp.path().join("usage"),
             vec![Source {
@@ -674,20 +719,31 @@ mod tests {
                 directory: profile,
             }],
         );
-        let (good, failed) = verify(&store).unwrap();
-        assert!(!failed, "{good}");
+        let (good, exit_code) = verify(&store).unwrap();
+        assert_eq!(exit_code, 0, "{good}");
         assert!(good.contains("OK $37.2000 vs $37.2000"));
+        assert!(good.contains("Cost-state sessions 1; checked sessions 1"));
         let before = fs::read(store.dir.join("rates.json")).unwrap();
         writeln!(
             fs::OpenOptions::new().append(true).open(&path).unwrap(),
             "{}",
-            state("2030-01-01T12:02:00Z", 99.0)
+            state(99.0)
         )
         .unwrap();
-        let (bad, failed) = verify(&store).unwrap();
-        assert!(failed, "{bad}");
+        let (bad, exit_code) = verify(&store).unwrap();
+        assert_eq!(exit_code, 1, "{bad}");
         assert!(bad.contains("FAIL rate check"));
         assert_eq!(fs::read(store.dir.join("rates.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn verify_returns_exit_two_when_no_rate_check_is_possible() {
+        // Known-bad: a vacuous verify exits 0 when no cost-state model can be checked.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("usage"), Vec::new());
+        let (output, exit_code) = verify(&store).unwrap();
+        assert_eq!(exit_code, 2, "{output}");
+        assert!(output.contains("Cost-state sessions 0; checked sessions 0"));
     }
 
     #[test]

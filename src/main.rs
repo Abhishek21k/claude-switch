@@ -281,14 +281,14 @@ fn main() -> Result<()> {
         }) => {
             let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
             let store = usage::store(&manager, directory)?;
-            let mut verify_failed = false;
+            let mut verify_exit_code = 0;
             let output = match action {
                 Some(UsageAction::Label { session, project }) => {
                     usage::report::label(&store, &session, &project)?
                 }
                 Some(UsageAction::Verify) => {
-                    let (output, failed) = usage::report::verify(&store)?;
-                    verify_failed = failed;
+                    let (output, exit_code) = usage::report::verify(&store)?;
+                    verify_exit_code = exit_code;
                     output
                 }
                 None => usage::report::run(
@@ -305,8 +305,8 @@ fn main() -> Result<()> {
                 )?,
             };
             print!("{output}");
-            if verify_failed {
-                std::process::exit(1);
+            if verify_exit_code != 0 {
+                std::process::exit(verify_exit_code);
             }
         }
     }
