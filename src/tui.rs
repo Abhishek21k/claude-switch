@@ -483,7 +483,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
 
-            KeyCode::Up => self.move_up(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
 
             KeyCode::Char('/') => {
@@ -510,11 +510,11 @@ impl App {
                 self.input_buffer.clear();
             }
 
-            KeyCode::Char('k') if self.selected_profile().is_some() => {
+            KeyCode::Char('p') if self.selected_profile().is_some() => {
                 self.key_buffer.clear();
                 self.mode = Mode::KeyEntry;
             }
-            KeyCode::Char('K') if self.selected_profile().is_some() => {
+            KeyCode::Char('P') if self.selected_profile().is_some() => {
                 self.mode = Mode::ConfirmKeyClear;
             }
 
@@ -1344,13 +1344,13 @@ impl App {
             vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
         } else {
             vec![
-                ("↑↓/j", "nav"),
+                ("↑↓/jk", "nav"),
                 ("enter", "launch"),
                 ("/", "search"),
                 ("a", "add account"),
                 ("l", "login"),
-                ("k", "set key"),
-                ("K", "clear key"),
+                ("p", "set key"),
+                ("P", "clear key"),
                 ("r", "refresh"),
                 ("d", "delete"),
                 ("?", "help"),
@@ -1389,13 +1389,13 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("↑/↓  j", "Navigate profiles"),
+            ("↑/↓  j/k", "Navigate profiles"),
             ("Enter", "Launch Claude with selected profile"),
             ("/", "Search profiles by name or email"),
             ("a", "Add account — choose copy, subscription, or Console"),
             ("l", "Login — straight to a different account"),
-            ("k", "Set API key for selected profile"),
-            ("K", "Clear API key after confirmation"),
+            ("p", "Set API key for selected profile"),
+            ("P", "Clear API key after confirmation"),
             ("r", "Refresh — overwrite with current session"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
@@ -1952,7 +1952,7 @@ mod tests {
         // Known-bad: the entered key appears in a TUI frame or survives Escape.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
-        app.handle_normal_key(KeyCode::Char('k'), KeyModifiers::NONE)
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
             .unwrap();
         assert_eq!(app.mode, Mode::KeyEntry);
         app.key_buffer = "sk-ant-api03-TESTKEY000".to_string();
@@ -1963,6 +1963,33 @@ mod tests {
             .unwrap();
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.key_buffer.is_empty());
+    }
+
+    #[test]
+    fn k_moves_up_in_normal_mode_without_opening_key_entry() {
+        // Known-bad: binding k to KeyEntry removes vim-style up navigation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("alpha", Some("alpha@example.com")),
+                ("beta", Some("beta@example.com")),
+            ],
+        );
+        assert_eq!(app.selected_profile().unwrap().name, "alpha");
+        app.handle_normal_key(KeyCode::Char('k'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.selected_profile().unwrap().name, "beta");
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_normal_key(KeyCode::Char('j'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.selected_profile().unwrap().name, "alpha");
+        app.handle_normal_key(KeyCode::Char('K'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_normal_key(KeyCode::Char('P'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmKeyClear);
     }
 
     #[test]

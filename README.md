@@ -150,20 +150,20 @@ Run `cswitch` with no arguments to open the TUI.
 │   client          ││  CLAUDE_CONFIG_DIR='...' claude   │
 │   dev@client.io   ││                                   │
 └───────────────────┘└───────────────────────────────────┘
-┌ ↑↓/j nav  enter launch  / search  a add account ...  ┐
+┌ ↑↓/jk nav  enter launch  / search  a add account ...  ┐
 ```
 
 ### TUI keybindings
 
 | Key | Action |
 |---|---|
-| `↑/↓` or `j` | Navigate profiles |
+| `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch Claude with selected profile |
 | `/` | Search profiles by name or email |
 | `a` | Add account — enter a name, then choose copy or login |
 | `l` | Login — shortcut straight to a different account |
-| `k` | Enter a masked API key for the selected profile |
-| `K` | Clear the selected profile's API key after confirmation |
+| `p` | Enter a masked API key for the selected profile |
+| `P` | Clear the selected profile's API key after confirmation |
 | `r` | Refresh — overwrite the selected profile with the current session (confirmed) |
 | `d` | Delete selected profile (confirmed) |
 | `?` | Help overlay |
