@@ -123,21 +123,46 @@ mod tests {
     }
 
     #[test]
-    fn identity_uses_profile_email_and_rejects_malformed_inputs() {
-        // Known-bad: a parser that panics or treats malformed segments as an account.
+    fn identity_uses_profile_email_fallback() {
+        // Known-bad: only the top-level email is accepted.
         let claims = br#"{"https://api.openai.com/profile":{"email":"fallback@example.com"}}"#;
         let auth = format!(r#"{{"tokens":{{"id_token":"h.{}.s"}}}}"#, encode(claims));
         assert_eq!(
             identity_from_auth(auth.as_bytes()).unwrap().email,
             "fallback@example.com"
         );
-        for input in [
-            br#"{}"#.as_slice(),
-            br#"{"tokens":{"id_token":"bad"}}"#,
-            br#"{"tokens":{"id_token":"h.bm90anNvbg.s"}}"#,
-            br#"{"tokens":{"id_token":"h.@@.s"}}"#,
-        ] {
-            assert_eq!(identity_from_auth(input), None);
-        }
+    }
+
+    #[test]
+    fn identity_rejects_missing_token() {
+        // Known-bad: missing token data is treated as an account.
+        assert_eq!(identity_from_auth(br#"{}"#), None);
+    }
+
+    #[test]
+    fn identity_rejects_bad_segment_count() {
+        // Known-bad: indexing JWT segments panics when the signature is missing.
+        assert_eq!(
+            identity_from_auth(br#"{"tokens":{"id_token":"bad"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_rejects_non_json_payload() {
+        // Known-bad: a decoded non-JSON payload is accepted or panics during claim access.
+        assert_eq!(
+            identity_from_auth(br#"{"tokens":{"id_token":"h.bm90anNvbg.s"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_rejects_invalid_base64url() {
+        // Known-bad: invalid base64url characters silently decode into an identity.
+        assert_eq!(
+            identity_from_auth(br#"{"tokens":{"id_token":"h.@@.s"}}"#),
+            None
+        );
     }
 }

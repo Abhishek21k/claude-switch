@@ -28,6 +28,9 @@ mod stage_b_tests {
     use super::*;
     use tempfile::TempDir;
 
+    const SYNTHETIC_CODEX_AUTH: &[u8] =
+        br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20ifQ.s"}}"#;
+
     fn manager(tmp: &TempDir) -> ProfileManager {
         ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude")).unwrap()
     }
@@ -204,8 +207,8 @@ mod stage_b_tests {
     }
 
     #[test]
-    fn codex_source_uses_nonempty_override_and_status_exit_is_required() {
-        // Known-bad: empty CODEX_HOME redirects seeding, or status failure registers a stale token.
+    fn codex_source_uses_nonempty_override() {
+        // Known-bad: an empty CODEX_HOME redirects seeding away from the default home.
         let home = Path::new("/synthetic/home");
         assert_eq!(codex_source_home(home, None), home.join(".codex"));
         assert_eq!(
@@ -216,19 +219,40 @@ mod stage_b_tests {
             codex_source_home(home, Some(std::ffi::OsStr::new("/synthetic/other"))),
             PathBuf::from("/synthetic/other")
         );
-        let auth = br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20ifQ.s"}}"#;
+    }
+
+    #[test]
+    fn codex_login_verdict_accepts_valid_identity() {
+        // Known-bad: successful login and status still reject a valid local identity.
         assert_eq!(
-            codex_login_verdict(true, true, Some(auth)).unwrap().email,
+            codex_login_verdict(true, true, Some(SYNTHETIC_CODEX_AUTH))
+                .unwrap()
+                .email,
             "o@example.com"
         );
-        assert!(codex_login_verdict(false, true, Some(auth)).is_none());
-        assert!(codex_login_verdict(true, false, Some(auth)).is_none());
+    }
+
+    #[test]
+    fn codex_login_command_failure_refuses_registration() {
+        // Known-bad: a failed browser login is accepted because an old auth.json remains.
+        assert!(codex_login_verdict(false, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+    }
+
+    #[test]
+    fn codex_login_status_failure_refuses_registration() {
+        // Known-bad: a failed `login status` is ignored when auth.json exists.
+        assert!(codex_login_verdict(true, false, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+    }
+
+    #[test]
+    fn codex_missing_auth_file_refuses_registration() {
+        // Known-bad: exit code zero alone registers a profile without auth.json.
         assert!(codex_login_verdict(true, true, None).is_none());
     }
 
     #[test]
-    fn mixed_aliases_and_same_account_are_tool_scoped() {
-        // Known-bad: Codex receives a claude- alias or matches a Claude profile with the same email.
+    fn mixed_aliases_are_tool_scoped() {
+        // Known-bad: Codex receives a claude- alias or an overlong email comment breaks the line limit.
         let tmp = TempDir::new().unwrap();
         let manager = manager(&tmp);
         register(&manager, "c", Tool::Claude, "same@example.com");
@@ -251,6 +275,15 @@ mod stage_b_tests {
         assert!(powershell.contains("function codex-o { cswitch use o @args }"));
         assert!(powershell.lines().all(|line| line.chars().count() <= 120));
         assert!(powershell.contains("function codex-long { cswitch use long @args }"));
+    }
+
+    #[test]
+    fn same_email_across_tools_is_not_the_same_account() {
+        // Known-bad: same-account detection compares email across Claude and Codex.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "c", Tool::Claude, "same@example.com");
+        register(&manager, "o", Tool::Codex, "same@example.com");
         assert_eq!(
             manager
                 .profiles_with_email("same@example.com", Tool::Codex)
@@ -266,14 +299,22 @@ mod stage_b_tests {
     }
 
     #[test]
-    fn codex_session_markers_and_sync_guard_do_not_touch_claude_state() {
-        // Known-bad: Codex activity is missed, or skills sync writes into its own skills directory.
+    fn codex_log_marker_counts_as_activity() {
+        // Known-bad: only Claude session markers are checked for Codex profiles.
         let tmp = TempDir::new().unwrap();
         let manager = manager(&tmp);
         register(&manager, "o", Tool::Codex, "o@example.com");
         fs::create_dir_all(manager.profile_dir("o").join("log")).unwrap();
         fs::write(manager.profile_dir("o").join("log/entry"), "synthetic").unwrap();
         assert!(manager.maybe_in_use("o").is_some());
+    }
+
+    #[test]
+    fn codex_skills_sync_refuses_and_launch_skips_it() {
+        // Known-bad: Codex launch links Claude skills into its own skills directory.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "o", Tool::Codex, "o@example.com");
         assert!(
             manager
                 .sync_skills(

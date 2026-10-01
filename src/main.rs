@@ -1436,8 +1436,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_cli_flags_and_mixed_list_are_tool_scoped() {
-        // Known-bad: Codex add prompts for Claude Copy, or its list row reads Claude limits.
+    fn codex_add_and_login_flags_parse() {
+        // Known-bad: --tool codex is missing from add or login.
         assert!(matches!(
             Cli::try_parse_from(["cswitch", "add", "o", "--tool", "codex"])
                 .unwrap()
@@ -1456,7 +1456,9 @@ mod tests {
                 ..
             })
         ));
-        let tmp = TempDir::new().unwrap();
+    }
+
+    fn mixed_tool_manager(tmp: &TempDir) -> ProfileManager {
         let manager =
             ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
                 .unwrap();
@@ -1486,6 +1488,14 @@ mod tests {
             serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
+        manager
+    }
+
+    #[test]
+    fn mixed_list_has_tool_column_and_skips_codex_limits() {
+        // Known-bad: Codex list rows read Claude limits or exceed 120 columns with a 30-character email.
+        let tmp = TempDir::new().unwrap();
+        let manager = mixed_tool_manager(&tmp);
         let output = list_output(&manager, Utc::now()).unwrap();
         assert!(output.contains("o                    codex"), "{output}");
         assert!(
@@ -1496,6 +1506,13 @@ mod tests {
         let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
         assert!(codex_row.contains("—       —"), "{codex_row}");
         assert!(!codex_row.contains("unreadable"), "{codex_row}");
+    }
+
+    #[test]
+    fn sync_all_selects_only_claude_profiles() {
+        // Known-bad: --all includes Codex homes in Claude skills sync.
+        let tmp = TempDir::new().unwrap();
+        let manager = mixed_tool_manager(&tmp);
         assert_eq!(sync_target_names(&manager, true, None).unwrap(), ["c"]);
     }
 }

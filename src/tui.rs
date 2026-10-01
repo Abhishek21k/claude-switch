@@ -2949,8 +2949,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_add_choice_and_refresh_guard() {
-        // Known-bad: [o] routes to Claude login, or refresh overwrites a Codex home.
+    fn codex_add_choice_routes_to_codex_login() {
+        // Known-bad: [o] routes to a Claude login instead of Codex.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
         app.mode = Mode::AddChoice;
@@ -2960,19 +2960,34 @@ mod tests {
             app.pending,
             Some(PendingAction::CodexLogin { name: "new".into() })
         );
-        app.pending = None;
+    }
+
+    #[test]
+    fn codex_refresh_hotkey_refuses_before_confirmation() {
+        // Known-bad: the r key offers to replace a Codex home with a Claude session.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
         app.mode = Mode::Normal;
         app.profiles[0].tool = Tool::Codex;
-        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        let marker = app.manager.profile_dir("o").join("auth.json");
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, b"synthetic untouched").unwrap();
         app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
             .unwrap();
         assert_eq!(
             app.mode,
             Mode::Message("Refresh is Claude-only".into(), true)
         );
+    }
+
+    #[test]
+    fn codex_refresh_confirmation_refuses_even_if_reached() {
+        // Known-bad: a stale confirmation deletes the Codex home on y.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        app.mode = Mode::ConfirmRefresh;
+        app.profiles[0].tool = Tool::Codex;
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let marker = app.manager.profile_dir("o").join("auth.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"synthetic untouched").unwrap();
         app.handle_confirm_refresh(KeyCode::Char('y')).unwrap();
         assert_eq!(std::fs::read(&marker).unwrap(), b"synthetic untouched");
     }

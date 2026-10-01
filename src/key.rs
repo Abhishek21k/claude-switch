@@ -2216,9 +2216,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn codex_profile_refuses_key_set_and_clear_before_settings_read() {
-        // Known-bad: key commands edit a Codex home's settings.json or private key store.
+    fn codex_manager_with_profile() -> (tempfile::TempDir, ProfileManager, std::path::PathBuf) {
         let (_tmp, manager, executable) = manager_with_profile();
         let mut registry = manager.load_registry().unwrap();
         registry.profiles.get_mut("n").unwrap().tool = Tool::Codex;
@@ -2229,6 +2227,14 @@ mod tests {
         .unwrap();
         let settings = manager.profile_dir("n").join("settings.json");
         std::fs::write(&settings, b"synthetic untouched").unwrap();
+        (_tmp, manager, executable)
+    }
+
+    #[test]
+    fn codex_profile_refuses_key_set_before_settings_read() {
+        // Known-bad: key set edits a Codex home's settings.json or private key store.
+        let (_tmp, manager, executable) = codex_manager_with_profile();
+        let settings = manager.profile_dir("n").join("settings.json");
         assert!(
             precheck_set_key(&manager, "n", false)
                 .unwrap_err()
@@ -2242,6 +2248,15 @@ mod tests {
                 .to_string()
                 .contains("Claude-only")
         );
+        assert_eq!(std::fs::read(&settings).unwrap(), b"synthetic untouched");
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn codex_profile_refuses_key_clear_before_settings_read() {
+        // Known-bad: key clear rewrites a Codex home's settings.json.
+        let (_tmp, manager, _executable) = codex_manager_with_profile();
+        let settings = manager.profile_dir("n").join("settings.json");
         assert!(
             clear_key(&manager, "n", now())
                 .err()
@@ -2250,6 +2265,5 @@ mod tests {
                 .contains("Claude-only")
         );
         assert_eq!(std::fs::read(&settings).unwrap(), b"synthetic untouched");
-        assert!(!has_key(&manager, "n"));
     }
 }
