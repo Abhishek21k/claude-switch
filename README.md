@@ -1,8 +1,8 @@
 # claude-switch
 
-Multi-account profile manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Multi-account profile manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex.
 
-Switch between multiple Claude accounts without logging out. Each profile is fully isolated — run different accounts in different terminals simultaneously.
+Switch between accounts without logging out. Each profile has its own tool home, so accounts can run in different terminals simultaneously.
 
 ## Why
 
@@ -57,6 +57,9 @@ cswitch add work
 # Add another account (opens Claude for you to log in)
 cswitch login personal
 
+# Add a Codex (ChatGPT) account in its own home
+cswitch login coding --tool codex
+
 # Switch between them
 cswitch use work
 cswitch use personal
@@ -74,13 +77,15 @@ cswitch
 | `cswitch login <name>` | Create a profile by logging into a different account |
 | `cswitch login <name> --email <addr>` | Same, pre-filling the address on Claude's login page |
 | `cswitch login <name> --console` | Create a profile through Anthropic Console (API billing) |
+| `cswitch login <name> --tool codex` | Log in to Codex with a new ChatGPT session |
+| `cswitch add <name> --tool codex` | Same Codex login, without a Copy option |
 | `cswitch key set <name> [--replace-helper]` | Read a hidden key, then optionally configure an Anthropic-compatible gateway |
 | `cswitch key clear <name>` | Remove the saved key and its managed gateway settings |
 | `cswitch gateway list` | Show saved gateway URLs and setting names, without values |
 | `cswitch gateway forget <url>` | Forget defaults for a gateway without editing any profile |
-| `cswitch use <name> [claude flags...]` | Sync skills, then launch Claude Code with a specific profile; flags pass through unchanged |
+| `cswitch use <name> [tool flags...]` | Launch the profile's tool; Claude profiles sync skills first, and flags pass through unchanged |
 | `cswitch sync <name> [--dry-run] [--adopt <skill>]...` | Sync shared skills into one profile |
-| `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every profile |
+| `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every Claude profile |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name> [--purge-usage]` | Delete a profile; keep its usage ledger unless explicitly purged |
@@ -105,6 +110,14 @@ On a terminal, `key set` then asks for a gateway base URL or the provider's sett
 The helper overrides a Console login or subscription while present. `cswitch key clear <name>` removes the helper and the base URL together, so the profile's saved login never goes to the gateway. If an unrelated helper already exists, `key set` refuses to replace it unless you pass `--replace-helper`.
 
 `key print` is a hidden command used only by Claude Code's helper. It refuses to print to a terminal and refuses an exposed key file on Unix. `cswitch info` and the TUI show the active authentication source; API-billed rows in `cswitch list` show `api` instead of plan limits.
+
+## Codex profiles
+
+Run `cswitch login <name> --tool codex` or `cswitch add <name> --tool codex`, or choose `[o]` in the TUI Add menu. Each Codex profile directory is its `CODEX_HOME`. `cswitch use <name>` launches Codex with that directory and forwards any arguments. Profile names share one namespace across Claude and Codex.
+
+Before login, cswitch copies only `config.toml`, `AGENTS.md`, `agents/`, `rules/` and `skills/` from `CODEX_HOME` (if set and non-empty) or `~/.codex`. It preserves links, but never copies `auth.json`, sessions, logs, sqlite state, secrets or daemon packages. The new login is verified by exit status; the status command's output is discarded because API-key mode can print part of a key. Account email and optional plan type are read offline from the new profile's `auth.json`.
+
+Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways, skills sync, plan limits and `cswitch usage` apply only to Claude profiles. `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
 
 ## Plan limits
 
@@ -168,13 +181,13 @@ Run `cswitch` with no arguments to open the TUI.
 | Key | Action |
 |---|---|
 | `↑/↓` or `j/k` | Navigate profiles |
-| `Enter` | Launch Claude with selected profile |
+| `Enter` | Launch the selected profile's tool |
 | `/` | Search profiles by name or email |
-| `a` | Add account — enter a name, then choose copy or login |
+| `a` | Add account — enter a name, then choose Claude Copy/login or `[o]` Codex login |
 | `l` | Login — shortcut straight to a different account |
-| `p` | Enter a masked API key for the selected profile |
-| `P` | Clear the selected profile's API key after confirmation |
-| `r` | Refresh — overwrite the selected profile with the current session (confirmed) |
+| `p` | Enter a masked API key for a Claude profile |
+| `P` | Clear a Claude profile's API key after confirmation |
+| `r` | Refresh a Claude profile from the current session (confirmed) |
 | `d` | Delete selected profile (confirmed) |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit |

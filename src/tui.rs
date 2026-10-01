@@ -12,7 +12,9 @@ use ratatui::{
 use crate::gateway::{self, GatewayInput};
 use crate::key::{self, AuthMode, InputStep};
 use crate::limits::{Limits, Window, parse_limits, read_claude_json};
-use crate::profile::{LoginMethod, Profile, ProfileManager, describe_age, detect_current_account};
+use crate::profile::{
+    LoginMethod, Profile, ProfileManager, Tool, describe_age, detect_current_account,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -57,7 +59,13 @@ enum Mode {
 #[derive(Debug, Clone, PartialEq)]
 enum PendingAction {
     /// Authenticate a brand-new profile as a different Claude account.
-    Login { name: String, method: LoginMethod },
+    Login {
+        name: String,
+        method: LoginMethod,
+    },
+    CodexLogin {
+        name: String,
+    },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -97,6 +105,7 @@ pub struct App {
     account_probe: AccountProbe,
     limits: HashMap<String, Limits>,
     auth_modes: HashMap<String, AuthMode>,
+    codex_plans: HashMap<String, Option<String>>,
     limits_selection: Option<String>,
     last_limits_refresh: Option<Instant>,
     limits_now: DateTime<Utc>,
@@ -149,6 +158,7 @@ impl App {
             account_probe: live_account_email,
             limits: HashMap::new(),
             auth_modes: HashMap::new(),
+            codex_plans: HashMap::new(),
             limits_selection: None,
             last_limits_refresh: None,
             limits_now: Utc::now(),
@@ -185,6 +195,23 @@ impl App {
         if let Some(name) = &selected
             && (changed || due)
         {
+            if let Some(tool) = self.selected_profile().map(|profile| profile.tool)
+                && tool != Tool::Claude
+            {
+                self.limits.remove(name);
+                self.auth_modes.remove(name);
+                if tool == Tool::Codex {
+                    self.codex_plans.insert(
+                        name.clone(),
+                        self.manager
+                            .codex_identity(name)
+                            .and_then(|identity| identity.plan_type),
+                    );
+                }
+                self.limits_selection = selected;
+                self.last_limits_refresh = Some(instant);
+                return;
+            }
             let claude = read_claude_json(&self.manager.profile_dir(name));
             self.auth_modes.insert(
                 name.clone(),
@@ -371,43 +398,47 @@ impl App {
 
         // `select` is only set when a profile actually landed in the registry,
         // so a failed attempt leaves the current selection alone.
-        let (select, message) = match action {
+        let (name, result, method) = match action {
             PendingAction::Login { name, method } => {
-                match self.manager.login_profile(&name, false, None, method) {
-                    Ok(result) => {
-                        let others: Vec<&str> = result
-                            .same_account_as
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|n| *n != name)
-                            .collect();
-
-                        let msg = if method == LoginMethod::Console && result.email.is_none() {
-                            format!(
-                                "Console login completed for profile '{name}' (email unavailable)."
-                            )
-                        } else if others.is_empty() {
-                            format!(
-                                "Profile '{}' logged in as {}.",
-                                name,
-                                result.display_email()
-                            )
-                        } else {
-                            // Not an error: two profiles for one account is a
-                            // valid setup. But say it, or it reads as a new one.
-                            format!(
-                                "Profile '{}' is {} — the same account as {}. \
-                                 Sign out of claude.ai and retry if you wanted a different one.",
-                                name,
-                                result.display_email(),
-                                others.join(", ")
-                            )
-                        };
-                        (Some(name), Mode::Message(msg, false))
-                    }
-                    Err(e) => (None, Mode::Message(e.to_string(), true)),
-                }
+                let result = self.manager.login_profile(&name, false, None, method);
+                (name, result, Some(method))
             }
+            PendingAction::CodexLogin { name } => {
+                let result = self.manager.login_codex_profile(&name);
+                (name, result, None)
+            }
+        };
+        let (select, message) = match result {
+            Ok(result) => {
+                let others: Vec<&str> = result
+                    .same_account_as
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| *n != name)
+                    .collect();
+
+                let msg = if method == Some(LoginMethod::Console) && result.email.is_none() {
+                    format!("Console login completed for profile '{name}' (email unavailable).")
+                } else if others.is_empty() {
+                    format!(
+                        "Profile '{}' logged in as {}.",
+                        name,
+                        result.display_email()
+                    )
+                } else {
+                    // Not an error: two profiles for one account is a
+                    // valid setup. But say it, or it reads as a new one.
+                    format!(
+                        "Profile '{}' is {} — the same {} account as {}.",
+                        name,
+                        result.display_email(),
+                        result.tool.label(),
+                        others.join(", ")
+                    )
+                };
+                (Some(name), Mode::Message(msg, false))
+            }
+            Err(e) => (None, Mode::Message(e.to_string(), true)),
         };
 
         // Rebuild the terminal the loop is about to draw into.
@@ -432,6 +463,10 @@ impl App {
         if !self.claude_dir_found {
             match code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                KeyCode::Char('a') => {
+                    self.input_buffer.clear();
+                    self.mode = Mode::AddName;
+                }
                 _ => self.mode = Mode::Normal,
             }
             return Ok(false);
@@ -440,6 +475,10 @@ impl App {
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('a') => {
+                self.input_buffer.clear();
+                self.mode = Mode::AddName;
+            }
 
             KeyCode::Char('1') => {
                 let name = self.input_buffer.trim().to_string();
@@ -509,10 +548,18 @@ impl App {
 
             KeyCode::Enter => {
                 if let Some(p) = self.selected_profile() {
+                    if p.tool == Tool::Unknown {
+                        self.mode = Mode::Message(
+                            "Profile has an unknown tool; cannot use or log in.".into(),
+                            true,
+                        );
+                        return Ok(false);
+                    }
                     let name = p.name.clone();
+                    let tool = p.tool;
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}'…", name);
-                    self.manager.launch_claude(&name, &[])?;
+                    println!("Launching {} with profile '{}'…", tool.label(), name);
+                    self.manager.launch_profile(&name, &[])?;
                 }
             }
 
@@ -522,6 +569,13 @@ impl App {
             }
 
             KeyCode::Char('p') if self.selected_profile().is_some() => {
+                if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool != Tool::Claude)
+                {
+                    self.mode = Mode::Message("API keys are Claude-only.".into(), true);
+                    return Ok(false);
+                }
                 self.key_buffer.clear();
                 self.gateway_buffer.clear();
                 self.pending_gateway = None;
@@ -529,7 +583,14 @@ impl App {
                 self.mode = Mode::KeyEntry;
             }
             KeyCode::Char('P') if self.selected_profile().is_some() => {
-                self.mode = Mode::ConfirmKeyClear;
+                self.mode = if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool == Tool::Claude)
+                {
+                    Mode::ConfirmKeyClear
+                } else {
+                    Mode::Message("API keys are Claude-only.".into(), true)
+                };
             }
 
             KeyCode::Char('a') => {
@@ -549,6 +610,13 @@ impl App {
             // account theft when they are not — so it is confirmed against the
             // identities involved.
             KeyCode::Char('r') if self.selected_profile().is_some() => {
+                if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool != Tool::Claude)
+                {
+                    self.mode = Mode::Message("Refresh is Claude-only".into(), true);
+                    return Ok(false);
+                }
                 self.current_account = (self.account_probe)();
                 self.selected_in_use = self.selected_session_age();
                 self.selected_has_history = self.selected_holds_history();
@@ -567,6 +635,10 @@ impl App {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(p) = self.selected_profile() {
+                    if p.tool != Tool::Claude {
+                        self.mode = Mode::Message("Refresh is Claude-only".into(), true);
+                        return Ok(());
+                    }
                     let name = p.name.clone();
                     match self.manager.add_profile_force(&name, false) {
                         Ok(p) => {
@@ -889,6 +961,9 @@ impl App {
                     method: LoginMethod::Console,
                 });
             }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.pending = Some(PendingAction::CodexLogin { name });
+            }
             // Esc steps back to the name, not out of the flow — a typo in the
             // name should not cost the whole interaction.
             KeyCode::Esc | KeyCode::Backspace => self.mode = Mode::AddName,
@@ -1161,6 +1236,10 @@ impl App {
                 "      Opens Claude for you to authenticate a new account",
                 Style::default().fg(DIM),
             )),
+            Line::from(Span::styled(
+                "  [a] Choose Claude or Codex login instead",
+                Style::default().fg(TEXT),
+            )),
         ]
     }
 
@@ -1186,7 +1265,7 @@ impl App {
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  You need to install and log in to Claude Code before adding profiles.",
+                "  Claude Code is not set up here. You can still add a Codex profile.",
                 Style::default().fg(DIM),
             )),
             Line::from(""),
@@ -1207,7 +1286,7 @@ impl App {
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  Then re-run cswitch to set up your first profile.",
+                "  Press [a] to choose Codex login, or install Claude Code first.",
                 Style::default().fg(DIM),
             )),
         ]
@@ -1300,7 +1379,10 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
-                        Span::styled(email.to_string(), Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("{} · {email}", p.tool.label()),
+                            Style::default().fg(DIM),
+                        ),
                     ]),
                 ])
             })
@@ -1355,6 +1437,10 @@ impl App {
                 Span::styled(profile.name.clone(), Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(vec![
+                Span::styled("  Tool         ", Style::default().fg(DIM)),
+                Span::styled(profile.tool.label(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
                 Span::styled("  Email        ", Style::default().fg(DIM)),
                 Span::styled(
                     profile.email.clone().unwrap_or("unknown".into()),
@@ -1364,17 +1450,25 @@ impl App {
             Line::from(vec![
                 Span::styled("  Auth         ", Style::default().fg(DIM)),
                 Span::styled(
-                    self.auth_modes
-                        .get(&profile.name)
-                        .map(AuthMode::label)
-                        .unwrap_or_else(|| "unreadable".into()),
+                    if profile.tool == Tool::Claude {
+                        self.auth_modes
+                            .get(&profile.name)
+                            .map(AuthMode::label)
+                            .unwrap_or_else(|| "unreadable".into())
+                    } else {
+                        "—".into()
+                    },
                     Style::default().fg(TEXT),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("  Gateway      ", Style::default().fg(DIM)),
                 Span::styled(
-                    key::gateway_info(&self.manager, &profile.name),
+                    if profile.tool == Tool::Claude {
+                        key::gateway_info(&self.manager, &profile.name)
+                    } else {
+                        "—".into()
+                    },
                     Style::default().fg(TEXT),
                 ),
             ]),
@@ -1396,38 +1490,55 @@ impl App {
                 ),
             ]),
         ];
+        if profile.tool == Tool::Codex {
+            lines.push(Line::from(vec![
+                Span::styled("  Plan         ", Style::default().fg(DIM)),
+                Span::styled(
+                    self.codex_plans
+                        .get(&profile.name)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| "—".into()),
+                    Style::default().fg(TEXT),
+                ),
+            ]));
+        }
         lines.push(Line::from(""));
-        match self.limits.get(&profile.name) {
-            Some(Limits::Snapshot(snapshot)) => {
-                lines.push(Line::from(vec![
-                    Span::styled("  Plan limits  ", Style::default().fg(DIM)),
-                    Span::styled(
-                        format!("as of {}", snapshot.age(self.limits_now)),
-                        Style::default().fg(TEXT),
-                    ),
-                ]));
-                if snapshot.windows.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "    No limit windows in this snapshot.",
-                        Style::default().fg(MUTED),
-                    )));
+        if profile.tool != Tool::Claude {
+            lines.push(Line::from("  Plan limits  —"));
+        } else {
+            match self.limits.get(&profile.name) {
+                Some(Limits::Snapshot(snapshot)) => {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Plan limits  ", Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("as of {}", snapshot.age(self.limits_now)),
+                            Style::default().fg(TEXT),
+                        ),
+                    ]));
+                    if snapshot.windows.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "    No limit windows in this snapshot.",
+                            Style::default().fg(MUTED),
+                        )));
+                    }
+                    for window in &snapshot.windows {
+                        lines.push(limit_line(window, self.limits_now));
+                    }
                 }
-                for window in &snapshot.windows {
-                    lines.push(limit_line(window, self.limits_now));
-                }
+                Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
+                    "  Plan limits  mismatch: another account's snapshot",
+                    Style::default().fg(MUTED),
+                ))),
+                Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
+                    "  Plan limits  unreadable: file couldn't be read",
+                    Style::default().fg(MUTED),
+                ))),
+                Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
+                    "  Plan limits  no data: no cached snapshot yet",
+                    Style::default().fg(MUTED),
+                ))),
             }
-            Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
-                "  Plan limits  mismatch: another account's snapshot",
-                Style::default().fg(MUTED),
-            ))),
-            Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
-                "  Plan limits  unreadable: file couldn't be read",
-                Style::default().fg(MUTED),
-            ))),
-            Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
-                "  Plan limits  no data: no cached snapshot yet",
-                Style::default().fg(MUTED),
-            ))),
         }
         lines.extend([
             Line::from(""),
@@ -1448,11 +1559,34 @@ impl App {
             Line::from(Span::styled(
                 if cfg!(target_os = "windows") {
                     format!(
-                        "  $env:CLAUDE_CONFIG_DIR='{}'; claude",
-                        profile_dir.display()
+                        "  $env:{}='{}'; {}",
+                        if profile.tool == Tool::Codex {
+                            "CODEX_HOME"
+                        } else {
+                            "CLAUDE_CONFIG_DIR"
+                        },
+                        profile_dir.display(),
+                        if profile.tool == Tool::Codex {
+                            "codex"
+                        } else {
+                            "claude"
+                        }
                     )
                 } else {
-                    format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
+                    format!(
+                        "  {}='{}' {}",
+                        if profile.tool == Tool::Codex {
+                            "CODEX_HOME"
+                        } else {
+                            "CLAUDE_CONFIG_DIR"
+                        },
+                        profile_dir.display(),
+                        if profile.tool == Tool::Codex {
+                            "codex"
+                        } else {
+                            "claude"
+                        }
+                    )
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
@@ -1518,9 +1652,9 @@ impl App {
 
         let help_entries: Vec<(&str, &str)> = vec![
             ("↑/↓  j/k", "Navigate profiles"),
-            ("Enter", "Launch Claude with selected profile"),
+            ("Enter", "Launch selected profile's tool"),
             ("/", "Search profiles by name or email"),
-            ("a", "Add account — choose copy, subscription, or Console"),
+            ("a", "Add account — choose Claude or Codex login"),
             ("l", "Login — straight to a different account"),
             ("p", "Set API key for selected profile"),
             ("P", "Clear API key after confirmation"),
@@ -1651,7 +1785,7 @@ impl App {
 
     /// The step that makes the side effect explicit before it happens.
     fn render_add_choice_popup(&self, f: &mut Frame) {
-        let area = centered_rect(66, 15, f.area());
+        let area = centered_rect(66, 17, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -1704,6 +1838,13 @@ impl App {
                     Span::styled("  [p] ", Style::default().fg(ACCENT).bold()),
                     Span::styled(
                         "Log in with the Anthropic Console (API billing)",
+                        Style::default().fg(TEXT),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  [o] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        "Log in to a Codex (ChatGPT) account",
                         Style::default().fg(TEXT),
                     ),
                 ]),
@@ -2105,6 +2246,7 @@ mod tests {
                 name.to_string(),
                 Profile {
                     name: name.to_string(),
+                    tool: Tool::Claude,
                     email: email.map(String::from),
                     added: Utc::now(),
                     last_used: None,
@@ -2804,5 +2946,45 @@ mod tests {
                 .contains_key("business"),
             "confirming must still delete"
         );
+    }
+
+    #[test]
+    fn codex_add_choice_and_refresh_guard() {
+        // Known-bad: [o] routes to Claude login, or refresh overwrites a Codex home.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "new".into();
+        app.handle_add_choice(KeyCode::Char('o')).unwrap();
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::CodexLogin { name: "new".into() })
+        );
+        app.pending = None;
+        app.mode = Mode::Normal;
+        app.profiles[0].tool = Tool::Codex;
+        let marker = app.manager.profile_dir("o").join("auth.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"synthetic untouched").unwrap();
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::Message("Refresh is Claude-only".into(), true)
+        );
+        app.handle_confirm_refresh(KeyCode::Char('y')).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"synthetic untouched");
+    }
+
+    #[test]
+    fn first_run_without_claude_can_enter_codex_add_flow() {
+        // Known-bad: the first-run screen requires Claude before Codex can be added.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = false;
+        app.handle_first_run_key(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::AddName);
     }
 }

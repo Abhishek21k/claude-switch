@@ -3,7 +3,7 @@
 use crate::atomic;
 use crate::gateway::{self, GatewayInput};
 use crate::limits::read_claude_json;
-use crate::profile::{ProfileManager, shell_quote};
+use crate::profile::{ProfileManager, Tool, shell_quote};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -315,7 +315,9 @@ pub fn precheck_set_key(manager: &ProfileManager, name: &str, replace_helper: bo
     if !valid_name(name) {
         bail!("Invalid profile name.");
     }
-    manager.get_profile(name)?;
+    if manager.get_profile(name)?.tool != Tool::Claude {
+        bail!("API keys are Claude-only.");
+    }
     let settings = manager.profile_dir(name).join("settings.json");
     let state = read_settings(&settings)?;
     let _ = read_manifest(&manager.base_dir, name)?;
@@ -494,7 +496,9 @@ pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Re
     if !valid_name(name) {
         bail!("Invalid profile name.");
     }
-    manager.get_profile(name)?;
+    if manager.get_profile(name)?.tool != Tool::Claude {
+        bail!("API keys are Claude-only.");
+    }
     let settings = manager.profile_dir(name).join("settings.json");
     let old_names = read_manifest(&manager.base_dir, name)?.unwrap_or_default();
     let old_gateway = gateway_display(manager, name);
@@ -2210,5 +2214,42 @@ mod tests {
             );
             assert!(!has_key(&manager, "n"));
         }
+    }
+
+    #[test]
+    fn codex_profile_refuses_key_set_and_clear_before_settings_read() {
+        // Known-bad: key commands edit a Codex home's settings.json or private key store.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let mut registry = manager.load_registry().unwrap();
+        registry.profiles.get_mut("n").unwrap().tool = Tool::Codex;
+        std::fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let settings = manager.profile_dir("n").join("settings.json");
+        std::fs::write(&settings, b"synthetic untouched").unwrap();
+        assert!(
+            precheck_set_key(&manager, "n", false)
+                .unwrap_err()
+                .to_string()
+                .contains("Claude-only")
+        );
+        assert!(
+            set_key(&manager, "n", "TESTKEY", &executable, false, now())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Claude-only")
+        );
+        assert!(
+            clear_key(&manager, "n", now())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Claude-only")
+        );
+        assert_eq!(std::fs::read(&settings).unwrap(), b"synthetic untouched");
+        assert!(!has_key(&manager, "n"));
     }
 }

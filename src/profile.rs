@@ -1,4 +1,5 @@
 use crate::atomic;
+use crate::codex;
 use crate::key::{remove_key, strip_copied_helper};
 use crate::skills_sync::{self, SyncAction, SyncOptions, SyncReport};
 use anyhow::{Context, Result, bail};
@@ -15,9 +16,323 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
+    #[serde(default)]
+    pub tool: Tool,
     pub email: Option<String>,
     pub added: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod stage_b_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn manager(tmp: &TempDir) -> ProfileManager {
+        ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude")).unwrap()
+    }
+
+    fn register(manager: &ProfileManager, name: &str, tool: Tool, email: &str) {
+        let mut registry = manager.load_registry().unwrap();
+        registry.profiles.insert(
+            name.into(),
+            Profile {
+                name: name.into(),
+                tool,
+                email: Some(email.into()),
+                added: Utc::now(),
+                last_used: None,
+            },
+        );
+        manager.save_registry(&registry).unwrap();
+        fs::create_dir_all(manager.profile_dir(name)).unwrap();
+    }
+
+    #[test]
+    fn legacy_registry_defaults_to_claude() {
+        // Known-bad: requiring `tool` breaks registries written before Stage B.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        fs::write(&manager.registry_path, r#"{"profiles":{"old":{"name":"old","email":"old@example.com","added":"2030-01-01T00:00:00Z","last_used":null}}}"#).unwrap();
+        assert_eq!(manager.get_profile("old").unwrap().tool, Tool::Claude);
+    }
+
+    #[test]
+    fn unknown_tool_loads_and_refuses_use_and_login() {
+        // Known-bad: a strict enum fails the whole registry instead of isolating the unknown profile.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        fs::write(&manager.registry_path, r#"{"profiles":{"alien":{"name":"alien","tool":"martian","email":"alien@example.com","added":"2030-01-01T00:00:00Z","last_used":null}}}"#).unwrap();
+        fs::create_dir_all(manager.profile_dir("alien")).unwrap();
+        assert_eq!(manager.get_profile("alien").unwrap().tool, Tool::Unknown);
+        assert!(
+            manager
+                .prepare_launch("alien")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool")
+        );
+        assert!(
+            manager
+                .login_codex_profile("alien")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool")
+        );
+    }
+
+    #[test]
+    fn codex_seed_copies_only_five_warm_entries() {
+        // Known-bad: a skip list misses a new versioned sqlite file or copies auth.json.
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join(".codex");
+        let dest = tmp.path().join("profile");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        for name in ["config.toml", "AGENTS.md"] {
+            fs::write(source.join(name), "synthetic warm state").unwrap();
+        }
+        for name in ["agents", "rules", "skills"] {
+            fs::create_dir_all(source.join(name)).unwrap();
+            fs::write(source.join(name).join("entry"), "synthetic warm state").unwrap();
+        }
+        for name in [
+            "auth.json",
+            "installation_id",
+            "history.jsonl",
+            "session_index.jsonl",
+            "logs_2.sqlite",
+            "logs_2.sqlite-shm",
+            "logs_2.sqlite-wal",
+            "state_5.sqlite",
+            "thread_history_1.sqlite",
+            "goals_1.sqlite",
+            "queue_1.sqlite",
+            "memories_1.sqlite",
+            "models_cache.json",
+            "version.json",
+            "tui-thread-reference-capabilities",
+            ".personality_migration",
+            ".sandbox_migration",
+        ] {
+            fs::write(source.join(name), "synthetic excluded state").unwrap();
+        }
+        for stem in [
+            "logs_2",
+            "state_5",
+            "thread_history_1",
+            "goals_1",
+            "queue_1",
+            "memories_1",
+        ] {
+            for suffix in ["", ".sqlite", ".sqlite-shm", ".sqlite-wal"] {
+                fs::write(
+                    source.join(format!("{stem}{suffix}")),
+                    "synthetic excluded state",
+                )
+                .unwrap();
+            }
+        }
+        for name in [
+            "secrets",
+            "sessions",
+            "archived_sessions",
+            "memories",
+            "packages",
+            "cache",
+            ".tmp",
+            "tmp",
+            "log",
+            "plugins",
+            "attachments",
+            "shell_snapshots",
+            "bin",
+            "ipc",
+            "app-server-control",
+            "app-server-daemon",
+            "mcp-oauth-locks",
+            "thread-writer-locks",
+        ] {
+            fs::create_dir_all(source.join(name)).unwrap();
+            fs::write(source.join(name).join("entry"), "synthetic excluded state").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source.join("agents/entry"), source.join("skills/linked"))
+            .unwrap();
+        seed_codex_from(&source, &dest).unwrap();
+        let mut entries: Vec<String> = fs::read_dir(&dest)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["AGENTS.md", "agents", "config.toml", "rules", "skills"]
+        );
+        #[cfg(unix)]
+        assert!(dest.join("skills/linked").is_symlink());
+    }
+
+    #[test]
+    fn launch_spec_sets_exactly_the_selected_tool_home() {
+        // Known-bad: a Codex launch inherits the Claude env key instead of CODEX_HOME.
+        let dir = PathBuf::from("/synthetic/profile");
+        assert_eq!(
+            launch_spec(Tool::Codex, dir.clone()).unwrap(),
+            LaunchSpec {
+                program: "codex",
+                env_key: "CODEX_HOME",
+                env_value: dir.clone()
+            }
+        );
+        assert_eq!(
+            launch_spec(Tool::Claude, dir.clone()).unwrap(),
+            LaunchSpec {
+                program: "claude",
+                env_key: "CLAUDE_CONFIG_DIR",
+                env_value: dir
+            }
+        );
+    }
+
+    #[test]
+    fn codex_source_uses_nonempty_override_and_status_exit_is_required() {
+        // Known-bad: empty CODEX_HOME redirects seeding, or status failure registers a stale token.
+        let home = Path::new("/synthetic/home");
+        assert_eq!(codex_source_home(home, None), home.join(".codex"));
+        assert_eq!(
+            codex_source_home(home, Some(std::ffi::OsStr::new(""))),
+            home.join(".codex")
+        );
+        assert_eq!(
+            codex_source_home(home, Some(std::ffi::OsStr::new("/synthetic/other"))),
+            PathBuf::from("/synthetic/other")
+        );
+        let auth = br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20ifQ.s"}}"#;
+        assert_eq!(
+            codex_login_verdict(true, true, Some(auth)).unwrap().email,
+            "o@example.com"
+        );
+        assert!(codex_login_verdict(false, true, Some(auth)).is_none());
+        assert!(codex_login_verdict(true, false, Some(auth)).is_none());
+        assert!(codex_login_verdict(true, true, None).is_none());
+    }
+
+    #[test]
+    fn mixed_aliases_and_same_account_are_tool_scoped() {
+        // Known-bad: Codex receives a claude- alias or matches a Claude profile with the same email.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "c", Tool::Claude, "same@example.com");
+        register(&manager, "o", Tool::Codex, "same@example.com");
+        register(
+            &manager,
+            "long",
+            Tool::Codex,
+            &format!("{}@example.com", "x".repeat(150)),
+        );
+        let aliases = manager.generate_aliases().unwrap();
+        assert!(aliases.contains("claude-c"));
+        assert!(aliases.contains("codex-o"));
+        assert!(!aliases.contains("claude-o"));
+        assert!(aliases.lines().all(|line| line.chars().count() <= 120));
+        assert!(aliases.contains("alias codex-long='cswitch use long'"));
+        let powershell = manager
+            .generate_powershell_aliases(&manager.list_profiles().unwrap())
+            .unwrap();
+        assert!(powershell.contains("function codex-o { cswitch use o @args }"));
+        assert!(powershell.lines().all(|line| line.chars().count() <= 120));
+        assert!(powershell.contains("function codex-long { cswitch use long @args }"));
+        assert_eq!(
+            manager
+                .profiles_with_email("same@example.com", Tool::Codex)
+                .unwrap(),
+            ["o"]
+        );
+        assert_eq!(
+            manager
+                .profiles_with_email("same@example.com", Tool::Claude)
+                .unwrap(),
+            ["c"]
+        );
+    }
+
+    #[test]
+    fn codex_session_markers_and_sync_guard_do_not_touch_claude_state() {
+        // Known-bad: Codex activity is missed, or skills sync writes into its own skills directory.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "o", Tool::Codex, "o@example.com");
+        fs::create_dir_all(manager.profile_dir("o").join("log")).unwrap();
+        fs::write(manager.profile_dir("o").join("log/entry"), "synthetic").unwrap();
+        assert!(manager.maybe_in_use("o").is_some());
+        assert!(
+            manager
+                .sync_skills(
+                    "o",
+                    &SyncOptions {
+                        dry_run: false,
+                        adopt: vec![]
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Claude-only")
+        );
+        assert!(!manager.profile_dir("o").join("skills").exists());
+        assert_eq!(manager.prepare_launch("o").unwrap().spec.program, "codex");
+        assert!(!manager.profile_dir("o").join("skills").exists());
+    }
+
+    #[test]
+    fn codex_nested_session_rewrite_counts_as_recent_activity() {
+        // Known-bad: checking only the sessions/ directory misses a rewrite several levels below it.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "o", Tool::Codex, "o@example.com");
+        let sessions = manager.profile_dir("o").join("sessions");
+        let year = sessions.join("2030");
+        let month = year.join("01");
+        fs::create_dir_all(&month).unwrap();
+        let session = month.join("session.jsonl");
+        fs::write(&session, "synthetic").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        for directory in [&sessions, &year, &month] {
+            fs::File::open(directory)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        assert!(manager.maybe_in_use("o").is_some());
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tool {
+    #[default]
+    Claude,
+    Codex,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Tool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Unknown => "unknown tool",
+        }
+    }
+
+    fn alias_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("claude"),
+            Self::Codex => Some("codex"),
+            Self::Unknown => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -35,6 +350,7 @@ pub struct Registry {
 pub struct LoginOutcome {
     pub email: Option<String>,
     pub same_account_as: Vec<String>,
+    pub tool: Tool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,16 +413,47 @@ pub struct ProfileManager {
     pub profiles_dir: PathBuf,
     registry_path: PathBuf,
     claude_home: PathBuf,
+    codex_home: PathBuf,
 }
 
+#[derive(Debug)]
 struct LaunchPreparation {
-    profile_dir: PathBuf,
+    spec: LaunchSpec,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LaunchSpec {
+    pub program: &'static str,
+    pub env_key: &'static str,
+    pub env_value: PathBuf,
+}
+
+pub fn launch_spec(tool: Tool, profile_dir: PathBuf) -> Result<LaunchSpec> {
+    let (program, env_key) = match tool {
+        Tool::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
+        Tool::Codex => ("codex", "CODEX_HOME"),
+        Tool::Unknown => bail!("Profile has an unknown tool; cannot use or log in."),
+    };
+    Ok(LaunchSpec {
+        program,
+        env_key,
+        env_value: profile_dir,
+    })
+}
+
+fn codex_source_home(home: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    configured
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
 }
 
 impl ProfileManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        Self::with_base_dir(home.join(".claude-switch"))
+        let mut manager = Self::with_base_dir(home.join(".claude-switch"))?;
+        manager.codex_home = codex_source_home(&home, std::env::var_os("CODEX_HOME").as_deref());
+        Ok(manager)
     }
 
     /// Build a manager rooted at an arbitrary directory.
@@ -122,6 +469,10 @@ impl ProfileManager {
 
     /// Inject both roots so tests never consult the caller's real home.
     pub fn with_paths(base_dir: PathBuf, claude_home: PathBuf) -> Result<Self> {
+        let home = base_dir
+            .parent()
+            .context("Cannot determine parent of profile base directory")?;
+        let codex_home = home.join(".codex");
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
         fs::create_dir_all(&profiles_dir)?;
@@ -130,6 +481,7 @@ impl ProfileManager {
             profiles_dir,
             registry_path,
             claude_home,
+            codex_home,
         })
     }
 
@@ -233,10 +585,13 @@ impl ProfileManager {
 
     pub fn remove_profile(&self, name: &str) -> Result<()> {
         let mut registry = self.load_registry()?;
-        if !registry.profiles.contains_key(name) {
-            bail!("Profile '{}' not found.", name);
+        let profile = registry
+            .profiles
+            .get(name)
+            .context(format!("Profile '{name}' not found."))?;
+        if profile.tool == Tool::Claude {
+            remove_key(&self.base_dir, name)?;
         }
-        remove_key(&self.base_dir, name)?;
         let dest = self.profiles_dir.join(name);
         if dest.exists() {
             fs::remove_dir_all(&dest)?;
@@ -259,7 +614,9 @@ impl ProfileManager {
     }
 
     pub fn sync_skills(&self, name: &str, opts: &SyncOptions) -> Result<SyncReport> {
-        self.get_profile(name)?;
+        if self.get_profile(name)?.tool != Tool::Claude {
+            bail!("Skills sync is Claude-only.");
+        }
         skills_sync::sync_skills(
             &self.claude_home.join("skills"),
             &self.profile_dir(name).join("skills"),
@@ -282,9 +639,24 @@ impl ProfileManager {
     pub fn seconds_since_session_write(&self, name: &str) -> Option<u64> {
         let dir = self.profile_dir(name);
         let now = SystemTime::now();
-        SESSION_ACTIVITY_MARKERS
+        let tool = self
+            .get_profile(name)
+            .map(|profile| profile.tool)
+            .unwrap_or(Tool::Claude);
+        let markers = match tool {
+            Tool::Claude => SESSION_ACTIVITY_MARKERS,
+            Tool::Codex => CODEX_ACTIVITY_MARKERS,
+            Tool::Unknown => return None,
+        };
+        markers
             .iter()
-            .filter_map(|marker| newest_write(&dir.join(marker)))
+            .filter_map(|marker| {
+                if tool == Tool::Codex {
+                    newest_write_tree(&dir.join(marker))
+                } else {
+                    newest_write(&dir.join(marker))
+                }
+            })
             // A timestamp ahead of the clock means skew, not staleness. Round it
             // to "just now" so skew can never make a live profile look idle.
             .map(|t| now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0))
@@ -313,30 +685,38 @@ impl ProfileManager {
             .any(|entry| dir.join(entry).exists())
     }
 
-    /// Launch `claude` with `CLAUDE_CONFIG_DIR` pointed at the named profile.
-    pub fn launch_claude(&self, name: &str, args: &[OsString]) -> Result<()> {
+    /// Launch the selected tool with its own home pointed at the named profile.
+    pub fn launch_profile(&self, name: &str, args: &[OsString]) -> Result<()> {
         let preparation = self.prepare_launch(name)?;
-        let mut command = std::process::Command::new("claude");
-        command
-            .args(args)
-            .env("CLAUDE_CONFIG_DIR", &preparation.profile_dir);
+        let spec = preparation.spec;
+        let mut command = std::process::Command::new(spec.program);
+        command.args(args).env(spec.env_key, &spec.env_value);
 
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             let error = command.exec();
-            Err(error).context("Failed to launch claude. Is it installed and in your PATH?")
+            Err(error).with_context(|| {
+                format!(
+                    "Failed to launch {}. Is it installed and in your PATH?",
+                    spec.program
+                )
+            })
         }
         #[cfg(not(unix))]
         {
-            let status = command
-                .status()
-                .context("Failed to launch claude. Is it installed and in your PATH?")?;
+            let status = command.status().with_context(|| {
+                format!(
+                    "Failed to launch {}. Is it installed and in your PATH?",
+                    spec.program
+                )
+            })?;
             std::process::exit(status.code().unwrap_or(1));
         }
     }
 
     fn prepare_launch(&self, name: &str) -> Result<LaunchPreparation> {
+        let profile = self.get_profile(name)?;
         let profile_dir = self.profile_dir(name);
         if !profile_dir.exists() {
             bail!(
@@ -345,36 +725,39 @@ impl ProfileManager {
                 name
             );
         }
+        let spec = launch_spec(profile.tool, profile_dir)?;
         let mut warnings = Vec::new();
-        match self.sync_skills(
-            name,
-            &SyncOptions {
-                dry_run: false,
-                adopt: Vec::new(),
-            },
-        ) {
-            Ok(report) => {
-                let changed: Vec<&str> = report
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        matches!(
-                            entry.action,
-                            SyncAction::Linked
-                                | SyncAction::Migrated { .. }
-                                | SyncAction::RemovedDangling
-                        )
-                    })
-                    .map(|entry| entry.name.as_str())
-                    .collect();
-                if let Some(summary) = launch_sync_summary(&changed) {
-                    eprintln!("{summary}");
+        if profile.tool == Tool::Claude {
+            match self.sync_skills(
+                name,
+                &SyncOptions {
+                    dry_run: false,
+                    adopt: Vec::new(),
+                },
+            ) {
+                Ok(report) => {
+                    let changed: Vec<&str> = report
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.action,
+                                SyncAction::Linked
+                                    | SyncAction::Migrated { .. }
+                                    | SyncAction::RemovedDangling
+                            )
+                        })
+                        .map(|entry| entry.name.as_str())
+                        .collect();
+                    if let Some(summary) = launch_sync_summary(&changed) {
+                        eprintln!("{summary}");
+                    }
+                    if report.has_failures() {
+                        warnings.push("some skills could not be synced".to_string());
+                    }
                 }
-                if report.has_failures() {
-                    warnings.push("some skills could not be synced".to_string());
-                }
+                Err(e) => warnings.push(format!("could not sync skills: {e}")),
             }
-            Err(e) => warnings.push(format!("could not sync skills: {e}")),
         }
         let bookkeeping = (|| -> Result<()> {
             let mut registry = self.load_registry()?;
@@ -390,7 +773,7 @@ impl ProfileManager {
         if !warnings.is_empty() {
             eprintln!("cswitch: warning: {}", warnings.join("; "));
         }
-        Ok(LaunchPreparation { profile_dir })
+        Ok(LaunchPreparation { spec })
     }
 
     /// Create a profile for a *different* account, pre-seeded with the current
@@ -415,6 +798,7 @@ impl ProfileManager {
         email_hint: Option<&str>,
         method: LoginMethod,
     ) -> Result<LoginOutcome> {
+        self.ensure_target_tool(name, Tool::Claude)?;
         let profile_dir = self.profiles_dir.join(name);
         // Never authenticate into a directory we did not just create: a
         // half-written login must not be able to clobber a working profile.
@@ -508,12 +892,13 @@ impl ProfileManager {
         // settings, separate MCP trust), so this warns rather than fails.
         let email = email.expect("login verdict checked");
         let same_account_as = match email.as_deref() {
-            Some(e) => self.profiles_with_email(e)?,
+            Some(e) => self.profiles_with_email(e, Tool::Claude)?,
             None => Vec::new(),
         };
 
         let profile = Profile {
             name: name.to_string(),
+            tool: Tool::Claude,
             email: email.clone(),
             added: Utc::now(),
             last_used: Some(Utc::now()),
@@ -523,22 +908,107 @@ impl ProfileManager {
         Ok(LoginOutcome {
             email,
             same_account_as,
+            tool: Tool::Claude,
         })
+    }
+
+    fn ensure_target_tool(&self, name: &str, tool: Tool) -> Result<()> {
+        if let Some(existing) = self.load_registry()?.profiles.get(name) {
+            if existing.tool == Tool::Unknown {
+                bail!("Profile '{name}' has an unknown tool; cannot use or log in.");
+            }
+            if existing.tool != tool {
+                bail!(
+                    "Profile '{name}' already belongs to {}.",
+                    existing.tool.label()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn codex_identity(&self, name: &str) -> Option<codex::Identity> {
+        if self.get_profile(name).ok()?.tool != Tool::Codex {
+            return None;
+        }
+        let bytes = fs::read(self.profile_dir(name).join("auth.json")).ok()?;
+        codex::identity_from_auth(&bytes)
+    }
+
+    pub fn login_codex_profile(&self, name: &str) -> Result<LoginOutcome> {
+        if !safe_shell_name(name) {
+            bail!("Invalid profile name.");
+        }
+        self.ensure_target_tool(name, Tool::Codex)?;
+        let profile_dir = self.profile_dir(name);
+        let we_created_dir = !profile_dir.exists();
+        if !we_created_dir && profile_dir.read_dir()?.next().is_some() {
+            bail!(
+                "Profile '{name}' already exists and holds an account. Delete it first or pick a different name."
+            );
+        }
+        fs::create_dir_all(&profile_dir)?;
+        let result = (|| -> Result<LoginOutcome> {
+            self.seed_codex_profile_dir(&profile_dir)?;
+            println!("Opening your browser — sign in to ChatGPT for profile '{name}'.");
+            let logged_in = std::process::Command::new("codex")
+                .arg("login")
+                .env("CODEX_HOME", &profile_dir)
+                .status()
+                .context("Failed to launch codex. Is it installed and in your PATH?")?
+                .success();
+            if !logged_in {
+                bail!("Codex login did not complete for profile '{name}'. Nothing was registered.");
+            }
+            let status = std::process::Command::new("codex")
+                .args(["login", "status"])
+                .env("CODEX_HOME", &profile_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .context("Could not check Codex login status")?
+                .success();
+            let auth = fs::read(profile_dir.join("auth.json")).ok();
+            let identity = codex_login_verdict(logged_in, status, auth.as_deref())
+                .context("Codex did not leave a readable ChatGPT login. Nothing was registered.")?;
+            let same_account_as = self.profiles_with_email(&identity.email, Tool::Codex)?;
+            self.upsert_profile(Profile {
+                name: name.to_string(),
+                tool: Tool::Codex,
+                email: Some(identity.email.clone()),
+                added: Utc::now(),
+                last_used: Some(Utc::now()),
+            })?;
+            Ok(LoginOutcome {
+                email: Some(identity.email),
+                same_account_as,
+                tool: Tool::Codex,
+            })
+        })();
+        if result.is_err() {
+            abort_login(&profile_dir, we_created_dir);
+        }
+        result
+    }
+
+    fn seed_codex_profile_dir(&self, profile_dir: &Path) -> Result<bool> {
+        seed_codex_from(&self.codex_home, profile_dir)
     }
 
     /// Names of already-registered profiles authenticated as `email`.
     /// Case-insensitive: Claude echoes the address as the user typed it.
-    pub fn profiles_with_email(&self, email: &str) -> Result<Vec<String>> {
+    pub fn profiles_with_email(&self, email: &str, tool: Tool) -> Result<Vec<String>> {
         let target = email.trim().to_lowercase();
         let mut names: Vec<String> = self
             .load_registry()?
             .profiles
             .into_values()
             .filter(|p| {
-                p.email
-                    .as_deref()
-                    .map(|e| e.trim().to_lowercase() == target)
-                    .unwrap_or(false)
+                p.tool == tool
+                    && p.email
+                        .as_deref()
+                        .map(|e| e.trim().to_lowercase() == target)
+                        .unwrap_or(false)
             })
             .map(|p| p.name)
             .collect();
@@ -568,17 +1038,20 @@ impl ProfileManager {
             String::new(),
         ];
         for p in profiles {
+            let Some(prefix) = p.tool.alias_prefix() else {
+                continue;
+            };
             let comment = p
                 .email
                 .as_deref()
                 .map(|e| format!("  # {}", e.replace(['\r', '\n'], " ")))
                 .unwrap_or_default();
-            lines.push(format!(
+            lines.push(limit_alias_line(format!(
                 "alias {}={}{}",
-                shell_word(&format!("claude-{}", p.name)),
+                shell_word(&format!("{prefix}-{}", p.name)),
                 shell_quote(&format!("cswitch use {}", shell_word(&p.name))),
                 comment
-            ));
+            )));
         }
         Ok(lines.join("\n"))
     }
@@ -591,17 +1064,20 @@ impl ProfileManager {
             String::new(),
         ];
         for p in profiles {
+            let Some(prefix) = p.tool.alias_prefix() else {
+                continue;
+            };
             let comment = p
                 .email
                 .as_deref()
                 .map(|e| format!("  # {}", e.replace(['\r', '\n'], " ")))
                 .unwrap_or_default();
-            lines.push(format!(
+            lines.push(limit_alias_line(format!(
                 "function {} {{ cswitch use {} @args }}{}",
-                powershell_word(&format!("claude-{}", p.name)),
+                powershell_word(&format!("{prefix}-{}", p.name)),
                 powershell_word(&p.name),
                 comment
-            ));
+            )));
         }
         Ok(lines.join("\n"))
     }
@@ -654,6 +1130,7 @@ impl ProfileManager {
         include_history: bool,
         force: bool,
     ) -> Result<Profile> {
+        self.ensure_target_tool(name, Tool::Claude)?;
         let src = std::path::absolute(src)?;
         if !src.exists() {
             bail!("Source directory '{}' does not exist.", src.display());
@@ -678,6 +1155,7 @@ impl ProfileManager {
         let email = read_email_from_dir(&dest);
         let profile = Profile {
             name: name.to_string(),
+            tool: Tool::Claude,
             email,
             added: Utc::now(),
             last_used: None,
@@ -721,6 +1199,62 @@ fn safe_shell_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn limit_alias_line(line: String) -> String {
+    if line.chars().count() <= 120 {
+        return line;
+    }
+    if let Some((command, comment)) = line.rsplit_once("  # ") {
+        let command_len = command.chars().count();
+        if command_len <= 120 {
+            let available = 120 - command_len;
+            if available < 5 {
+                return command.to_string();
+            }
+            return format!(
+                "{command}  # {}",
+                comment.chars().take(available - 4).collect::<String>()
+            );
+        }
+    }
+    "# alias omitted: profile name exceeds 120 columns".to_string()
+}
+
+fn codex_login_verdict(
+    login_ok: bool,
+    status_ok: bool,
+    auth: Option<&[u8]>,
+) -> Option<codex::Identity> {
+    if !login_ok || !status_ok {
+        return None;
+    }
+    codex::identity_from_auth(auth?)
+}
+
+const CODEX_SEED_ALLOWLIST: &[&str] = &["config.toml", "AGENTS.md", "agents", "rules", "skills"];
+
+fn seed_codex_from(source: &Path, destination: &Path) -> Result<bool> {
+    if !source.is_dir() {
+        return Ok(false);
+    }
+    for name in CODEX_SEED_ALLOWLIST {
+        let from = source.join(name);
+        let metadata = match fs::symlink_metadata(&from) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let to = destination.join(name);
+        if metadata.file_type().is_symlink() {
+            copy_symlink(&from, &to)?;
+        } else if metadata.is_dir() {
+            copy_dir_all_filtered(&from, &to, &[])?;
+        } else if metadata.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(true)
 }
 
 fn launch_sync_summary(changed: &[&str]) -> Option<String> {
@@ -855,6 +1389,7 @@ fn seed_skip(include_history: bool) -> Vec<&'static str> {
 /// would read as "active" the moment it was created. These are only ever
 /// written by a real session in that directory.
 const SESSION_ACTIVITY_MARKERS: &[&str] = &["sessions", "session-env", "shell-snapshots"];
+const CODEX_ACTIVITY_MARKERS: &[&str] = &["sessions", "log", "shell_snapshots"];
 
 /// How long after its last write a profile is still treated as possibly in use.
 ///
@@ -879,6 +1414,28 @@ fn newest_write(path: &Path) -> Option<SystemTime> {
             if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
                 newest = Some(newest.map_or(t, |n| n.max(t)));
             }
+        }
+    }
+    newest
+}
+
+fn newest_write_tree(path: &Path) -> Option<SystemTime> {
+    let mut newest = None;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if let Ok(time) = metadata.modified() {
+            newest = Some(newest.map_or(time, |previous: SystemTime| previous.max(time)));
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(next)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
         }
     }
     newest
@@ -1325,6 +1882,7 @@ mod tests {
             "work".into(),
             Profile {
                 name: "work".into(),
+                tool: Tool::Claude,
                 email: Some("work@acme.com".into()),
                 added: Utc::now(),
                 last_used: None,
@@ -1638,10 +2196,14 @@ mod tests {
         }
 
         assert_eq!(
-            mgr.profiles_with_email("same@x.com").unwrap(),
+            mgr.profiles_with_email("same@x.com", Tool::Claude).unwrap(),
             vec!["solo", "work"]
         );
-        assert_eq!(mgr.profiles_with_email("other@x.com").unwrap(), vec!["alt"]);
+        assert_eq!(
+            mgr.profiles_with_email("other@x.com", Tool::Claude)
+                .unwrap(),
+            vec!["alt"]
+        );
     }
 
     #[test]
@@ -1652,7 +2214,8 @@ mod tests {
         mgr.add_profile_from("work", &src).unwrap();
 
         assert_eq!(
-            mgr.profiles_with_email("  me@example.com ").unwrap(),
+            mgr.profiles_with_email("  me@example.com ", Tool::Claude)
+                .unwrap(),
             vec!["work"]
         );
     }
@@ -1664,7 +2227,11 @@ mod tests {
         let src = make_claude_dir(&tmp.path().join("work"), "me@x.com");
         mgr.add_profile_from("work", &src).unwrap();
 
-        assert!(mgr.profiles_with_email("nobody@x.com").unwrap().is_empty());
+        assert!(
+            mgr.profiles_with_email("nobody@x.com", Tool::Claude)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1676,7 +2243,11 @@ mod tests {
         let src = make_claude_dir_creds_only(&tmp.path().join("a"), "unreadable");
         mgr.add_profile_from("a", &src).unwrap();
 
-        assert!(mgr.profiles_with_email("").unwrap().is_empty());
+        assert!(
+            mgr.profiles_with_email("", Tool::Claude)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── abort_login ───────────────────────────────────────────────────────
@@ -2285,7 +2856,7 @@ mod tests {
         fs::write(mgr.claude_home.join("skills"), "not a directory").unwrap();
 
         let prepared = mgr.prepare_launch("work").unwrap();
-        assert_eq!(prepared.profile_dir, mgr.profile_dir("work"));
+        assert_eq!(prepared.spec.env_value, mgr.profile_dir("work"));
         assert!(mgr.get_profile("work").unwrap().last_used.is_some());
     }
 

@@ -1,4 +1,5 @@
 mod atomic;
+mod codex;
 mod gateway;
 mod key;
 mod limits;
@@ -9,9 +10,9 @@ mod usage;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use limits::{Limits, Window, format_info, parse_limits, read_claude_json};
-use profile::{LoginMethod, LoginOutcome, ProfileManager, detect_current_account};
+use profile::{LoginMethod, LoginOutcome, ProfileManager, Tool, detect_current_account};
 use skills_sync::{SyncAction, SyncOptions, SyncReport};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -20,10 +21,8 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(
     name = "cswitch",
-    about = "Multi-account profile manager for Claude Code",
-    long_about = "Manage multiple Claude Code accounts using isolated config directories.\n\
-                  Each profile keeps its own credentials and settings, links shared skills,\n\
-                  and launches Claude with CLAUDE_CONFIG_DIR set.",
+    about = "Multi-account profile manager for Claude Code and Codex",
+    long_about = "Manage Claude Code and Codex accounts using isolated profile directories.",
     version,
     after_help = "\
 Quick start:
@@ -77,6 +76,9 @@ enum Commands {
         /// Off by default: separate sessions per profile are usually the point.
         #[arg(long)]
         include_history: bool,
+        /// Tool to log in to; Codex always starts a new login and cannot copy an account
+        #[arg(long, value_enum, default_value_t = ToolChoice::Claude)]
+        tool: ToolChoice,
     },
 
     /// Log in to a new Claude account and save it as a profile (skips detection prompt)
@@ -94,6 +96,9 @@ enum Commands {
         /// Authenticate using Anthropic Console API billing
         #[arg(long)]
         console: bool,
+        /// Tool to log in to
+        #[arg(long, value_enum, default_value_t = ToolChoice::Claude)]
+        tool: ToolChoice,
     },
 
     /// Manage a profile's local Anthropic API key
@@ -117,7 +122,7 @@ enum Commands {
         purge_usage: bool,
     },
 
-    /// Launch Claude Code with a specific profile
+    /// Launch the selected profile's tool
     #[command(disable_help_flag = true, disable_version_flag = true)]
     Use {
         /// Profile name to use
@@ -175,6 +180,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<UsageAction>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ToolChoice {
+    Claude,
+    Codex,
 }
 
 #[derive(Subcommand)]
@@ -285,8 +296,16 @@ fn main() -> Result<()> {
             name,
             force,
             include_history,
+            tool,
         }) => {
-            handle_add(&manager, &name, force, include_history)?;
+            if tool == ToolChoice::Codex {
+                if force || include_history {
+                    anyhow::bail!("Codex login does not support --force or --include-history.");
+                }
+                report_login(&name, &manager.login_codex_profile(&name)?);
+            } else {
+                handle_add(&manager, &name, force, include_history)?;
+            }
         }
 
         Some(Commands::Login {
@@ -294,7 +313,17 @@ fn main() -> Result<()> {
             include_history,
             email,
             console,
+            tool,
         }) => {
+            if tool == ToolChoice::Codex {
+                if console || email.is_some() || include_history {
+                    anyhow::bail!(
+                        "Codex login does not support --console, --email or --include-history."
+                    );
+                }
+                report_login(&name, &manager.login_codex_profile(&name)?);
+                return Ok(());
+            }
             let method = if console {
                 LoginMethod::Console
             } else {
@@ -387,7 +416,7 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Use { name, args }) => {
-            manager.launch_claude(&name, &args)?;
+            manager.launch_profile(&name, &args)?;
         }
 
         Some(Commands::Sync {
@@ -397,15 +426,7 @@ fn main() -> Result<()> {
             adopt,
         }) => {
             let opts = SyncOptions { dry_run, adopt };
-            let names = if all {
-                manager
-                    .list_profiles()?
-                    .into_iter()
-                    .map(|profile| profile.name)
-                    .collect::<Vec<_>>()
-            } else {
-                vec![name.expect("clap requires a name or --all")]
-            };
+            let names = sync_target_names(&manager, all, name)?;
             let home = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
             let (output, failed) = sync_profile_blocks(&manager, &names, &opts, &home, all)?;
@@ -419,11 +440,31 @@ fn main() -> Result<()> {
             Ok(p) => {
                 let dir = manager.profile_dir(&p.name);
                 println!("Name:      {}", p.name);
+                println!("Tool:      {}", p.tool.label());
                 println!("Email:     {}", p.email.as_deref().unwrap_or("unknown"));
-                let claude = read_claude_json(&dir);
-                let auth = key::read_auth_mode(&manager, &p.name, claude.clone());
-                println!("Auth:      {}", auth.label());
-                println!("Gateway:   {}", key::gateway_info(&manager, &p.name));
+                if p.tool == Tool::Claude {
+                    let claude = read_claude_json(&dir);
+                    let auth = key::read_auth_mode(&manager, &p.name, claude.clone());
+                    println!("Auth:      {}", auth.label());
+                    println!("Gateway:   {}", key::gateway_info(&manager, &p.name));
+                    let limits = claude
+                        .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+                        .unwrap_or(Limits::Unreadable);
+                    print!("{}", format_info(&limits, Utc::now()));
+                } else {
+                    println!("Auth:      —");
+                    println!("Gateway:   —");
+                    if p.tool == Tool::Codex {
+                        println!(
+                            "Plan:      {}",
+                            manager
+                                .codex_identity(&p.name)
+                                .and_then(|identity| identity.plan_type)
+                                .unwrap_or_else(|| "—".into())
+                        );
+                    }
+                    println!("Plan limits: —");
+                }
                 println!("Added:     {}", p.added.format("%Y-%m-%d %H:%M UTC"));
                 println!(
                     "Last used: {}",
@@ -432,10 +473,6 @@ fn main() -> Result<()> {
                         .unwrap_or("never".to_string())
                 );
                 println!("Directory: {}", dir.display());
-                let limits = claude
-                    .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
-                    .unwrap_or(Limits::Unreadable);
-                print!("{}", format_info(&limits, Utc::now()));
                 println!();
                 println!("Launch:");
                 println!("  cswitch use {}", p.name);
@@ -499,8 +536,8 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
         return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".to_string());
     }
     let header = format!(
-        "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
-        "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+        "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}",
+        "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
     );
     let mut output = format!("{}\n{}\n", header, "─".repeat(header.chars().count()));
     let mut saw_reset = false;
@@ -514,8 +551,20 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             .as_deref()
             .unwrap_or("—")
             .chars()
-            .take(32)
+            .take(30)
             .collect();
+        let tool = profile.tool.label();
+        let last_used = profile
+            .last_used
+            .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".to_string());
+        if profile.tool != Tool::Claude {
+            output.push_str(&format!(
+                "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
+                name, tool, email, "—", "—", "—", last_used
+            ));
+            continue;
+        }
         let dir = manager.profile_dir(&profile.name);
         let claude = read_claude_json(&dir);
         let auth = key::read_auth_mode(manager, &profile.name, claude.clone());
@@ -525,8 +574,9 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
         if auth.api_billed() {
             saw_api = true;
             output.push_str(&format!(
-                "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+                "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
                 name,
+                tool,
                 email,
                 "—",
                 "—",
@@ -550,13 +600,9 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             Limits::AccountMismatch => ("—".to_string(), "—".to_string(), "mismatch".to_string()),
             Limits::Unreadable => ("—".to_string(), "—".to_string(), "unreadable".to_string()),
         };
-        let last_used = profile
-            .last_used
-            .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "never".to_string());
         output.push_str(&format!(
-            "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
-            name, email, session, weekly, age, last_used
+            "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
+            name, tool, email, session, weekly, age, last_used
         ));
     }
     if saw_api {
@@ -620,6 +666,23 @@ fn sync_profile_blocks(
         }
     }
     Ok((output, failed))
+}
+
+fn sync_target_names(
+    manager: &ProfileManager,
+    all: bool,
+    name: Option<String>,
+) -> Result<Vec<String>> {
+    if all {
+        Ok(manager
+            .list_profiles()?
+            .into_iter()
+            .filter(|profile| profile.tool == Tool::Claude)
+            .map(|profile| profile.name)
+            .collect())
+    } else {
+        Ok(vec![name.expect("clap requires a name or --all")])
+    }
 }
 
 fn sync_header(name: &str, dry_run: bool) -> String {
@@ -811,13 +874,16 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
 
     if !others.is_empty() {
         println!(
-            "\n  Note: this is the same Claude account as: {}",
+            "\n  Note: this is the same {} account as: {}",
+            outcome.tool.label(),
             others.join(", ")
         );
-        println!("  If you meant to add a different account, sign out of claude.ai");
-        println!(
-            "  (or use a private window) and run: cswitch remove {name} && cswitch login {name}"
-        );
+        if outcome.tool == Tool::Claude {
+            println!("  If you meant to add a different account, sign out of claude.ai");
+            println!(
+                "  (or use a private window) and run: cswitch remove {name} && cswitch login {name}"
+            );
+        }
     }
 
     println!("\nLaunch with: cswitch use {}", name);
@@ -1095,6 +1161,7 @@ mod tests {
                 name.to_string(),
                 Profile {
                     name: name.to_string(),
+                    tool: Tool::Claude,
                     email: Some(email.to_string()),
                     added: now,
                     last_used,
@@ -1126,19 +1193,21 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
 
         let header = format!(
-            "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
-            "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+            "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}",
+            "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
         );
         let expected = format!(
-            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+            "{header}\n{}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
             "─".repeat(header.chars().count()),
             "active",
+            "claude",
             "thirtyx.characters@example.com",
             "12%",
             "88% █████████░",
             "1 h ago",
             "2030-01-07 06:31",
             "fresh",
+            "claude",
             "b@example.com",
             "—",
             "—",
@@ -1156,15 +1225,17 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
         let changed = list_output(&manager, now).unwrap();
         let expected_changed = format!(
-            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
+            "{header}\n{}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
             "─".repeat(header.chars().count()),
             "active",
+            "claude",
             "thirtyx.characters@example.com",
             "reset",
             "88% █████████░ !",
             "1 h ago",
             "2030-01-07 06:31",
             "fresh",
+            "claude",
             "b@example.com",
             "—",
             "—",
@@ -1184,7 +1255,7 @@ mod tests {
             .unwrap()
             .split_whitespace()
             .collect();
-        assert_eq!(fields[2..5], ["—", "—", "mismatch"]);
+        assert_eq!(fields[3..6], ["—", "—", "mismatch"]);
         assert!(!mismatch.contains("88%"));
     }
 
@@ -1362,5 +1433,68 @@ mod tests {
                 .is_symlink()
         );
         assert!(sync_profile_blocks(&manager, &["bad".into()], &opts, home, false).is_err());
+    }
+
+    #[test]
+    fn codex_cli_flags_and_mixed_list_are_tool_scoped() {
+        // Known-bad: Codex add prompts for Claude Copy, or its list row reads Claude limits.
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "add", "o", "--tool", "codex"])
+                .unwrap()
+                .command,
+            Some(Commands::Add {
+                tool: ToolChoice::Codex,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "login", "o", "--tool", "codex"])
+                .unwrap()
+                .command,
+            Some(Commands::Login {
+                tool: ToolChoice::Codex,
+                ..
+            })
+        ));
+        let tmp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let mut registry = Registry::default();
+        for (name, tool) in [
+            ("c", Tool::Claude),
+            ("o", Tool::Codex),
+            ("u", Tool::Unknown),
+        ] {
+            registry.profiles.insert(
+                name.into(),
+                Profile {
+                    name: name.into(),
+                    tool,
+                    email: Some(format!("{}@example.com", "x".repeat(30))),
+                    added: Utc::now(),
+                    last_used: None,
+                },
+            );
+            fs::create_dir_all(manager.profile_dir(name)).unwrap();
+            if tool != Tool::Claude {
+                fs::write(manager.profile_dir(name).join(".claude.json"), b"not JSON").unwrap();
+            }
+        }
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let output = list_output(&manager, Utc::now()).unwrap();
+        assert!(output.contains("o                    codex"), "{output}");
+        assert!(
+            output.contains("u                    unknown tool"),
+            "{output}"
+        );
+        assert!(output.lines().all(|line| line.chars().count() <= 120));
+        let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
+        assert!(codex_row.contains("—       —"), "{codex_row}");
+        assert_eq!(sync_target_names(&manager, true, None).unwrap(), ["c"]);
     }
 }
