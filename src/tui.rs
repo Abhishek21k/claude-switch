@@ -2177,13 +2177,54 @@ mod tests {
         // Known-bad: a pasted JSON token reaches a TUI frame or survives cancellation.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        let json = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_AUTH_TOKEN":"TOKEN-CANARY"}}"#;
+        let executable = tmp.path().join("cswitch");
+        fs::write(&executable, "synthetic executable").unwrap();
+        let parsed = key::parse_gateway_input(json).unwrap();
+        let set = key::set_key_with_gateway(
+            &app.manager,
+            "api",
+            "TESTKEY",
+            &executable,
+            false,
+            &parsed,
+            true,
+            Utc::now(),
+        )
+        .unwrap();
+        let info = format!(
+            "{} {}",
+            key::read_auth_mode(&app.manager, "api", Ok(None)).label(),
+            key::gateway_info(&app.manager, "api")
+        );
+        let list = crate::list_output(&app.manager, Utc::now()).unwrap();
+        let defaults = gateway::list(&app.manager.base_dir).unwrap();
+        for output in [set.gateway_lines.join("\n"), info, list, defaults] {
+            assert!(!output.contains("TOKEN-CANARY") && !output.contains("TESTKEY"));
+        }
+        fn collect(root: &std::path::Path, output: &mut Vec<u8>, skip_key: bool) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if skip_key && path.file_name().is_some_and(|name| name == "api.key") {
+                    continue;
+                }
+                if fs::symlink_metadata(&path).unwrap().file_type().is_dir() {
+                    collect(&path, output, skip_key);
+                } else {
+                    output.extend(fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = Vec::new();
+        collect(&app.manager.base_dir, &mut files, true);
+        assert!(!files.windows(7).any(|window| window == b"TESTKEY"));
+        assert!(!files.windows(12).any(|window| window == b"TOKEN-CANARY"));
         app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
             .unwrap();
         app.key_buffer = "TESTKEY".into();
         app.handle_key_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.mode, Mode::GatewayEntry);
-        let json = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_AUTH_TOKEN":"TOKEN-CANARY"}}"#;
         app.gateway_buffer = json.into();
         assert!(!render_text(&mut app).contains("TOKEN-CANARY"));
         app.handle_gateway_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -2200,6 +2241,12 @@ mod tests {
                 && app.gateway_buffer.is_empty()
                 && app.pending_gateway.is_none()
         );
+        key::clear_key(&app.manager, "api", Utc::now()).unwrap();
+        assert!(!key::key_path(&app.manager.base_dir, "api").exists());
+        files.clear();
+        collect(&app.manager.base_dir, &mut files, false);
+        assert!(!files.windows(7).any(|window| window == b"TESTKEY"));
+        assert!(!files.windows(12).any(|window| window == b"TOKEN-CANARY"));
     }
 
     #[test]
