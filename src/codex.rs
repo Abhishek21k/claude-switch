@@ -190,6 +190,16 @@ mod tests {
     }
 
     #[test]
+    fn identity_requires_exactly_three_jwt_segments() {
+        // Known-bad: extra segments after the signature are ignored.
+        let payload = encode(br#"{"email":"user@example.com"}"#);
+        for token in [format!("h.{payload}"), format!("h.{payload}.s.extra")] {
+            let auth = format!(r#"{{"tokens":{{"id_token":"{token}"}}}}"#);
+            assert_eq!(identity_from_auth(auth.as_bytes()), None, "{token}");
+        }
+    }
+
+    #[test]
     fn identity_rejects_empty_jwt_segments() {
         // Known-bad: a token with an empty header or signature is treated as a valid JWT.
         let payload = encode(br#"{"email":"user@example.com"}"#);
