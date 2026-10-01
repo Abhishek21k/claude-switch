@@ -13,7 +13,7 @@ use crate::gateway::{self, GatewayInput};
 use crate::key::{self, AuthMode, InputStep};
 use crate::limits::{Limits, Window, parse_limits, read_claude_json};
 use crate::profile::{
-    LoginMethod, Profile, ProfileManager, Tool, describe_age, detect_current_account,
+    LoginMethod, LoginOutcome, Profile, ProfileManager, Tool, describe_age, detect_current_account,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -410,32 +410,7 @@ impl App {
         };
         let (select, message) = match result {
             Ok(result) => {
-                let others: Vec<&str> = result
-                    .same_account_as
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|n| *n != name)
-                    .collect();
-
-                let msg = if method == Some(LoginMethod::Console) && result.email.is_none() {
-                    format!("Console login completed for profile '{name}' (email unavailable).")
-                } else if others.is_empty() {
-                    format!(
-                        "Profile '{}' logged in as {}.",
-                        name,
-                        result.display_email()
-                    )
-                } else {
-                    // Not an error: two profiles for one account is a
-                    // valid setup. But say it, or it reads as a new one.
-                    format!(
-                        "Profile '{}' is {} — the same {} account as {}.",
-                        name,
-                        result.display_email(),
-                        result.tool.label(),
-                        others.join(", ")
-                    )
-                };
+                let msg = pending_login_message(&name, &result, method);
                 (Some(name), Mode::Message(msg, false))
             }
             Err(e) => (None, Mode::Message(e.to_string(), true)),
@@ -2175,6 +2150,38 @@ impl App {
     }
 }
 
+fn pending_login_message(name: &str, result: &LoginOutcome, method: Option<LoginMethod>) -> String {
+    if result.email.is_none() {
+        if result.tool == Tool::Codex {
+            return format!("Codex login completed for profile '{name}' (email unavailable).");
+        }
+        if method == Some(LoginMethod::Console) {
+            return format!("Console login completed for profile '{name}' (email unavailable).");
+        }
+    }
+    let others: Vec<&str> = result
+        .same_account_as
+        .iter()
+        .map(String::as_str)
+        .filter(|other| *other != name)
+        .collect();
+    if others.is_empty() {
+        format!(
+            "Profile '{}' logged in as {}.",
+            name,
+            result.display_email()
+        )
+    } else {
+        format!(
+            "Profile '{}' is {} — the same {} account as {}.",
+            name,
+            result.display_email(),
+            result.tool.label(),
+            others.join(", ")
+        )
+    }
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn limit_line(window: &Window, now: DateTime<Utc>) -> Line<'static> {
@@ -3037,6 +3044,20 @@ mod tests {
             app.pending,
             Some(PendingAction::CodexLogin { ref name }) if name == "work"
         ));
+    }
+
+    #[test]
+    fn codex_login_without_identity_has_explicit_tui_confirmation() {
+        // Known-bad: an unreadable Codex identity is refused before the TUI can confirm it.
+        let outcome = LoginOutcome {
+            email: None,
+            same_account_as: Vec::new(),
+            tool: Tool::Codex,
+        };
+        assert_eq!(
+            pending_login_message("work", &outcome, None),
+            "Codex login completed for profile 'work' (email unavailable)."
+        );
     }
 
     #[test]

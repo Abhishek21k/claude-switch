@@ -859,11 +859,7 @@ fn handle_add(
 /// say so plainly — the usual cause is a browser that was still signed in, and
 /// silently listing the email would look like a different account was added.
 fn report_login(name: &str, outcome: &LoginOutcome) {
-    println!(
-        "\nProfile '{}' registered (account: {}).",
-        name,
-        outcome.display_email()
-    );
+    println!("\n{}", login_confirmation(name, outcome));
 
     let others: Vec<&str> = outcome
         .same_account_as
@@ -887,6 +883,18 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
     }
 
     println!("\nLaunch with: cswitch use {}", name);
+}
+
+fn login_confirmation(name: &str, outcome: &LoginOutcome) -> String {
+    if outcome.tool == Tool::Codex && outcome.email.is_none() {
+        format!("Codex login completed for profile '{name}' (email unavailable).")
+    } else {
+        format!(
+            "Profile '{}' registered (account: {}).",
+            name,
+            outcome.display_email()
+        )
+    }
 }
 
 fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
@@ -921,6 +929,20 @@ mod tests {
     use crate::skills_sync::SyncEntry;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn codex_login_without_identity_has_explicit_cli_confirmation() {
+        // Known-bad: a successful login with unreadable claims reports an unnamed account.
+        let outcome = LoginOutcome {
+            email: None,
+            same_account_as: Vec::new(),
+            tool: Tool::Codex,
+        };
+        assert_eq!(
+            login_confirmation("work", &outcome),
+            "Codex login completed for profile 'work' (email unavailable)."
+        );
+    }
 
     #[test]
     fn console_and_key_cli_surfaces_parse_without_key_argument() {

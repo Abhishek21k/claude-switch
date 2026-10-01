@@ -225,7 +225,8 @@ mod stage_b_tests {
     fn codex_login_verdict_accepts_valid_identity() {
         // Known-bad: successful login and status still reject a valid local identity.
         assert_eq!(
-            codex_login_verdict(true, true, Some(SYNTHETIC_CODEX_AUTH))
+            codex_login_verdict(true, true, true, Some(SYNTHETIC_CODEX_AUTH))
+                .unwrap()
                 .unwrap()
                 .email,
             "o@example.com"
@@ -235,19 +236,29 @@ mod stage_b_tests {
     #[test]
     fn codex_login_command_failure_refuses_registration() {
         // Known-bad: a failed browser login is accepted because an old auth.json remains.
-        assert!(codex_login_verdict(false, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+        assert!(codex_login_verdict(false, true, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
     }
 
     #[test]
     fn codex_login_status_failure_refuses_registration() {
         // Known-bad: a failed `login status` is ignored when auth.json exists.
-        assert!(codex_login_verdict(true, false, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+        assert!(codex_login_verdict(true, false, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
     }
 
     #[test]
     fn codex_missing_auth_file_refuses_registration() {
         // Known-bad: exit code zero alone registers a profile without auth.json.
-        assert!(codex_login_verdict(true, true, None).is_none());
+        assert!(codex_login_verdict(true, true, false, None).is_none());
+    }
+
+    #[test]
+    fn codex_unreadable_identity_still_registers_without_email() {
+        // Known-bad: successful login with auth.json containing unreadable claims is discarded.
+        assert_eq!(
+            codex_login_verdict(true, true, true, Some(b"{}")),
+            Some(None)
+        );
+        assert_eq!(codex_login_verdict(true, true, true, None), Some(None));
     }
 
     #[test]
@@ -1045,19 +1056,25 @@ impl ProfileManager {
                 .status()
                 .context("Could not check Codex login status")?
                 .success();
-            let auth = fs::read(profile_dir.join("auth.json")).ok();
-            let identity = codex_login_verdict(logged_in, status, auth.as_deref())
-                .context("Codex did not leave a readable ChatGPT login. Nothing was registered.")?;
-            let same_account_as = self.profiles_with_email(&identity.email, Tool::Codex)?;
+            let auth_path = profile_dir.join("auth.json");
+            let auth = fs::read(&auth_path).ok();
+            let identity =
+                codex_login_verdict(logged_in, status, auth_path.exists(), auth.as_deref())
+                    .context("Codex did not leave auth.json. Nothing was registered.")?;
+            let email = identity.map(|identity| identity.email);
+            let same_account_as = match email.as_deref() {
+                Some(email) => self.profiles_with_email(email, Tool::Codex)?,
+                None => Vec::new(),
+            };
             self.upsert_profile(Profile {
                 name: name.to_string(),
                 tool: Tool::Codex,
-                email: Some(identity.email.clone()),
+                email: email.clone(),
                 added: Utc::now(),
                 last_used: Some(Utc::now()),
             })?;
             Ok(LoginOutcome {
-                email: Some(identity.email),
+                email,
                 same_account_as,
                 tool: Tool::Codex,
             })
@@ -1302,12 +1319,13 @@ fn limit_alias_line(line: String) -> String {
 fn codex_login_verdict(
     login_ok: bool,
     status_ok: bool,
+    auth_exists: bool,
     auth: Option<&[u8]>,
-) -> Option<codex::Identity> {
-    if !login_ok || !status_ok {
+) -> Option<Option<codex::Identity>> {
+    if !login_ok || !status_ok || !auth_exists {
         return None;
     }
-    codex::identity_from_auth(auth?)
+    Some(auth.and_then(codex::identity_from_auth))
 }
 
 const CODEX_SEED_ALLOWLIST: &[&str] = &["config.toml", "AGENTS.md", "agents", "rules", "skills"];
