@@ -280,11 +280,13 @@ cswitch aliases >> ~/.zshrc   # or ~/.bashrc
 source ~/.zshrc
 ```
 
-This gives you commands like:
+For each Claude or Codex profile, `cswitch aliases` emits one alias named after its tool:
+`claude-<name>` or `codex-<name>`. This gives you commands like:
 
 ```bash
 claude-work --resume       # syncs skills, then launches Claude with the "work" profile
 claude-personal --model opus
+codex-research              # launches Codex with the "research" profile
 ```
 
 On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to your `$PROFILE`.
