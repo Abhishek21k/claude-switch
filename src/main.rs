@@ -436,52 +436,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Info { name }) => match manager.get_profile(&name) {
-            Ok(p) => {
-                let dir = manager.profile_dir(&p.name);
-                println!("Name:      {}", p.name);
-                println!("Tool:      {}", p.tool.label());
-                println!("Email:     {}", p.email.as_deref().unwrap_or("unknown"));
-                if p.tool == Tool::Claude {
-                    let claude = read_claude_json(&dir);
-                    let auth = key::read_auth_mode(&manager, &p.name, claude.clone());
-                    println!("Auth:      {}", auth.label());
-                    println!("Gateway:   {}", key::gateway_info(&manager, &p.name));
-                    let limits = claude
-                        .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
-                        .unwrap_or(Limits::Unreadable);
-                    print!("{}", format_info(&limits, Utc::now()));
-                } else {
-                    println!("Auth:      —");
-                    println!("Gateway:   —");
-                    if p.tool == Tool::Codex {
-                        println!(
-                            "Plan:      {}",
-                            manager
-                                .codex_identity(&p.name)
-                                .and_then(|identity| identity.plan_type)
-                                .unwrap_or_else(|| "—".into())
-                        );
-                    }
-                    println!("Plan limits: —");
-                }
-                println!("Added:     {}", p.added.format("%Y-%m-%d %H:%M UTC"));
-                println!(
-                    "Last used: {}",
-                    p.last_used
-                        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
-                        .unwrap_or("never".to_string())
-                );
-                println!("Directory: {}", dir.display());
-                println!();
-                println!("Launch:");
-                println!("  cswitch use {}", p.name);
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        },
+        Some(Commands::Info { name }) => print!("{}", info_output(&manager, &name, Utc::now())?),
 
         Some(Commands::Aliases) => {
             println!("{}", manager.generate_aliases()?);
@@ -528,6 +483,51 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Result<String> {
+    let profile = manager.get_profile(name)?;
+    let dir = manager.profile_dir(&profile.name);
+    let mut output = format!(
+        "Name:      {}\nTool:      {}\nEmail:     {}\n",
+        profile.name,
+        profile.tool.label(),
+        profile.email.as_deref().unwrap_or("unknown")
+    );
+    if profile.tool == Tool::Claude {
+        let claude = read_claude_json(&dir);
+        let auth = key::read_auth_mode(manager, &profile.name, claude.clone());
+        output.push_str(&format!(
+            "Auth:      {}\nGateway:   {}\n",
+            auth.label(),
+            key::gateway_info(manager, &profile.name)
+        ));
+        let limits = claude
+            .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+            .unwrap_or(Limits::Unreadable);
+        output.push_str(&format_info(&limits, now));
+    } else {
+        output.push_str("Auth:      —\nGateway:   —\n");
+        if profile.tool == Tool::Codex {
+            let plan = manager
+                .codex_identity(&profile.name)
+                .and_then(|identity| identity.plan_type)
+                .unwrap_or_else(|| "—".into());
+            output.push_str(&format!("Plan:      {plan}\n"));
+        }
+        output.push_str("Plan limits: —\n");
+    }
+    output.push_str(&format!(
+        "Added:     {}\nLast used: {}\nDirectory: {}\n\nLaunch:\n  cswitch use {}\n",
+        profile.added.format("%Y-%m-%d %H:%M UTC"),
+        profile
+            .last_used
+            .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "never".to_string()),
+        dir.display(),
+        profile.name
+    ));
+    Ok(output)
 }
 
 fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
@@ -1528,6 +1528,39 @@ mod tests {
         let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
         assert!(codex_row.contains("—       —"), "{codex_row}");
         assert!(!codex_row.contains("unreadable"), "{codex_row}");
+    }
+
+    #[test]
+    fn info_uses_tool_specific_fields_and_keeps_claude_output() {
+        // Known-bad: every known tool takes the Claude info branch and reads .claude.json.
+        let tmp = TempDir::new().unwrap();
+        let manager = mixed_tool_manager(&tmp);
+        let auth = br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.s"}}"#;
+        fs::write(manager.profile_dir("o").join("auth.json"), auth).unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let codex = info_output(&manager, "o", now).unwrap();
+        for expected in [
+            "Tool:      codex\n",
+            "Auth:      —\n",
+            "Gateway:   —\n",
+            "Plan:      plus\n",
+            "Plan limits: —\n",
+        ] {
+            assert!(codex.contains(expected), "{codex}");
+        }
+        assert!(!codex.contains("unreadable"), "{codex}");
+
+        let profile = manager.get_profile("c").unwrap();
+        let claude = info_output(&manager, "c", now).unwrap();
+        let expected = format!(
+            "Name:      c\nTool:      claude\nEmail:     {}\nAuth:      not logged in\nGateway:   the Anthropic API\nPlan limits: the file couldn't be read.\nAdded:     {}\nLast used: never\nDirectory: {}\n\nLaunch:\n  cswitch use c\n",
+            profile.email.unwrap(),
+            profile.added.format("%Y-%m-%d %H:%M UTC"),
+            manager.profile_dir("c").display()
+        );
+        assert_eq!(claude, expected);
     }
 
     #[test]
