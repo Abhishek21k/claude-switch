@@ -3023,11 +3023,37 @@ mod tests {
             serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
-        assert!(!app.handle_normal_key(KeyCode::Enter, KeyModifiers::NONE).unwrap());
+        assert!(
+            !app.handle_normal_key(KeyCode::Enter, KeyModifiers::NONE)
+                .unwrap()
+        );
         assert_eq!(
             app.mode,
-            Mode::Message("Profile has an unknown tool; cannot use or log in.".into(), true)
+            Mode::Message(
+                "Profile has an unknown tool; cannot use or log in.".into(),
+                true
+            )
         );
+    }
+
+    #[test]
+    fn codex_api_key_hotkeys_refuse_before_entry_or_clear() {
+        // Known-bad: removing either p/P tool guard opens a Claude-only key flow.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("work", Some("work@example.com"))]);
+        app.profiles[0].tool = Tool::Codex;
+        for key in ['p', 'P'] {
+            app.mode = Mode::Normal;
+            assert!(
+                !app.handle_normal_key(KeyCode::Char(key), KeyModifiers::NONE)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.mode,
+                Mode::Message("API keys are Claude-only.".into(), true),
+                "{key}"
+            );
+        }
     }
 
     #[test]
