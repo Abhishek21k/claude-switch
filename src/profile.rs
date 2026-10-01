@@ -278,6 +278,34 @@ mod stage_b_tests {
     }
 
     #[test]
+    fn long_profile_names_keep_aliases_in_both_shells() {
+        // Known-bad: the display line limit replaces long aliases with a comment.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        let claude_name = "c".repeat(50);
+        let codex_name = "o".repeat(50);
+        register(&manager, &claude_name, Tool::Claude, "c@example.com");
+        register(&manager, &codex_name, Tool::Codex, "o@example.com");
+        let profiles = manager.list_profiles().unwrap();
+        let shell = manager.generate_shell_aliases(&profiles).unwrap();
+        let powershell = manager.generate_powershell_aliases(&profiles).unwrap();
+        for (prefix, name) in [("claude", claude_name), ("codex", codex_name)] {
+            assert!(
+                shell.contains(&format!("alias {prefix}-{name}='cswitch use {name}'")),
+                "{shell}"
+            );
+            assert!(
+                powershell.contains(&format!(
+                    "function {prefix}-{name} {{ cswitch use {name} @args }}"
+                )),
+                "{powershell}"
+            );
+        }
+        assert!(!shell.contains("alias omitted"));
+        assert!(!powershell.contains("alias omitted"));
+    }
+
+    #[test]
     fn same_email_across_tools_is_not_the_same_account() {
         // Known-bad: same-account detection compares email across Claude and Codex.
         let tmp = TempDir::new().unwrap();
@@ -1266,8 +1294,9 @@ fn limit_alias_line(line: String) -> String {
                 comment.chars().take(available - 4).collect::<String>()
             );
         }
+        return command.to_string();
     }
-    "# alias omitted: profile name exceeds 120 columns".to_string()
+    line
 }
 
 fn codex_login_verdict(
