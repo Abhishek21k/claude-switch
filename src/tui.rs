@@ -195,7 +195,7 @@ impl App {
         if let Some(name) = &selected
             && (changed || due)
         {
-            if let Some(tool) = self.selected_profile().map(|profile| profile.tool)
+            if let Some(tool) = self.selected_profile().map(|profile| profile.tool.clone())
                 && tool != Tool::Claude
             {
                 self.limits.remove(name);
@@ -529,7 +529,7 @@ impl App {
 
             KeyCode::Enter => {
                 if let Some(p) = self.selected_profile() {
-                    if p.tool == Tool::Unknown {
+                    if matches!(p.tool, Tool::Unknown(_)) {
                         self.mode = Mode::Message(
                             "Profile has an unknown tool; cannot use or log in.".into(),
                             true,
@@ -537,7 +537,7 @@ impl App {
                         return Ok(false);
                     }
                     let name = p.name.clone();
-                    let tool = p.tool;
+                    let tool = p.tool.clone();
                     ratatui::restore();
                     println!("Launching {} with profile '{}'…", tool.label(), name);
                     self.manager.launch_profile(&name, &[])?;
@@ -3015,9 +3015,9 @@ mod tests {
         // Known-bad: without the TUI guard, Enter returns a launch error and exits the TUI.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("alien", Some("alien@example.com"))]);
-        app.profiles[0].tool = Tool::Unknown;
+        app.profiles[0].tool = Tool::Unknown("martian".into());
         let mut registry = app.manager.load_registry().unwrap();
-        registry.profiles.get_mut("alien").unwrap().tool = Tool::Unknown;
+        registry.profiles.get_mut("alien").unwrap().tool = Tool::Unknown("martian".into());
         std::fs::write(
             app.manager.base_dir.join("registry.json"),
             serde_json::to_vec(&registry).unwrap(),

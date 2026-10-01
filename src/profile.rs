@@ -4,7 +4,7 @@ use crate::key::{remove_key, strip_copied_helper};
 use crate::skills_sync::{self, SyncAction, SyncOptions, SyncReport};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
@@ -67,7 +67,10 @@ mod stage_b_tests {
         let manager = manager(&tmp);
         fs::write(&manager.registry_path, r#"{"profiles":{"alien":{"name":"alien","tool":"martian","email":"alien@example.com","added":"2030-01-01T00:00:00Z","last_used":null}}}"#).unwrap();
         fs::create_dir_all(manager.profile_dir("alien")).unwrap();
-        assert_eq!(manager.get_profile("alien").unwrap().tool, Tool::Unknown);
+        assert_eq!(
+            manager.get_profile("alien").unwrap().tool,
+            Tool::Unknown("martian".into())
+        );
         assert!(
             manager
                 .prepare_launch("alien")
@@ -90,6 +93,34 @@ mod stage_b_tests {
                 .to_string()
                 .contains("unknown tool")
         );
+    }
+
+    #[test]
+    fn unknown_tool_value_survives_unrelated_save_without_aliases() {
+        // Known-bad: serde(other) rewrites an unknown tool as "unknown" on the next save.
+        for raw_tool in ["martian", "antigravity"] {
+            let tmp = TempDir::new().unwrap();
+            let manager = manager(&tmp);
+            let registry = format!(
+                r#"{{"profiles":{{"alien":{{"name":"alien","tool":"{raw_tool}","email":"alien@example.com","added":"2030-01-01T00:00:00Z","last_used":null}}}}}}"#
+            );
+            fs::write(&manager.registry_path, registry).unwrap();
+            register(&manager, "other", Tool::Claude, "other@example.com");
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manager.registry_path).unwrap()).unwrap();
+            assert_eq!(saved["profiles"]["alien"]["tool"], raw_tool);
+            let profiles = manager.list_profiles().unwrap();
+            assert_eq!(
+                manager.get_profile("alien").unwrap().tool.label(),
+                "unknown tool"
+            );
+            let shell = manager.generate_shell_aliases(&profiles).unwrap();
+            let powershell = manager.generate_powershell_aliases(&profiles).unwrap();
+            assert!(!shell.contains("alien"), "{shell}");
+            assert!(!powershell.contains("alien"), "{powershell}");
+            assert!(shell.contains("claude-other"));
+            assert!(powershell.contains("claude-other"));
+        }
     }
 
     #[test]
@@ -458,31 +489,51 @@ mod stage_b_tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Tool {
     #[default]
     Claude,
     Codex,
-    #[serde(other)]
-    Unknown,
+    Unknown(String),
 }
 
 impl Tool {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Unknown => "unknown tool",
+            Self::Unknown(_) => "unknown tool",
         }
     }
 
-    fn alias_prefix(self) -> Option<&'static str> {
+    fn alias_prefix(&self) -> Option<&'static str> {
         match self {
             Self::Claude => Some("claude"),
             Self::Codex => Some("codex"),
-            Self::Unknown => None,
+            Self::Unknown(_) => None,
         }
+    }
+}
+
+impl Serialize for Tool {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let value = match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Unknown(value) => value,
+        };
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tool {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            _ => Self::Unknown(value),
+        })
     }
 }
 
@@ -584,7 +635,7 @@ pub fn launch_spec(tool: Tool, profile_dir: PathBuf) -> Result<LaunchSpec> {
     let (program, env_key) = match tool {
         Tool::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
         Tool::Codex => ("codex", "CODEX_HOME"),
-        Tool::Unknown => bail!("Profile has an unknown tool; cannot use or log in."),
+        Tool::Unknown(_) => bail!("Profile has an unknown tool; cannot use or log in."),
     };
     Ok(LaunchSpec {
         program,
@@ -803,7 +854,7 @@ impl ProfileManager {
         let markers = match tool {
             Tool::Claude => SESSION_ACTIVITY_MARKERS,
             Tool::Codex => CODEX_ACTIVITY_MARKERS,
-            Tool::Unknown => return None,
+            Tool::Unknown(_) => return None,
         };
         markers
             .iter()
@@ -875,7 +926,7 @@ impl ProfileManager {
     fn prepare_launch(&self, name: &str) -> Result<LaunchPreparation> {
         let profile = self.get_profile(name)?;
         let profile_dir = self.profile_dir(name);
-        let spec = launch_spec(profile.tool, profile_dir.clone())?;
+        let spec = launch_spec(profile.tool.clone(), profile_dir.clone())?;
         if !profile_dir.exists() {
             bail!(
                 "Profile directory for '{}' not found. Re-add it with: cswitch add {}",
@@ -1071,7 +1122,7 @@ impl ProfileManager {
 
     fn ensure_target_tool(&self, name: &str, tool: Tool) -> Result<()> {
         if let Some(existing) = self.load_registry()?.profiles.get(name) {
-            if existing.tool == Tool::Unknown {
+            if matches!(existing.tool, Tool::Unknown(_)) {
                 bail!("Profile '{name}' has an unknown tool; cannot use or log in.");
             }
             if existing.tool != tool {

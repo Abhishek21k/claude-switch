@@ -1493,13 +1493,13 @@ mod tests {
         for (name, tool) in [
             ("c", Tool::Claude),
             ("o", Tool::Codex),
-            ("u", Tool::Unknown),
+            ("u", Tool::Unknown("martian".into())),
         ] {
             registry.profiles.insert(
                 name.into(),
                 Profile {
                     name: name.into(),
-                    tool,
+                    tool: tool.clone(),
                     email: Some(format!("{}@example.com", "x".repeat(30))),
                     added: Utc::now(),
                     last_used: None,
