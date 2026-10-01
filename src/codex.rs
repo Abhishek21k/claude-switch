@@ -107,7 +107,8 @@ mod tests {
     #[test]
     fn identity_reads_synthetic_claims_without_padding() {
         // Known-bad: treating an unpadded JWT payload as invalid or missing its plan claim.
-        let claims = br#"{"email":"user@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}"#;
+        let claims = br#"{"email":"user@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}} "#;
+        assert_ne!(encode(claims).len() % 4, 0);
         let auth = format!(
             r#"{{"tokens":{{"id_token":"header.{}.signature"}}}}"#,
             encode(claims)
