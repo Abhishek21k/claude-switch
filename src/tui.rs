@@ -475,11 +475,6 @@ impl App {
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('q') => return Ok(true),
-            KeyCode::Char('a') => {
-                self.input_buffer.clear();
-                self.mode = Mode::AddName;
-            }
-
             KeyCode::Char('1') => {
                 let name = self.input_buffer.trim().to_string();
                 if name.is_empty() {
@@ -515,6 +510,17 @@ impl App {
                     name,
                     method: LoginMethod::ClaudeAi,
                 });
+            }
+
+            KeyCode::Char('3') => {
+                let name = self.input_buffer.trim().to_string();
+                if name.is_empty() {
+                    return Ok(false);
+                }
+                self.detected_email = None;
+                self.claude_dir_found = false;
+                self.mode = Mode::Normal;
+                self.pending = Some(PendingAction::CodexLogin { name });
             }
 
             KeyCode::Backspace => {
@@ -1122,6 +1128,8 @@ impl App {
                 Span::styled("copy session  ", Style::default().fg(DIM)),
                 Span::styled(" 2 ", Style::default().fg(ACCENT).bold()),
                 Span::styled("login new  ", Style::default().fg(DIM)),
+                Span::styled(" 3 ", Style::default().fg(ACCENT).bold()),
+                Span::styled("codex login  ", Style::default().fg(DIM)),
                 Span::styled(" esc ", Style::default().fg(ACCENT).bold()),
                 Span::styled("skip  ", Style::default().fg(DIM)),
                 Span::styled(" q ", Style::default().fg(ACCENT).bold()),
@@ -1236,10 +1244,13 @@ impl App {
                 "      Opens Claude for you to authenticate a new account",
                 Style::default().fg(DIM),
             )),
-            Line::from(Span::styled(
-                "  [a] Choose Claude or Codex login instead",
-                Style::default().fg(TEXT),
-            )),
+            Line::from(vec![
+                Span::styled("  [3] ", Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    "Log in to a Codex (ChatGPT) account",
+                    Style::default().fg(TEXT),
+                ),
+            ]),
         ]
     }
 
@@ -3002,6 +3013,30 @@ mod tests {
         app.handle_first_run_key(KeyCode::Char('a'), KeyModifiers::NONE)
             .unwrap();
         assert_eq!(app.mode, Mode::AddName);
+    }
+
+    #[test]
+    fn first_run_detected_name_keeps_a_and_uses_three_for_codex() {
+        // Known-bad: `a` opens AddName and discards the detected screen's name.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = true;
+        app.input_buffer = "default".into();
+        for key in ['-', 'a'] {
+            app.handle_first_run_key(KeyCode::Char(key), KeyModifiers::NONE)
+                .unwrap();
+        }
+        assert_eq!(app.input_buffer, "default-a");
+        assert_eq!(app.mode, Mode::FirstRun);
+
+        app.input_buffer = "work".into();
+        app.handle_first_run_key(KeyCode::Char('3'), KeyModifiers::NONE)
+            .unwrap();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::CodexLogin { ref name }) if name == "work"
+        ));
     }
 
     #[test]
