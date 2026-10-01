@@ -565,6 +565,7 @@ pub struct ProfileManager {
     registry_path: PathBuf,
     claude_home: PathBuf,
     codex_home: PathBuf,
+    codex_source_label: &'static str,
 }
 
 #[derive(Debug)]
@@ -603,7 +604,11 @@ impl ProfileManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
         let mut manager = Self::with_base_dir(home.join(".claude-switch"))?;
-        manager.codex_home = codex_source_home(&home, std::env::var_os("CODEX_HOME").as_deref());
+        let configured = std::env::var_os("CODEX_HOME");
+        manager.codex_home = codex_source_home(&home, configured.as_deref());
+        if configured.as_deref().is_some_and(|value| !value.is_empty()) {
+            manager.codex_source_label = "CODEX_HOME";
+        }
         Ok(manager)
     }
 
@@ -633,6 +638,7 @@ impl ProfileManager {
             registry_path,
             claude_home,
             codex_home,
+            codex_source_label: "~/.codex",
         })
     }
 
@@ -1101,6 +1107,12 @@ impl ProfileManager {
         fs::create_dir_all(&profile_dir)?;
         let result = (|| -> Result<LoginOutcome> {
             self.seed_codex_profile_dir(&profile_dir)?;
+            let copied: Vec<&str> = CODEX_SEED_ALLOWLIST
+                .iter()
+                .copied()
+                .filter(|entry| fs::symlink_metadata(profile_dir.join(*entry)).is_ok())
+                .collect();
+            println!("{}", codex_seed_message(self.codex_source_label, &copied));
             println!("Opening your browser — sign in to ChatGPT for profile '{name}'.");
             let logged_in = std::process::Command::new("codex")
                 .arg("login")
@@ -1392,6 +1404,14 @@ fn codex_login_verdict(
 }
 
 const CODEX_SEED_ALLOWLIST: &[&str] = &["config.toml", "AGENTS.md", "agents", "rules", "skills"];
+
+fn codex_seed_message(source: &str, copied: &[&str]) -> String {
+    if copied.is_empty() {
+        format!("Codex seed from {source}: nothing to copy.")
+    } else {
+        format!("Codex seed from {source}: copied {}.", copied.join(", "))
+    }
+}
 
 fn seed_codex_from(source: &Path, destination: &Path) -> Result<bool> {
     if !source.is_dir() {
