@@ -2963,6 +2963,7 @@ mod tests {
         app.pending = None;
         app.mode = Mode::Normal;
         app.profiles[0].tool = Tool::Codex;
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         let marker = app.manager.profile_dir("o").join("auth.json");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"synthetic untouched").unwrap();
