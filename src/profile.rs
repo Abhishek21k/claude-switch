@@ -2407,6 +2407,39 @@ mod tests {
     }
 
     #[test]
+    fn t1_seed_and_copy_drop_base_url_without_source_manifest() {
+        // Known-bad: relying on the source manifest leaves an older helper's base URL in a new profile.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        fs::create_dir_all(&mgr.claude_home).unwrap();
+        let settings = serde_json::json!({
+            "apiKeyHelper": "'/opt/tools/cswitch' key print source",
+            "env": {"ANTHROPIC_BASE_URL": "https://gateway.example.com", "OTHER": "keep"},
+            "theme": "dark"
+        });
+        fs::write(mgr.claude_home.join("settings.json"), settings.to_string()).unwrap();
+        assert!(!crate::key::manifest_path(&mgr.base_dir, "source").exists());
+
+        let seeded_dir = mgr.profile_dir("seeded");
+        fs::create_dir_all(&seeded_dir).unwrap();
+        mgr.seed_profile_dir(&seeded_dir, false).unwrap();
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&fs::read(seeded_dir.join("settings.json")).unwrap()).unwrap();
+        assert!(seeded.get("apiKeyHelper").is_none());
+        assert_eq!(seeded["env"], serde_json::json!({"OTHER":"keep"}));
+        assert_eq!(seeded["theme"], "dark");
+
+        mgr.add_profile_from("copied", &mgr.claude_home).unwrap();
+        let copied: serde_json::Value = serde_json::from_slice(
+            &fs::read(mgr.profile_dir("copied").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(copied.get("apiKeyHelper").is_none());
+        assert_eq!(copied["env"], serde_json::json!({"OTHER":"keep"}));
+        assert_eq!(copied["theme"], "dark");
+    }
+
+    #[test]
     fn remove_and_refresh_delete_saved_key() {
         // Known-bad: deleting or refreshing a profile leaves a key or gateway manifest orphaned.
         let tmp = TempDir::new().unwrap();

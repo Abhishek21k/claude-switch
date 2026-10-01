@@ -1910,7 +1910,8 @@ impl App {
             )),
             Line::from(""),
             Line::from("  Enter keeps it · \"none\" for the Anthropic API"),
-            Line::from("  Paste a URL or the provider's JSON · Esc cancels"),
+            Line::from("  Paste a URL or the provider's JSON · a blank line ends a JSON paste"),
+            Line::from("  Esc cancels"),
         ];
         f.render_widget(
             Paragraph::new(lines)
@@ -2170,6 +2171,34 @@ mod tests {
             .unwrap();
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.key_buffer.is_empty());
+    }
+
+    #[test]
+    fn t4_foreign_helper_refuses_before_gateway_entry() {
+        // Known-bad: bypassing the TUI pre-check opens GatewayEntry over a foreign helper.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        let profile_dir = app.manager.profile_dir("api");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let settings = br#"{"apiKeyHelper":"foreign helper","env":{"OTHER":"keep"}}"#;
+        let path = profile_dir.join("settings.json");
+        fs::write(&path, settings).unwrap();
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::KeyEntry);
+        for ch in "TESTKEY".chars() {
+            app.handle_key_entry(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.mode, Mode::Message(message, true) if message.contains("foreign apiKeyHelper"))
+        );
+        assert!(app.key_buffer.is_empty());
+        assert!(!key::key_path(&app.manager.base_dir, "api").exists());
+        assert!(!key::manifest_path(&app.manager.base_dir, "api").exists());
+        assert_eq!(fs::read(&path).unwrap(), settings);
     }
 
     #[test]

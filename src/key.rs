@@ -527,17 +527,16 @@ pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Re
     Ok(ClearOutcome {
         foreign_helper: result.foreign_helper,
         fallback,
-        gateway_line: if result.removed_gateway {
+        gateway_line: if result.removed_gateway_count > 0 {
             let host =
                 if old_gateway == "the Anthropic API" || old_gateway == "(unrecognized base URL)" {
                     old_gateway
                 } else {
                     gateway::host(&old_gateway).to_string()
                 };
-            Some(format!(
-                "Removed the gateway ({host}, {} settings).",
-                old_names.len().max(1)
-            ))
+            let count = result.removed_gateway_count;
+            let noun = if count == 1 { "setting" } else { "settings" };
+            Some(format!("Removed the gateway ({host}, {count} {noun})."))
         } else {
             None
         },
@@ -701,7 +700,7 @@ struct Merge {
     changed: bool,
     foreign_helper: bool,
     overwritten: Vec<String>,
-    removed_gateway: bool,
+    removed_gateway_count: usize,
 }
 
 fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
@@ -783,20 +782,21 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                 changed,
                 foreign_helper: false,
                 overwritten,
-                removed_gateway: false,
+                removed_gateway_count: 0,
             })
         }
         Edit::Clear { owned } => {
             if managed.as_deref() == Some(name) {
                 object.remove("apiKeyHelper");
-                let mut removed_gateway = false;
+                let mut removed_gateway_count = 0;
                 if let Some(env) = object.get_mut("env") {
                     let env = env
                         .as_object_mut()
                         .ok_or_else(|| anyhow::anyhow!("settings.json env is not an object."))?;
-                    removed_gateway |= env.remove("ANTHROPIC_BASE_URL").is_some();
+                    removed_gateway_count +=
+                        usize::from(env.remove("ANTHROPIC_BASE_URL").is_some());
                     for entry in owned {
-                        removed_gateway |= env.remove(entry).is_some();
+                        removed_gateway_count += usize::from(env.remove(entry).is_some());
                     }
                     if env.is_empty() {
                         object.remove("env");
@@ -807,16 +807,16 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                     changed: true,
                     foreign_helper: false,
                     overwritten: Vec::new(),
-                    removed_gateway,
+                    removed_gateway_count,
                 })
             } else if !present && !owned.is_empty() {
-                let mut removed_gateway = false;
+                let mut removed_gateway_count = 0;
                 if let Some(env) = object.get_mut("env") {
                     let env = env
                         .as_object_mut()
                         .ok_or_else(|| anyhow::anyhow!("settings.json env is not an object."))?;
                     for entry in owned {
-                        removed_gateway |= env.remove(entry).is_some();
+                        removed_gateway_count += usize::from(env.remove(entry).is_some());
                     }
                     if env.is_empty() {
                         object.remove("env");
@@ -824,10 +824,10 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                 }
                 Ok(Merge {
                     json,
-                    changed: removed_gateway,
+                    changed: removed_gateway_count > 0,
                     foreign_helper: false,
                     overwritten: Vec::new(),
-                    removed_gateway,
+                    removed_gateway_count,
                 })
             } else {
                 Ok(Merge {
@@ -835,7 +835,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                     changed: false,
                     foreign_helper: foreign,
                     overwritten: Vec::new(),
-                    removed_gateway: false,
+                    removed_gateway_count: 0,
                 })
             }
         }
@@ -844,7 +844,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
 
 struct EditOutcome {
     foreign_helper: bool,
-    removed_gateway: bool,
+    removed_gateway_count: usize,
     overwritten: Vec<String>,
 }
 
@@ -862,7 +862,7 @@ fn edit_settings<F: FnMut(usize)>(
         if !merged.changed {
             return Ok(EditOutcome {
                 foreign_helper: merged.foreign_helper,
-                removed_gateway: merged.removed_gateway,
+                removed_gateway_count: merged.removed_gateway_count,
                 overwritten: merged.overwritten,
             });
         }
@@ -896,7 +896,7 @@ fn edit_settings<F: FnMut(usize)>(
         if result? {
             return Ok(EditOutcome {
                 foreign_helper: false,
-                removed_gateway: merged.removed_gateway,
+                removed_gateway_count: merged.removed_gateway_count,
                 overwritten: merged.overwritten,
             });
         }
@@ -1010,6 +1010,7 @@ pub fn apply_gateway_event(buffer: &mut String, key: KeyEvent) -> InputStep {
         if trimmed.is_empty()
             || !trimmed.starts_with('{')
             || serde_json::from_str::<Value>(trimmed).is_ok()
+            || buffer.ends_with('\n')
         {
             return InputStep::Complete;
         }
@@ -1064,7 +1065,7 @@ pub fn read_key_input() -> Result<String> {
 pub fn read_gateway_input(current: &str) -> Result<GatewayInput> {
     println!("Gateway now: {current}");
     println!(
-        "Base URL, or the provider's settings JSON (hidden; Enter keeps it, \"none\" for the Anthropic API):"
+        "Base URL, or the provider's settings JSON (hidden; Enter keeps it, \"none\" for the Anthropic API; a blank line ends a JSON paste):"
     );
     io::stdout().flush()?;
     crossterm::terminal::enable_raw_mode()?;
@@ -1694,6 +1695,27 @@ mod tests {
             parse_gateway_input(&buffer).unwrap(),
             GatewayInput::Json { .. }
         ));
+        // Known-bad: malformed hidden JSON never completes, even on a blank line.
+        buffer.clear();
+        buffer.push('{');
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Continue
+        );
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Complete
+        );
+        assert_eq!(
+            parse_gateway_input(&buffer).unwrap_err().to_string(),
+            "That isn't a base URL or a settings JSON object."
+        );
         buffer.clear();
         assert_eq!(
             apply_gateway_event(
@@ -1911,7 +1933,10 @@ mod tests {
         let cleared: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(cleared["env"], json!({"OTHER":"keep"}));
         assert!(cleared.get("apiKeyHelper").is_none());
-        assert!(result.gateway_line.unwrap().contains("gateway.example.com"));
+        assert_eq!(
+            result.gateway_line.unwrap(),
+            "Removed the gateway (gateway.example.com, 1 setting)."
+        );
         assert!(!has_key(&manager, "n"));
     }
 
@@ -1945,6 +1970,43 @@ mod tests {
         assert_eq!(cleared, json!({"theme":"dark"}));
         assert!(!manifest_path(&manager.base_dir, "n").exists());
         assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn t2_clear_without_helper_removes_only_manifest_names() {
+        // Known-bad: skipping the no-helper manifest branch leaves cswitch-owned gateway values behind.
+        let (_tmp, manager, _) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        fs::write(&path, r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_MODEL":"vendor/claude-model","OTHER":"keep"},"theme":"dark"}"#).unwrap();
+        write_manifest(
+            &manager.base_dir,
+            "n",
+            &BTreeSet::from(["ANTHROPIC_BASE_URL".into(), "ANTHROPIC_MODEL".into()]),
+        )
+        .unwrap();
+        let outcome = clear_key(&manager, "n", now()).unwrap();
+        let cleared: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cleared["env"], json!({"OTHER":"keep"}));
+        assert_eq!(cleared["theme"], "dark");
+        assert!(cleared.get("apiKeyHelper").is_none());
+        assert!(!manifest_path(&manager.base_dir, "n").exists());
+        assert_eq!(
+            outcome.gateway_line.unwrap(),
+            "Removed the gateway (gateway.example.com, 2 settings)."
+        );
+    }
+
+    #[test]
+    fn t2_clear_without_helper_or_manifest_keeps_env_bytes() {
+        // Known-bad: clearing an unmanaged gateway rewrites or removes its env object.
+        let (_tmp, manager, _) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        let original = b"{ \"env\": {\"ANTHROPIC_BASE_URL\":\"https://gateway.example.com\", \"OTHER\":\"keep\"}, \"theme\":\"dark\" }";
+        fs::write(&path, original).unwrap();
+        let outcome = clear_key(&manager, "n", now()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(outcome.gateway_line.is_none());
+        assert!(!manifest_path(&manager.base_dir, "n").exists());
     }
 
     #[test]
@@ -2041,6 +2103,41 @@ mod tests {
             settings["env"],
             json!({"ANTHROPIC_BASE_URL":"https://gateway.example.com/b"})
         );
+    }
+
+    #[test]
+    fn t3_declining_defaults_never_creates_or_rewrites_store() {
+        // Known-bad: saving every JSON paste ignores a "no" answer to the defaults question.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let input = parse_gateway_input(r#"{"ANTHROPIC_BASE_URL":"https://gateway.example.com/new","ANTHROPIC_MODEL":"vendor/claude-model"}"#).unwrap();
+        let path = manager.base_dir.join("gateways.json");
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &input,
+            false,
+            now(),
+        )
+        .unwrap();
+        assert!(!path.exists());
+
+        let existing = br#" {"version":1,"gateways":{"https://other.example.com":{"ANTHROPIC_BASE_URL":"https://other.example.com","API_TIMEOUT_MS":"600000"}}} "#;
+        fs::write(&path, existing).unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "NEWKEY",
+            &executable,
+            false,
+            &input,
+            false,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), existing);
     }
 
     #[test]

@@ -100,7 +100,7 @@ On a terminal, `key set` then asks for a gateway base URL or the provider's sett
 {"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com/anthropic","ANTHROPIC_MODEL":"vendor/claude-model[1m]","ANTHROPIC_AUTH_TOKEN":"TESTKEY"}}
 ```
 
-`ANTHROPIC_AUTH_TOKEN` and other credential fields in pasted JSON are ignored and reported by name. The key comes only from the first prompt. The key is stored outside the profile at `~/.claude-switch/keys/<name>.key` (`0700` directory, `0600` file on Unix); it never enters `settings.json`. That file holds the `apiKeyHelper` command, base URL and safe gateway settings. Saved defaults live in the private `~/.claude-switch/gateways.json`; `cswitch gateway list` shows only URLs and setting names, and `cswitch gateway forget <url>` removes an entry without changing profiles.
+`ANTHROPIC_AUTH_TOKEN` and other credential fields in pasted JSON are ignored and reported by name. The key comes only from the first prompt. The key is stored outside the profile at `~/.claude-switch/keys/<name>.key` (`0700` directory, `0600` file on Unix); it never enters `settings.json`. The profile's `settings.json` holds the `apiKeyHelper` command, base URL and safe gateway settings. Saved defaults live in the private `~/.claude-switch/gateways.json`; `cswitch gateway list` shows only URLs and setting names, and `cswitch gateway forget <url>` removes an entry without changing profiles.
 
 The helper overrides a Console login or subscription while present. `cswitch key clear <name>` removes the helper and the base URL together, so the profile's saved login never goes to the gateway. If an unrelated helper already exists, `key set` refuses to replace it unless you pass `--replace-helper`.
 

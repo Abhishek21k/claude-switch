@@ -159,7 +159,7 @@ pub fn parse_gateway_input(input: &str) -> Result<GatewayInput> {
             dropped,
         })
     } else {
-        normalize_base_url(input)
+        normalize_base_url(trimmed)
             .map(GatewayInput::Url)
             .map_err(|_| anyhow::anyhow!("That isn't a base URL or a settings JSON object."))
     }
@@ -349,7 +349,15 @@ mod tests {
         ] {
             assert!(normalize_base_url(input).is_err(), "unsafe URL accepted");
         }
-        assert!(parse_gateway_input(" https://gateway.example.com ").is_err());
+    }
+
+    #[test]
+    fn d1_url_input_trims_surrounding_whitespace() {
+        // Known-bad: passing the untrimmed paste to normalize_base_url rejects a valid URL.
+        assert_eq!(
+            parse_gateway_input("  https://Gateway.example.com/x/  ").unwrap(),
+            GatewayInput::Url("https://gateway.example.com/x".into())
+        );
     }
 
     #[test]
