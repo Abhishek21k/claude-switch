@@ -129,6 +129,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_decodes_both_base64url_only_characters() {
+        // Known-bad: decoding the URL alphabet as standard Base64 rejects '-' and '_'.
+        let mut claims = String::from(
+            r#"{"email":"user@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus"},"noise":""#,
+        );
+        while claims.len() % 3 != 0 {
+            claims.push(' ');
+        }
+        claims.push_str("~~~???");
+        claims.push_str("\"}");
+        let payload = encode(claims.as_bytes());
+        assert!(payload.contains('-') && payload.contains('_'), "{payload}");
+        let auth = format!(r#"{{"tokens":{{"id_token":"h.{payload}.s"}}}}"#);
+        assert_eq!(
+            identity_from_auth(auth.as_bytes()),
+            Some(Identity {
+                email: "user@example.com".into(),
+                plan_type: Some("plus".into()),
+            })
+        );
+    }
+
+    #[test]
     fn identity_uses_profile_email_fallback() {
         // Known-bad: only the top-level email is accepted.
         let claims = br#"{"https://api.openai.com/profile":{"email":"fallback@example.com"}}"#;
