@@ -3011,6 +3011,26 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_unknown_profile_stays_in_tui_with_error_message() {
+        // Known-bad: without the TUI guard, Enter returns a launch error and exits the TUI.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("alien", Some("alien@example.com"))]);
+        app.profiles[0].tool = Tool::Unknown;
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("alien").unwrap().tool = Tool::Unknown;
+        std::fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        assert!(!app.handle_normal_key(KeyCode::Enter, KeyModifiers::NONE).unwrap());
+        assert_eq!(
+            app.mode,
+            Mode::Message("Profile has an unknown tool; cannot use or log in.".into(), true)
+        );
+    }
+
+    #[test]
     fn first_run_without_claude_can_enter_codex_add_flow() {
         // Known-bad: the first-run screen requires Claude before Codex can be added.
         let tmp = TempDir::new().unwrap();
