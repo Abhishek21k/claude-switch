@@ -12,20 +12,25 @@ pub fn identity_from_auth(bytes: &[u8]) -> Option<Identity> {
     let auth: Value = serde_json::from_slice(bytes).ok()?;
     let token = auth.get("tokens")?.get("id_token")?.as_str()?;
     let mut parts = token.split('.');
-    let (Some(_header), Some(payload), Some(_signature), None) =
+    let (Some(header), Some(payload), Some(signature), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return None;
     };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return None;
+    }
     let claims: Value = serde_json::from_slice(&decode_base64url(payload)?).ok()?;
     let email = claims
         .get("email")
         .and_then(Value::as_str)
+        .filter(|email| !email.trim().is_empty())
         .or_else(|| {
             claims
                 .get("https://api.openai.com/profile")?
                 .get("email")?
                 .as_str()
+                .filter(|email| !email.trim().is_empty())
         })?
         .trim();
     if email.is_empty() {
@@ -35,6 +40,7 @@ pub fn identity_from_auth(bytes: &[u8]) -> Option<Identity> {
         .get("https://api.openai.com/auth")
         .and_then(|auth| auth.get("chatgpt_plan_type"))
         .and_then(Value::as_str)
+        .filter(|plan| !plan.trim().is_empty())
         .map(str::to_string);
     Some(Identity {
         email: email.to_string(),
@@ -134,6 +140,18 @@ mod tests {
     }
 
     #[test]
+    fn identity_falls_back_when_top_level_email_is_empty() {
+        // Known-bad: an empty top-level email masks a populated profile claim.
+        let claims =
+            br#"{"email":" ","https://api.openai.com/profile":{"email":"fallback@example.com"}}"#;
+        let auth = format!(r#"{{"tokens":{{"id_token":"h.{}.s"}}}}"#, encode(claims));
+        assert_eq!(
+            identity_from_auth(auth.as_bytes()).unwrap().email,
+            "fallback@example.com"
+        );
+    }
+
+    #[test]
     fn identity_rejects_missing_token() {
         // Known-bad: missing token data is treated as an account.
         assert_eq!(identity_from_auth(br#"{}"#), None);
@@ -146,6 +164,16 @@ mod tests {
             identity_from_auth(br#"{"tokens":{"id_token":"bad"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn identity_rejects_empty_jwt_segments() {
+        // Known-bad: a token with an empty header or signature is treated as a valid JWT.
+        let payload = encode(br#"{"email":"user@example.com"}"#);
+        for token in [format!(".{payload}.s"), format!("h.{payload}.")] {
+            let auth = format!(r#"{{"tokens":{{"id_token":"{token}"}}}}"#);
+            assert_eq!(identity_from_auth(auth.as_bytes()), None);
+        }
     }
 
     #[test]
