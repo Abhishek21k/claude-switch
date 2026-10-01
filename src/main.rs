@@ -1495,6 +1495,7 @@ mod tests {
         assert!(output.lines().all(|line| line.chars().count() <= 120));
         let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
         assert!(codex_row.contains("—       —"), "{codex_row}");
+        assert!(!codex_row.contains("unreadable"), "{codex_row}");
         assert_eq!(sync_target_names(&manager, true, None).unwrap(), ["c"]);
     }
 }
