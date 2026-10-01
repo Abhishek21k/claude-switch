@@ -210,6 +210,20 @@ mod stage_b_tests {
     }
 
     #[test]
+    fn codex_seed_without_source_leaves_destination_empty() {
+        // Known-bad: a missing source home blocks a first login with a read error.
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let missing = tmp.path().join("absent");
+        assert!(!seed_codex_from(&missing, &dest).unwrap());
+        let file = tmp.path().join("source-file");
+        fs::write(&file, "synthetic").unwrap();
+        assert!(!seed_codex_from(&file, &dest).unwrap());
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
     fn launch_spec_sets_exactly_the_selected_tool_home() {
         // Known-bad: a Codex launch inherits the Claude env key instead of CODEX_HOME.
         let dir = PathBuf::from("/synthetic/profile");
