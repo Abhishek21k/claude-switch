@@ -879,6 +879,11 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
             println!(
                 "  (or use a private window) and run: cswitch remove {name} && cswitch login {name}"
             );
+        } else if outcome.tool == Tool::Codex {
+            println!("  To use a different Codex account, sign out of ChatGPT in the browser");
+            println!(
+                "  (or use a private window), then run: cswitch remove {name} && cswitch login {name} --tool codex"
+            );
         }
     }
 
