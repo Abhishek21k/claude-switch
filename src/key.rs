@@ -99,19 +99,16 @@ pub fn read_auth_mode(
     name: &str,
     claude: Result<Option<Value>, ()>,
 ) -> AuthMode {
-    let Ok(claude) = claude else {
-        return AuthMode::Unreadable;
-    };
     let path = manager.profile_dir(name).join("settings.json");
-    let Ok(helper) = read_helper(&path) else {
-        return AuthMode::Unreadable;
+    let mode = match (claude, read_helper(&path)) {
+        (Ok(claude), Ok(helper)) => derive_auth_mode(
+            name,
+            claude.as_ref(),
+            helper.as_deref(),
+            key_path(&manager.base_dir, name).exists(),
+        ),
+        _ => AuthMode::Unreadable,
     };
-    let mode = derive_auth_mode(
-        name,
-        claude.as_ref(),
-        helper.as_deref(),
-        key_path(&manager.base_dir, name).exists(),
-    );
     match gateway_host(&path) {
         Some(host) => AuthMode::Via(Box::new(mode), host),
         None => mode,
@@ -420,13 +417,13 @@ pub fn set_key_with_gateway(
         owned: &old_names,
     };
     // Dry-run the complete merge before either sidecar or settings is written.
-    let preview = merge_settings(&read_settings(&settings)?.json, name, edit)?;
+    let _ = merge_settings(&read_settings(&settings)?.json, name, edit)?;
     store_key(&manager.base_dir, name, key)?;
     if !matches!(gateway_input, GatewayInput::Keep) {
         let union = old_names.union(&new_names).cloned().collect();
         write_manifest(&manager.base_dir, name, &union)?;
     }
-    edit_settings(&settings, &manager.base_dir, name, edit, now, |_| {})?;
+    let edited = edit_settings(&settings, &manager.base_dir, name, edit, now, |_| {})?;
     if !matches!(gateway_input, GatewayInput::Keep) {
         if new_names.is_empty() {
             remove_manifest(&manager.base_dir, name)?;
@@ -470,7 +467,7 @@ pub fn set_key_with_gateway(
             lines
         }
     };
-    for name in preview.overwritten {
+    for name in edited.overwritten {
         gateway_lines.push(format!("Replaced {name}, which cswitch didn't set."));
     }
     let claude = read_claude_json(&manager.profile_dir(name)).ok().flatten();
@@ -728,7 +725,8 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                     "settings.json has a foreign apiKeyHelper; use --replace-helper to replace it."
                 );
             }
-            let mut changed = current != Some(helper);
+            // Every key set makes one settings edit and backup, including a piped key rotation.
+            let mut changed = true;
             object.insert(
                 "apiKeyHelper".to_string(),
                 Value::String(helper.to_string()),
@@ -847,6 +845,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
 struct EditOutcome {
     foreign_helper: bool,
     removed_gateway: bool,
+    overwritten: Vec<String>,
 }
 
 fn edit_settings<F: FnMut(usize)>(
@@ -864,6 +863,7 @@ fn edit_settings<F: FnMut(usize)>(
             return Ok(EditOutcome {
                 foreign_helper: merged.foreign_helper,
                 removed_gateway: merged.removed_gateway,
+                overwritten: merged.overwritten,
             });
         }
         let bytes = serde_json::to_vec_pretty(&merged.json)?;
@@ -897,6 +897,7 @@ fn edit_settings<F: FnMut(usize)>(
             return Ok(EditOutcome {
                 foreign_helper: false,
                 removed_gateway: merged.removed_gateway,
+                overwritten: merged.overwritten,
             });
         }
     }
@@ -1781,6 +1782,18 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Ignored ANTHROPIC_AUTH_TOKEN"))
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(manifest_path(&manager.base_dir, "n"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert!(
             !fs::read(manager.base_dir.join("gateways.json"))
                 .unwrap()
@@ -1877,6 +1890,12 @@ mod tests {
         .unwrap();
         let second: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(second["env"], original["env"]);
+        assert_eq!(
+            fs::read_dir(manager.base_dir.join("backups/settings/n"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1893,6 +1912,38 @@ mod tests {
         assert_eq!(cleared["env"], json!({"OTHER":"keep"}));
         assert!(cleared.get("apiKeyHelper").is_none());
         assert!(result.gateway_line.unwrap().contains("gateway.example.com"));
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn g8_clear_removes_manifest_names_with_the_helper_in_one_backup() {
+        // Known-bad: clear removes the helper first and leaves a managed model or base URL behind.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        let gateway = parse_gateway_input(r#"{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_MODEL":"vendor/claude-model"}"#).unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &gateway,
+            false,
+            now(),
+        )
+        .unwrap();
+        let before = fs::read_dir(manager.base_dir.join("backups/settings/n"))
+            .unwrap()
+            .count();
+        clear_key(&manager, "n", now()).unwrap();
+        let after = fs::read_dir(manager.base_dir.join("backups/settings/n"))
+            .unwrap()
+            .count();
+        assert_eq!(after, before + 1);
+        let cleared: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cleared, json!({"theme":"dark"}));
+        assert!(!manifest_path(&manager.base_dir, "n").exists());
         assert!(!has_key(&manager, "n"));
     }
 
@@ -1915,6 +1966,30 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(manifest_path(&manager.base_dir, "n").exists());
         assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn invalid_manifest_refuses_set_before_storing_key() {
+        // Known-bad: guessing owned env names from an invalid manifest can erase foreign settings.
+        let (_tmp, manager, executable) = manager_with_profile();
+        fs::create_dir_all(manager.base_dir.join("keys")).unwrap();
+        fs::write(manifest_path(&manager.base_dir, "n"), "bad").unwrap();
+        let gateway = parse_gateway_input("https://gateway.example.com").unwrap();
+        let error = set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &gateway,
+            false,
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "Gateway manifest is unsafe or invalid.");
+        assert!(!has_key(&manager, "n"));
+        assert!(!manager.profile_dir("n").join("settings.json").exists());
     }
 
     #[test]
@@ -1998,6 +2073,30 @@ mod tests {
                 .label()
                 .contains("TOKEN-CANARY")
         );
+    }
+
+    #[test]
+    fn g14_every_auth_mode_shows_gateway_host() {
+        // Known-bad: via <host> appears only for a cswitch-managed key.
+        let (_tmp, manager, _) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        for helper in [None, Some("foreign helper"), Some("cswitch key print n")] {
+            let mut settings =
+                json!({"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com/a"}});
+            if let Some(helper) = helper {
+                settings["apiKeyHelper"] = json!(helper);
+            }
+            fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+            for claude in [
+                Ok(None),
+                Ok(Some(json!({"primaryApiKey":"synthetic"}))),
+                Ok(Some(json!({"oauthAccount":{}}))),
+                Err(()),
+            ] {
+                let label = read_auth_mode(&manager, "n", claude).label();
+                assert!(label.contains("via gateway.example.com"));
+            }
+        }
     }
 
     #[test]

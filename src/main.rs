@@ -877,6 +877,98 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["cswitch", "key", "set", "n", "synthetic-secret"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "gateway", "list"])
+                .unwrap()
+                .command,
+            Some(Commands::Gateway {
+                action: GatewayAction::List
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cswitch",
+                "gateway",
+                "forget",
+                "https://gateway.example.com"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Gateway {
+                action: GatewayAction::Forget { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn g13_gateway_canary_never_reaches_views_or_non_key_files() {
+        // Known-bad: a provider token gets copied from pasted JSON into settings, defaults or a backup.
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let manager = ProfileManager::with_paths(temp.path().join("base"), source.clone()).unwrap();
+        manager.add_profile_from("api", &source).unwrap();
+        fs::write(
+            manager.profile_dir("api").join("settings.json"),
+            r#"{"theme":"dark"}"#,
+        )
+        .unwrap();
+        let executable = temp.path().join("cswitch");
+        fs::write(&executable, "synthetic executable").unwrap();
+        let key_canary = "TESTKEY-CANARY";
+        let token_canary = "TOKEN-CANARY";
+        let input = gateway::parse_gateway_input(&format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_AUTH_TOKEN":"{token_canary}","ANTHROPIC_CUSTOM_HEADERS":"{token_canary}","ANTHROPIC_MODEL":"vendor/claude-model"}}}}"#)).unwrap();
+        let outcome = key::set_key_with_gateway(
+            &manager,
+            "api",
+            key_canary,
+            &executable,
+            false,
+            &input,
+            true,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(key::key_path(&manager.base_dir, "api")).unwrap(),
+            format!("{key_canary}\n")
+        );
+        let info = format!(
+            "{} {}",
+            key::read_auth_mode(&manager, "api", Ok(None)).label(),
+            key::gateway_info(&manager, "api")
+        );
+        let list = list_output(&manager, Utc::now()).unwrap();
+        let gateways = gateway::list(&manager.base_dir).unwrap();
+        for output in [outcome.gateway_lines.join("\n"), info, list, gateways] {
+            assert!(!output.contains(token_canary));
+            assert!(!output.contains(key_canary));
+        }
+        let clear = key::clear_key(&manager, "api", Utc::now()).unwrap();
+        assert!(clear.gateway_line.unwrap().contains("gateway.example.com"));
+        assert!(!key::key_path(&manager.base_dir, "api").exists());
+        fn all_files(root: &Path, output: &mut Vec<u8>) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    all_files(&path, output);
+                } else {
+                    output.extend(fs::read(path).unwrap());
+                }
+            }
+        }
+        let mut files = Vec::new();
+        all_files(&manager.base_dir, &mut files);
+        assert!(
+            !files
+                .windows(token_canary.len())
+                .any(|window| window == token_canary.as_bytes())
+        );
+        assert!(
+            !files
+                .windows(key_canary.len())
+                .any(|window| window == key_canary.as_bytes())
+        );
     }
 
     #[test]

@@ -2439,4 +2439,27 @@ mod tests {
         assert!(!crate::key::has_key(&mgr, "refresh"));
         assert!(!crate::key::manifest_path(&mgr.base_dir, "refresh").exists());
     }
+
+    #[test]
+    fn g11_bad_manifest_refuses_remove_or_refresh_before_profile_changes() {
+        // Known-bad: profile removal or refresh changes the registry before a manifest deletion fails.
+        let tmp = TempDir::new().unwrap();
+        let mgr = make_manager(&tmp);
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        mgr.add_profile_from("remove", &source).unwrap();
+        mgr.add_profile_from("refresh", &source).unwrap();
+        fs::create_dir_all(mgr.base_dir.join("keys/remove.gateway")).unwrap();
+        fs::create_dir_all(mgr.base_dir.join("keys/refresh.gateway")).unwrap();
+        let registry = fs::read(mgr.base_dir.join("registry.json")).unwrap();
+        assert!(mgr.remove_profile("remove").is_err());
+        assert!(mgr.add_profile_from_force("refresh", &source).is_err());
+        assert_eq!(
+            fs::read(mgr.base_dir.join("registry.json")).unwrap(),
+            registry
+        );
+        assert!(mgr.profile_dir("remove").join("settings.json").exists());
+        assert!(mgr.profile_dir("refresh").join("settings.json").exists());
+    }
 }

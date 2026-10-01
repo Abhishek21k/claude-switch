@@ -349,6 +349,7 @@ mod tests {
         ] {
             assert!(normalize_base_url(input).is_err(), "unsafe URL accepted");
         }
+        assert!(parse_gateway_input(" https://gateway.example.com ").is_err());
     }
 
     #[test]
@@ -380,8 +381,11 @@ mod tests {
         let listed = list(base).unwrap();
         assert!(listed.contains("ANTHROPIC_MODEL"));
         assert!(!listed.contains("vendor/claude-model"));
+        assert!(listed.lines().all(|line| line.len() <= 120));
         assert_eq!(forget(base, "https://GATEWAY.EXAMPLE.COM/a/").unwrap(), url);
         assert!(read_defaults(base).unwrap().is_empty());
+        fs::write(base.join("gateways.json"), r#"{"version":2,"gateways":{}}"#).unwrap();
+        assert!(read_defaults(base).is_err());
         fs::write(base.join("gateways.json"), "bad").unwrap();
         assert!(read_defaults(base).is_err());
         assert!(forget(base, "https://gateway.example.com/a").is_err());
