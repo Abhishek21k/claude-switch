@@ -432,6 +432,30 @@ mod stage_b_tests {
         }
         assert!(manager.maybe_in_use("o").is_some());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_activity_walk_does_not_follow_directory_link() {
+        // Known-bad: metadata() follows a linked sessions directory outside the profile.
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        register(&manager, "o", Tool::Codex, "o@example.com");
+        let profile = manager.profile_dir("o");
+        let sessions = profile.join("sessions");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("linked")).unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        for directory in [&profile, &sessions] {
+            fs::File::open(directory)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        fs::write(outside.join("fresh"), "synthetic").unwrap();
+        assert_eq!(manager.maybe_in_use("o"), None);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
