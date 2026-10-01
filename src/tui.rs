@@ -2987,4 +2987,30 @@ mod tests {
             .unwrap();
         assert_eq!(app.mode, Mode::AddName);
     }
+
+    #[test]
+    fn codex_detail_shows_tool_and_plan_without_claude_limits() {
+        // Known-bad: Codex details display Claude auth or limit data, or omit JWT plan type.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("o").unwrap().tool = Tool::Codex;
+        std::fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.profiles[0].tool = Tool::Codex;
+        let auth = br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.s"}}"#;
+        std::fs::create_dir_all(app.manager.profile_dir("o")).unwrap();
+        std::fs::write(app.manager.profile_dir("o").join("auth.json"), auth).unwrap();
+        app.refresh_limits_if_due(Instant::now());
+        let display = render_text(&mut app);
+        assert!(display.contains("Tool"));
+        assert!(display.contains("codex"));
+        assert!(display.contains("plus"));
+        assert!(display.contains("Plan limits  —"));
+        assert!(display.contains("CODEX_HOME"));
+        assert!(!display.contains("no data: no cached snapshot"));
+    }
 }

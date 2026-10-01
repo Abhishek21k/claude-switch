@@ -72,6 +72,14 @@ mod stage_b_tests {
                 .to_string()
                 .contains("unknown tool")
         );
+        fs::remove_dir_all(manager.profile_dir("alien")).unwrap();
+        assert!(
+            manager
+                .prepare_launch("alien")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool")
+        );
         assert!(
             manager
                 .login_codex_profile("alien")
@@ -718,6 +726,7 @@ impl ProfileManager {
     fn prepare_launch(&self, name: &str) -> Result<LaunchPreparation> {
         let profile = self.get_profile(name)?;
         let profile_dir = self.profile_dir(name);
+        let spec = launch_spec(profile.tool, profile_dir.clone())?;
         if !profile_dir.exists() {
             bail!(
                 "Profile directory for '{}' not found. Re-add it with: cswitch add {}",
@@ -725,7 +734,6 @@ impl ProfileManager {
                 name
             );
         }
-        let spec = launch_spec(profile.tool, profile_dir)?;
         let mut warnings = Vec::new();
         if profile.tool == Tool::Claude {
             match self.sync_skills(
