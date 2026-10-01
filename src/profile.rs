@@ -184,6 +184,31 @@ mod stage_b_tests {
         assert!(dest.join("skills/linked").is_symlink());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_seed_keeps_top_level_skills_symlink() {
+        // Known-bad: metadata() follows the linked skills directory and copies its tree.
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let dest = tmp.path().join("dest");
+        let linked = tmp.path().join("linked-skills");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(linked.join("first"), "synthetic").unwrap();
+        std::os::unix::fs::symlink(&linked, source.join("skills")).unwrap();
+        assert!(seed_codex_from(&source, &dest).unwrap());
+        assert!(
+            fs::symlink_metadata(dest.join("skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(dest.join("skills")).unwrap(), linked);
+        fs::write(linked.join("later"), "synthetic").unwrap();
+        assert!(dest.join("skills/later").exists());
+    }
+
     #[test]
     fn launch_spec_sets_exactly_the_selected_tool_home() {
         // Known-bad: a Codex launch inherits the Claude env key instead of CODEX_HOME.
