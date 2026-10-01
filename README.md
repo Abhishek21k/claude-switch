@@ -74,8 +74,10 @@ cswitch
 | `cswitch login <name>` | Create a profile by logging into a different account |
 | `cswitch login <name> --email <addr>` | Same, pre-filling the address on Claude's login page |
 | `cswitch login <name> --console` | Create a profile through Anthropic Console (API billing) |
-| `cswitch key set <name> [--replace-helper]` | Read a key from hidden terminal input or one stdin line and enable it for the profile |
-| `cswitch key clear <name>` | Remove the saved key and return to the profile's prior login |
+| `cswitch key set <name> [--replace-helper]` | Read a hidden key, then optionally configure an Anthropic-compatible gateway |
+| `cswitch key clear <name>` | Remove the saved key and its managed gateway settings |
+| `cswitch gateway list` | Show saved gateway URLs and setting names, without values |
+| `cswitch gateway forget <url>` | Forget defaults for a gateway without editing any profile |
 | `cswitch use <name> [claude flags...]` | Sync skills, then launch Claude Code with a specific profile; flags pass through unchanged |
 | `cswitch sync <name> [--dry-run] [--adopt <skill>]...` | Sync shared skills into one profile |
 | `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every profile |
@@ -90,9 +92,17 @@ cswitch
 
 ## API key
 
-Create a profile with `cswitch login <name> --console`, or choose `[p]` after `cswitch add <name>` or in the TUI Add menu. Console login uses API billing. Later, `cswitch key set <name>` reads your own Anthropic key without echoing it. A pipe can provide one line on stdin. The key is never a command argument.
+Create a profile with `cswitch login <name> --console`, or choose `[p]` after `cswitch add <name>` or in the TUI Add menu. Console login uses API billing. Later, `cswitch key set <name>` reads your own Anthropic key without echoing it. The key is never a command argument. A pipe can provide one line on stdin; piped key rotation leaves the gateway unchanged.
 
-The key is stored outside the profile at `~/.claude-switch/keys/<name>.key` (`0700` directory, `0600` file on Unix). The profile's `settings.json` stores only an `apiKeyHelper` command that asks cswitch for the key. That helper overrides a Console login or subscription while present; `cswitch key clear <name>` removes it and reports the fallback. If an unrelated helper already exists, `key set` refuses to replace it unless you pass `--replace-helper`.
+On a terminal, `key set` then asks for a gateway base URL or the provider's settings JSON. Paste the URL to reuse saved defaults for it, paste JSON to apply its non-credential settings and choose whether to save them, press Enter to keep the current gateway, or type `none` for the Anthropic API. The gateway input is hidden because provider JSON can contain a real token. For example, this synthetic snippet sets a base URL and model:
+
+```json
+{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com/anthropic","ANTHROPIC_MODEL":"vendor/claude-model[1m]","ANTHROPIC_AUTH_TOKEN":"TESTKEY"}}
+```
+
+`ANTHROPIC_AUTH_TOKEN` and other credential fields in pasted JSON are ignored and reported by name. The key comes only from the first prompt. The key is stored outside the profile at `~/.claude-switch/keys/<name>.key` (`0700` directory, `0600` file on Unix); it never enters `settings.json`. That file holds the `apiKeyHelper` command, base URL and safe gateway settings. Saved defaults live in the private `~/.claude-switch/gateways.json`; `cswitch gateway list` shows only URLs and setting names, and `cswitch gateway forget <url>` removes an entry without changing profiles.
+
+The helper overrides a Console login or subscription while present. `cswitch key clear <name>` removes the helper and the base URL together, so the profile's saved login never goes to the gateway. If an unrelated helper already exists, `key set` refuses to replace it unless you pass `--replace-helper`.
 
 `key print` is a hidden command used only by Claude Code's helper. It refuses to print to a terminal and refuses an exposed key file on Unix. `cswitch info` and the TUI show the active authentication source; API-billed rows in `cswitch list` show `api` instead of plan limits.
 

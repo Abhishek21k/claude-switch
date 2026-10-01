@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use crate::gateway::{self, GatewayInput};
 use crate::key::{self, AuthMode, InputStep};
 use crate::limits::{Limits, Window, parse_limits, read_claude_json};
 use crate::profile::{LoginMethod, Profile, ProfileManager, describe_age, detect_current_account};
@@ -39,6 +40,8 @@ enum Mode {
     ConfirmRefresh,
     ConfirmKeyClear,
     KeyEntry,
+    GatewayEntry,
+    ConfirmGatewayDefaults,
     AddName,
     /// Name accepted; now choosing *how* the profile gets its account.
     /// Split from `AddName` so Esc backs out one step at a time and the
@@ -65,6 +68,9 @@ pub struct App {
     mode: Mode,
     input_buffer: String,
     key_buffer: String,
+    gateway_buffer: String,
+    pending_gateway: Option<GatewayInput>,
+    gateway_replaces_defaults: bool,
     executable: PathBuf,
     search_query: String,
     /// Indices into `profiles` matching the current search.
@@ -127,6 +133,9 @@ impl App {
             mode,
             input_buffer,
             key_buffer: String::new(),
+            gateway_buffer: String::new(),
+            pending_gateway: None,
+            gateway_replaces_defaults: false,
             executable: PathBuf::new(),
             search_query: String::new(),
             filtered_indices,
@@ -323,6 +332,8 @@ impl App {
                     }
                     Mode::ConfirmKeyClear => self.handle_confirm_key_clear(key.code)?,
                     Mode::KeyEntry => self.handle_key_entry(key)?,
+                    Mode::GatewayEntry => self.handle_gateway_entry(key)?,
+                    Mode::ConfirmGatewayDefaults => self.handle_confirm_gateway_defaults(key)?,
                     Mode::AddName => {
                         if self.handle_add_name(key.code)? {
                             return Ok(());
@@ -512,6 +523,9 @@ impl App {
 
             KeyCode::Char('p') if self.selected_profile().is_some() => {
                 self.key_buffer.clear();
+                self.gateway_buffer.clear();
+                self.pending_gateway = None;
+                self.gateway_replaces_defaults = false;
                 self.mode = Mode::KeyEntry;
             }
             KeyCode::Char('P') if self.selected_profile().is_some() => {
@@ -581,40 +595,142 @@ impl App {
     fn handle_key_entry(&mut self, event: KeyEvent) -> Result<()> {
         match key::apply_key_event(&mut self.key_buffer, event) {
             InputStep::Continue => {}
-            InputStep::Abort => self.mode = Mode::Normal,
+            InputStep::Abort => {
+                self.gateway_buffer.clear();
+                self.pending_gateway = None;
+                self.mode = Mode::Normal;
+            }
+            InputStep::TooLong => unreachable!(),
             InputStep::Complete => {
-                let input = std::mem::take(&mut self.key_buffer);
                 if let Some(profile) = self.selected_profile() {
                     let name = profile.name.clone();
-                    self.mode = match key::set_key(
-                        &self.manager,
-                        &name,
-                        &input,
-                        &self.executable,
-                        false,
-                        Utc::now(),
-                    ) {
-                        Ok(outcome) => {
-                            self.last_limits_refresh = None;
-                            let mut message = format!("API key saved for profile '{name}'.");
-                            if outcome.running_session {
-                                message.push_str(" Restart running sessions.");
-                            }
-                            if outcome.overrides_subscription {
-                                message.push_str(" Billing moves to the API.");
-                            }
-                            if outcome.build_path {
-                                message.push_str(" Helper uses a build directory; install cswitch and rerun key set.");
-                            }
-                            Mode::Message(message, false)
+                    let check = key::validate_key_input(&self.key_buffer)
+                        .and_then(|_| key::precheck_set_key(&self.manager, &name, false));
+                    self.mode = match check {
+                        Ok(()) => Mode::GatewayEntry,
+                        Err(error) => {
+                            self.key_buffer.clear();
+                            Mode::Message(error.to_string(), true)
                         }
-                        Err(error) => Mode::Message(error.to_string(), true),
                     };
                 } else {
+                    self.key_buffer.clear();
                     self.mode = Mode::Normal;
                 }
             }
         }
+        Ok(())
+    }
+
+    fn cancel_gateway_entry(&mut self) {
+        self.key_buffer.clear();
+        self.gateway_buffer.clear();
+        self.pending_gateway = None;
+        self.gateway_replaces_defaults = false;
+        self.mode = Mode::Normal;
+    }
+
+    fn handle_gateway_entry(&mut self, event: KeyEvent) -> Result<()> {
+        match key::apply_gateway_event(&mut self.gateway_buffer, event) {
+            InputStep::Continue => {}
+            InputStep::Abort => self.cancel_gateway_entry(),
+            InputStep::TooLong => {
+                self.cancel_gateway_entry();
+                self.mode = Mode::Message("Gateway input is too long.".into(), true);
+            }
+            InputStep::Complete => {
+                let mut input = std::mem::take(&mut self.gateway_buffer);
+                let parsed = key::parse_gateway_input(&input);
+                input.clear();
+                self.mode = match parsed {
+                    Ok(gateway) => {
+                        let confirm = matches!(gateway, GatewayInput::Json { .. });
+                        if let GatewayInput::Json { url, settings, .. } = &gateway {
+                            match gateway::read_defaults(&self.manager.base_dir) {
+                                Ok(defaults) => {
+                                    self.gateway_replaces_defaults =
+                                        defaults.get(url).is_some_and(|old| old != settings)
+                                }
+                                Err(error) => {
+                                    self.key_buffer.clear();
+                                    self.mode = Mode::Message(error.to_string(), true);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        self.pending_gateway = Some(gateway);
+                        if confirm {
+                            Mode::ConfirmGatewayDefaults
+                        } else {
+                            self.finish_key_set(false)?;
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        self.key_buffer.clear();
+                        Mode::Message(error.to_string(), true)
+                    }
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_gateway_defaults(&mut self, event: KeyEvent) -> Result<()> {
+        if event.code == KeyCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cancel_gateway_entry();
+            return Ok(());
+        }
+        match event.code {
+            KeyCode::Esc => self.cancel_gateway_entry(),
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.finish_key_set(true)?
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.finish_key_set(false)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish_key_set(&mut self, save_defaults: bool) -> Result<()> {
+        let gateway = self.pending_gateway.take().unwrap_or(GatewayInput::Keep);
+        let mut input = std::mem::take(&mut self.key_buffer);
+        self.gateway_buffer.clear();
+        let Some(profile) = self.selected_profile() else {
+            self.mode = Mode::Normal;
+            return Ok(());
+        };
+        let name = profile.name.clone();
+        self.mode = match key::set_key_with_gateway(
+            &self.manager,
+            &name,
+            &input,
+            &self.executable,
+            false,
+            &gateway,
+            save_defaults,
+            Utc::now(),
+        ) {
+            Ok(outcome) => {
+                self.last_limits_refresh = None;
+                let mut lines = vec![format!("API key saved for profile '{name}'.")];
+                lines.extend(outcome.gateway_lines);
+                if outcome.running_session {
+                    lines.push("Restart running sessions.".into());
+                }
+                if outcome.overrides_subscription {
+                    lines.push("Billing moves to the API.".into());
+                }
+                if outcome.build_path {
+                    lines.push(
+                        "Helper uses a build directory; install cswitch and rerun key set.".into(),
+                    );
+                }
+                Mode::Message(lines.join("\n"), false)
+            }
+            Err(error) => Mode::Message(error.to_string(), true),
+        };
+        input.clear();
         Ok(())
     }
 
@@ -632,6 +748,9 @@ impl App {
                     );
                     if result.foreign_helper {
                         message.push_str(" A foreign helper remains active.");
+                    }
+                    if let Some(line) = result.gateway_line {
+                        message.push_str(&format!("\n{line}"));
                     }
                     Mode::Message(message, false)
                 }
@@ -862,6 +981,8 @@ impl App {
             Mode::ConfirmRefresh => self.render_confirm_refresh_popup(f),
             Mode::ConfirmKeyClear => self.render_confirm_key_clear_popup(f),
             Mode::KeyEntry => self.render_key_entry_popup(f),
+            Mode::GatewayEntry => self.render_gateway_entry_popup(f),
+            Mode::ConfirmGatewayDefaults => self.render_confirm_gateway_defaults_popup(f),
             Mode::AddName => self.render_add_name_popup(f),
             Mode::AddChoice => self.render_add_choice_popup(f),
             Mode::LoginName => self.render_login_name_popup(f),
@@ -1246,7 +1367,14 @@ impl App {
                     self.auth_modes
                         .get(&profile.name)
                         .map(AuthMode::label)
-                        .unwrap_or("unreadable"),
+                        .unwrap_or_else(|| "unreadable".into()),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Gateway      ", Style::default().fg(DIM)),
+                Span::styled(
+                    key::gateway_info(&self.manager, &profile.name),
                     Style::default().fg(TEXT),
                 ),
             ]),
@@ -1756,9 +1884,82 @@ impl App {
                 "•".repeat(self.key_buffer.chars().count())
             )),
             Line::from(""),
-            Line::from("  Enter saves · Esc or Ctrl-C cancels"),
+            Line::from("  Enter continues · Esc or Ctrl-C cancels"),
         ];
         f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_gateway_entry_popup(&self, f: &mut Frame) {
+        let area = centered_rect(82, 9, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Gateway ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let current = self.selected_profile().map_or_else(
+            || "the Anthropic API".into(),
+            |profile| key::gateway_display(&self.manager, &profile.name),
+        );
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!("  Gateway now: {current}")),
+            Line::from(format!(
+                "  Input: {} characters (hidden)",
+                self.gateway_buffer.chars().count()
+            )),
+            Line::from(""),
+            Line::from("  Enter keeps it · \"none\" for the Anthropic API"),
+            Line::from("  Paste a URL or the provider's JSON · Esc cancels"),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_confirm_gateway_defaults_popup(&self, f: &mut Frame) {
+        let area = centered_rect(82, 12, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Save gateway defaults ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let mut lines = vec![Line::from("")];
+        if let Some(GatewayInput::Json {
+            url,
+            settings,
+            dropped,
+        }) = &self.pending_gateway
+        {
+            lines.push(Line::from(format!(
+                "  Read: {}",
+                settings.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+            if !dropped.is_empty() {
+                lines.push(Line::from(format!("  Ignored: {}", dropped.join(", "))));
+            }
+            let suffix = if self.gateway_replaces_defaults {
+                " (replaces the saved ones)"
+            } else {
+                ""
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Save these {} settings as the defaults for {url}? [Y/n]{suffix}",
+                settings.len()
+            )));
+        }
+        lines.push(Line::from("  Enter/y saves · n skips · Esc cancels"));
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     fn render_confirm_key_clear_popup(&self, f: &mut Frame) {
@@ -1779,7 +1980,11 @@ impl App {
     }
 
     fn render_message(&self, f: &mut Frame, msg: &str, is_err: bool) {
-        let area = centered_rect(60, 6, f.area());
+        let area = centered_rect(
+            78,
+            (msg.lines().count() as u16 + 5).min(f.area().height),
+            f.area(),
+        );
         f.render_widget(Clear, area);
 
         let color = if is_err { DANGER } else { SUCCESS };
@@ -1796,18 +2001,20 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         f.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {}", msg),
-                    Style::default().fg(TEXT),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press any key to continue",
-                    Style::default().fg(DIM),
-                )),
-            ]))
+            Paragraph::new(Text::from(
+                std::iter::once(Line::from(""))
+                    .chain(msg.lines().map(|line| {
+                        Line::from(Span::styled(format!("  {line}"), Style::default().fg(TEXT)))
+                    }))
+                    .chain([
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Press any key to continue",
+                            Style::default().fg(DIM),
+                        )),
+                    ])
+                    .collect::<Vec<_>>(),
+            ))
             .block(block)
             .wrap(Wrap { trim: false }),
             area,
@@ -1963,6 +2170,36 @@ mod tests {
             .unwrap();
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.key_buffer.is_empty());
+    }
+
+    #[test]
+    fn g13_gateway_modes_hide_pasted_token_and_abort_clears_both_buffers() {
+        // Known-bad: a pasted JSON token reaches a TUI frame or survives cancellation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
+            .unwrap();
+        app.key_buffer = "TESTKEY".into();
+        app.handle_key_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::GatewayEntry);
+        let json = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_AUTH_TOKEN":"TOKEN-CANARY"}}"#;
+        app.gateway_buffer = json.into();
+        assert!(!render_text(&mut app).contains("TOKEN-CANARY"));
+        app.handle_gateway_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmGatewayDefaults);
+        let frame = render_text(&mut app);
+        assert!(frame.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!frame.contains("TOKEN-CANARY"));
+        app.handle_confirm_gateway_defaults(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.key_buffer.is_empty()
+                && app.gateway_buffer.is_empty()
+                && app.pending_gateway.is_none()
+        );
     }
 
     #[test]

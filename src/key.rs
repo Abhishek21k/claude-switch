@@ -1,12 +1,14 @@
 //! Local Claude API keys. Key bytes only enter the private store or helper stdout.
 
 use crate::atomic;
+use crate::gateway::{self, GatewayInput};
 use crate::limits::read_claude_json;
 use crate::profile::{ProfileManager, shell_quote};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,11 +23,20 @@ pub enum AuthMode {
     Subscription,
     NotLoggedIn,
     Unreadable,
+    Via(Box<AuthMode>, String),
 }
 
 impl AuthMode {
-    pub fn label(&self) -> &'static str {
-        match self {
+    pub fn label(&self) -> String {
+        if let Self::Via(mode, host) = self {
+            let label = mode.label();
+            return if let Some((first, rest)) = label.split_once(", overrides") {
+                format!("{first} via {host}, overrides{rest}")
+            } else {
+                format!("{label} via {host}")
+            };
+        }
+        let label = match self {
             Self::ApiKey(Some("console")) => "API key (cswitch), overrides the Console key",
             Self::ApiKey(Some("subscription")) => "API key (cswitch), overrides the subscription",
             Self::ApiKey(_) => "API key (cswitch)",
@@ -35,11 +46,16 @@ impl AuthMode {
             Self::Subscription => "Claude subscription",
             Self::NotLoggedIn => "not logged in",
             Self::Unreadable => "unreadable",
-        }
+            Self::Via(_, _) => unreachable!(),
+        };
+        label.to_string()
     }
 
     pub fn api_billed(&self) -> bool {
-        matches!(self, Self::ApiKey(_) | Self::Console)
+        match self {
+            Self::Via(mode, _) => mode.api_billed(),
+            _ => matches!(self, Self::ApiKey(_) | Self::Console),
+        }
     }
 }
 
@@ -90,12 +106,58 @@ pub fn read_auth_mode(
     let Ok(helper) = read_helper(&path) else {
         return AuthMode::Unreadable;
     };
-    derive_auth_mode(
+    let mode = derive_auth_mode(
         name,
         claude.as_ref(),
         helper.as_deref(),
         key_path(&manager.base_dir, name).exists(),
+    );
+    match gateway_host(&path) {
+        Some(host) => AuthMode::Via(Box::new(mode), host),
+        None => mode,
+    }
+}
+
+fn gateway_host(path: &Path) -> Option<String> {
+    let json: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let value = json.get("env")?.get("ANTHROPIC_BASE_URL")?;
+    Some(
+        value
+            .as_str()
+            .and_then(|raw| gateway::normalize_base_url(raw).ok())
+            .map_or_else(
+                || "(unrecognized base URL)".into(),
+                |url| gateway::host(&url).to_string(),
+            ),
     )
+}
+
+pub fn gateway_display(manager: &ProfileManager, name: &str) -> String {
+    let path = manager.profile_dir(name).join("settings.json");
+    let Ok(bytes) = fs::read(path) else {
+        return "the Anthropic API".into();
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+        return "(unrecognized base URL)".into();
+    };
+    let Some(raw) = json.get("env").and_then(|v| v.get("ANTHROPIC_BASE_URL")) else {
+        return "the Anthropic API".into();
+    };
+    raw.as_str()
+        .and_then(|s| gateway::normalize_base_url(s).ok())
+        .unwrap_or_else(|| "(unrecognized base URL)".into())
+}
+
+pub fn gateway_info(manager: &ProfileManager, name: &str) -> String {
+    let url = gateway_display(manager, name);
+    if url == "the Anthropic API" {
+        return url;
+    }
+    let manifest = read_manifest(&manager.base_dir, name).ok().flatten();
+    match manifest {
+        Some(names) if !names.is_empty() => format!("{url} (cswitch, {} settings)", names.len()),
+        _ => format!("{url} (set outside cswitch)"),
+    }
 }
 
 fn read_helper(path: &Path) -> Result<Option<String>> {
@@ -124,8 +186,74 @@ pub fn has_key(manager: &ProfileManager, name: &str) -> bool {
 }
 
 pub fn remove_key(base_dir: &Path, name: &str) -> Result<()> {
+    // Remove sidecars before callers touch the profile directory or registry.
+    let _ = read_manifest(base_dir, name)?;
+    remove_manifest(base_dir, name)?;
+    remove_key_file(base_dir, name)
+}
+
+fn check_key_directory(base_dir: &Path) -> Result<()> {
+    let directory = base_dir.join("keys");
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            bail!("Key directory is not a regular directory.")
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_key_file(base_dir: &Path, name: &str) -> Result<()> {
+    check_key_directory(base_dir)?;
     let path = key_path(base_dir, name);
     match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn manifest_path(base_dir: &Path, name: &str) -> PathBuf {
+    base_dir.join("keys").join(format!("{name}.gateway"))
+}
+
+fn read_manifest(base_dir: &Path, name: &str) -> Result<Option<BTreeSet<String>>> {
+    check_key_directory(base_dir)?;
+    let path = manifest_path(base_dir, name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("Gateway manifest is unsafe or invalid."),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Gateway manifest is unsafe or invalid.");
+    }
+    let bytes =
+        fs::read(path).map_err(|_| anyhow::anyhow!("Gateway manifest is unsafe or invalid."))?;
+    let names: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Gateway manifest is unsafe or invalid."))?;
+    if names
+        .iter()
+        .any(|name| !gateway::valid_env_name(name) || gateway::credential_name(name))
+        || names.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        bail!("Gateway manifest is unsafe or invalid.");
+    }
+    Ok(Some(names.into_iter().collect()))
+}
+
+fn write_manifest(base_dir: &Path, name: &str, names: &BTreeSet<String>) -> Result<()> {
+    check_key_directory(base_dir)?;
+    atomic::write_private(
+        &manifest_path(base_dir, name),
+        &serde_json::to_vec(&names.iter().collect::<Vec<_>>())?,
+    )
+}
+
+fn remove_manifest(base_dir: &Path, name: &str) -> Result<()> {
+    check_key_directory(base_dir)?;
+    match fs::remove_file(manifest_path(base_dir, name)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -146,13 +274,23 @@ fn valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+pub fn validate_key_input(input: &str) -> Result<&str> {
+    let key = input.trim();
+    if !valid_key(key) {
+        let lower = key.to_ascii_lowercase();
+        if key.starts_with('{') || lower.starts_with("http://") || lower.starts_with("https://") {
+            bail!(
+                "That looks like a URL or JSON: paste the key first; the gateway step comes next."
+            );
+        }
+        bail!("API key must contain only alphanumeric characters, dashes, underscores.");
+    }
+    Ok(key)
+}
+
 fn store_key(base_dir: &Path, name: &str, key: &str) -> Result<()> {
     let directory = base_dir.join("keys");
-    if let Ok(metadata) = fs::symlink_metadata(&directory)
-        && !metadata.file_type().is_dir()
-    {
-        bail!("Key directory is not a regular directory.");
-    }
+    check_key_directory(base_dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -173,8 +311,39 @@ pub struct SetOutcome {
     pub running_session: bool,
     pub overrides_subscription: bool,
     pub build_path: bool,
+    pub gateway_lines: Vec<String>,
 }
 
+pub fn precheck_set_key(manager: &ProfileManager, name: &str, replace_helper: bool) -> Result<()> {
+    if !valid_name(name) {
+        bail!("Invalid profile name.");
+    }
+    manager.get_profile(name)?;
+    let settings = manager.profile_dir(name).join("settings.json");
+    let state = read_settings(&settings)?;
+    let _ = read_manifest(&manager.base_dir, name)?;
+    let object = state
+        .json
+        .as_object()
+        .expect("read_settings returns an object");
+    if object.get("env").is_some_and(|value| !value.is_object()) {
+        bail!("settings.json env is not an object.");
+    }
+    if object.contains_key("apiKeyHelper")
+        && object
+            .get("apiKeyHelper")
+            .and_then(Value::as_str)
+            .and_then(managed_helper_name)
+            .as_deref()
+            != Some(name)
+        && !replace_helper
+    {
+        bail!("settings.json has a foreign apiKeyHelper; use --replace-helper to replace it.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn set_key(
     manager: &ProfileManager,
     name: &str,
@@ -183,35 +352,127 @@ pub fn set_key(
     replace_helper: bool,
     now: DateTime<Utc>,
 ) -> Result<SetOutcome> {
-    if !valid_name(name) {
-        bail!("Invalid profile name.");
-    }
-    manager.get_profile(name)?;
-    let key = input.trim();
-    if !valid_key(key) {
-        bail!("API key must contain only alphanumeric characters, dashes, underscores.");
-    }
+    set_key_with_gateway(
+        manager,
+        name,
+        input,
+        executable,
+        replace_helper,
+        &GatewayInput::Keep,
+        false,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // CLI and TUI share this complete, atomic key operation.
+pub fn set_key_with_gateway(
+    manager: &ProfileManager,
+    name: &str,
+    input: &str,
+    executable: &Path,
+    replace_helper: bool,
+    gateway_input: &GatewayInput,
+    save_defaults: bool,
+    now: DateTime<Utc>,
+) -> Result<SetOutcome> {
+    let key = validate_key_input(input)?;
+    precheck_set_key(manager, name, replace_helper)?;
     let executable = fs::canonicalize(executable).context("Cannot resolve cswitch executable")?;
     let helper = format!(
         "{} key print {name}",
         shell_quote(&executable.to_string_lossy())
     );
     let settings = manager.profile_dir(name).join("settings.json");
-    // Refuse a foreign or malformed settings file before storing the secret.
-    let _ = merge_settings(
-        &read_settings(&settings)?.json,
-        name,
-        Edit::Set(&helper, replace_helper),
-    )?;
+    let old_names = read_manifest(&manager.base_dir, name)?.unwrap_or_default();
+    let mut defaults = if matches!(gateway_input, GatewayInput::Url(_)) || save_defaults {
+        Some(gateway::read_defaults(&manager.base_dir)?)
+    } else {
+        None
+    };
+    let new_settings: BTreeMap<String, String> = match gateway_input {
+        GatewayInput::Keep | GatewayInput::Remove => BTreeMap::new(),
+        GatewayInput::Url(url) => defaults
+            .as_ref()
+            .and_then(|saved| saved.get(url))
+            .cloned()
+            .unwrap_or_else(|| BTreeMap::from([("ANTHROPIC_BASE_URL".into(), url.clone())])),
+        GatewayInput::Json { settings, .. } => settings.clone(),
+    };
+    let new_names: BTreeSet<String> = match gateway_input {
+        GatewayInput::Keep => old_names.clone(),
+        _ => new_settings.keys().cloned().collect(),
+    };
+    let had_saved_defaults = match gateway_input {
+        GatewayInput::Url(url) => defaults
+            .as_ref()
+            .is_some_and(|saved| saved.contains_key(url)),
+        _ => false,
+    };
+    let gateway_edit = match gateway_input {
+        GatewayInput::Keep => GatewayEdit::Keep,
+        GatewayInput::Remove => GatewayEdit::Remove,
+        _ => GatewayEdit::Set(&new_settings),
+    };
+    let edit = Edit::Set {
+        helper: &helper,
+        replace: replace_helper,
+        gateway: gateway_edit,
+        owned: &old_names,
+    };
+    // Dry-run the complete merge before either sidecar or settings is written.
+    let preview = merge_settings(&read_settings(&settings)?.json, name, edit)?;
     store_key(&manager.base_dir, name, key)?;
-    edit_settings(
-        &settings,
-        &manager.base_dir,
-        name,
-        Edit::Set(&helper, replace_helper),
-        now,
-        |_| {},
-    )?;
+    if !matches!(gateway_input, GatewayInput::Keep) {
+        let union = old_names.union(&new_names).cloned().collect();
+        write_manifest(&manager.base_dir, name, &union)?;
+    }
+    edit_settings(&settings, &manager.base_dir, name, edit, now, |_| {})?;
+    if !matches!(gateway_input, GatewayInput::Keep) {
+        if new_names.is_empty() {
+            remove_manifest(&manager.base_dir, name)?;
+        } else {
+            write_manifest(&manager.base_dir, name, &new_names)?;
+        }
+    }
+    if save_defaults && let GatewayInput::Json { url, .. } = gateway_input {
+        let saved = defaults.get_or_insert_with(BTreeMap::new);
+        saved.insert(url.clone(), new_settings.clone());
+        gateway::write_defaults(&manager.base_dir, saved)?;
+    }
+    let mut gateway_lines = match gateway_input {
+        GatewayInput::Keep => vec![format!(
+            "Gateway unchanged: {}.",
+            gateway_display(manager, name)
+        )],
+        GatewayInput::Remove => vec!["Gateway removed: the key goes to the Anthropic API.".into()],
+        GatewayInput::Url(url) => {
+            if had_saved_defaults {
+                vec![format!(
+                    "Using the {} saved settings for {url}.",
+                    new_settings.len()
+                )]
+            } else {
+                vec![format!(
+                    "No saved defaults for {url}: only the base URL is set. Paste the provider's JSON to save some."
+                )]
+            }
+        }
+        GatewayInput::Json { url, dropped, .. } => {
+            let mut lines = vec![format!("Gateway: {url} ({} settings).", new_settings.len())];
+            for name in dropped {
+                lines.push(format!(
+                    "Ignored {name}: the key comes only from the key prompt."
+                ));
+            }
+            if save_defaults {
+                lines.push(format!("Saved as the defaults for {url}."));
+            }
+            lines
+        }
+    };
+    for name in preview.overwritten {
+        gateway_lines.push(format!("Replaced {name}, which cswitch didn't set."));
+    }
     let claude = read_claude_json(&manager.profile_dir(name)).ok().flatten();
     let overrides_subscription = claude
         .as_ref()
@@ -222,12 +483,14 @@ pub fn set_key(
         build_path: executable
             .components()
             .any(|component| component.as_os_str() == "target"),
+        gateway_lines,
     })
 }
 
 pub struct ClearOutcome {
     pub foreign_helper: bool,
     pub fallback: &'static str,
+    pub gateway_line: Option<String>,
 }
 
 pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Result<ClearOutcome> {
@@ -236,8 +499,20 @@ pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Re
     }
     manager.get_profile(name)?;
     let settings = manager.profile_dir(name).join("settings.json");
-    let result = edit_settings(&settings, &manager.base_dir, name, Edit::Clear, now, |_| {})?;
-    remove_key(&manager.base_dir, name)?;
+    let old_names = read_manifest(&manager.base_dir, name)?.unwrap_or_default();
+    let old_gateway = gateway_display(manager, name);
+    let result = edit_settings(
+        &settings,
+        &manager.base_dir,
+        name,
+        Edit::Clear { owned: &old_names },
+        now,
+        |_| {},
+    )?;
+    remove_key_file(&manager.base_dir, name)?;
+    if !result.foreign_helper {
+        remove_manifest(&manager.base_dir, name)?;
+    }
     let claude = read_claude_json(&manager.profile_dir(name)).ok().flatten();
     let fallback = if claude
         .as_ref()
@@ -255,6 +530,20 @@ pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Re
     Ok(ClearOutcome {
         foreign_helper: result.foreign_helper,
         fallback,
+        gateway_line: if result.removed_gateway {
+            let host =
+                if old_gateway == "the Anthropic API" || old_gateway == "(unrecognized base URL)" {
+                    old_gateway
+                } else {
+                    gateway::host(&old_gateway).to_string()
+                };
+            Some(format!(
+                "Removed the gateway ({host}, {} settings).",
+                old_names.len().max(1)
+            ))
+        } else {
+            None
+        },
     })
 }
 
@@ -392,14 +681,30 @@ fn read_settings(path: &Path) -> Result<SettingsState> {
 
 #[derive(Clone, Copy)]
 enum Edit<'a> {
-    Set(&'a str, bool),
-    Clear,
+    Set {
+        helper: &'a str,
+        replace: bool,
+        gateway: GatewayEdit<'a>,
+        owned: &'a BTreeSet<String>,
+    },
+    Clear {
+        owned: &'a BTreeSet<String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum GatewayEdit<'a> {
+    Keep,
+    Remove,
+    Set(&'a BTreeMap<String, String>),
 }
 
 struct Merge {
     json: Value,
     changed: bool,
     foreign_helper: bool,
+    overwritten: Vec<String>,
+    removed_gateway: bool,
 }
 
 fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
@@ -412,36 +717,127 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
     let foreign = present;
     let managed = current.and_then(managed_helper_name);
     match edit {
-        Edit::Set(helper, replace) => {
+        Edit::Set {
+            helper,
+            replace,
+            gateway,
+            owned,
+        } => {
             if present && managed.as_deref() != Some(name) && !replace {
                 bail!(
                     "settings.json has a foreign apiKeyHelper; use --replace-helper to replace it."
                 );
             }
-            let changed = current != Some(helper);
+            let mut changed = current != Some(helper);
             object.insert(
                 "apiKeyHelper".to_string(),
                 Value::String(helper.to_string()),
             );
+            let mut overwritten = Vec::new();
+            if !matches!(gateway, GatewayEdit::Keep) {
+                let env = match object.get_mut("env") {
+                    Some(value) => value
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("settings.json env is not an object."))?,
+                    None => {
+                        object.insert("env".into(), Value::Object(Map::new()));
+                        object
+                            .get_mut("env")
+                            .and_then(Value::as_object_mut)
+                            .expect("inserted object")
+                    }
+                };
+                let before = env.clone();
+                match gateway {
+                    GatewayEdit::Keep => unreachable!(),
+                    GatewayEdit::Remove => {
+                        env.remove("ANTHROPIC_BASE_URL");
+                        for name in owned {
+                            env.remove(name);
+                        }
+                    }
+                    GatewayEdit::Set(settings) => {
+                        env.remove("ANTHROPIC_BASE_URL");
+                        for name in owned {
+                            env.remove(name);
+                        }
+                        for (name, value) in settings {
+                            if before.contains_key(name)
+                                && !owned.contains(name)
+                                && before.get(name) != Some(&Value::String(value.clone()))
+                            {
+                                overwritten.push(name.clone());
+                            }
+                            env.insert(name.clone(), Value::String(value.clone()));
+                        }
+                    }
+                }
+                changed |= *env != before;
+                if env.is_empty() {
+                    changed = true;
+                    object.remove("env");
+                }
+            } else if object.get("env").is_some_and(|value| !value.is_object()) {
+                bail!("settings.json env is not an object.");
+            }
             Ok(Merge {
                 json,
                 changed,
                 foreign_helper: false,
+                overwritten,
+                removed_gateway: false,
             })
         }
-        Edit::Clear => {
+        Edit::Clear { owned } => {
             if managed.as_deref() == Some(name) {
                 object.remove("apiKeyHelper");
+                let mut removed_gateway = false;
+                if let Some(env) = object.get_mut("env") {
+                    let env = env
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("settings.json env is not an object."))?;
+                    removed_gateway |= env.remove("ANTHROPIC_BASE_URL").is_some();
+                    for entry in owned {
+                        removed_gateway |= env.remove(entry).is_some();
+                    }
+                    if env.is_empty() {
+                        object.remove("env");
+                    }
+                }
                 Ok(Merge {
                     json,
                     changed: true,
                     foreign_helper: false,
+                    overwritten: Vec::new(),
+                    removed_gateway,
+                })
+            } else if !present && !owned.is_empty() {
+                let mut removed_gateway = false;
+                if let Some(env) = object.get_mut("env") {
+                    let env = env
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("settings.json env is not an object."))?;
+                    for entry in owned {
+                        removed_gateway |= env.remove(entry).is_some();
+                    }
+                    if env.is_empty() {
+                        object.remove("env");
+                    }
+                }
+                Ok(Merge {
+                    json,
+                    changed: removed_gateway,
+                    foreign_helper: false,
+                    overwritten: Vec::new(),
+                    removed_gateway,
                 })
             } else {
                 Ok(Merge {
                     json,
                     changed: false,
                     foreign_helper: foreign,
+                    overwritten: Vec::new(),
+                    removed_gateway: false,
                 })
             }
         }
@@ -450,6 +846,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
 
 struct EditOutcome {
     foreign_helper: bool,
+    removed_gateway: bool,
 }
 
 fn edit_settings<F: FnMut(usize)>(
@@ -466,6 +863,7 @@ fn edit_settings<F: FnMut(usize)>(
         if !merged.changed {
             return Ok(EditOutcome {
                 foreign_helper: merged.foreign_helper,
+                removed_gateway: merged.removed_gateway,
             });
         }
         let bytes = serde_json::to_vec_pretty(&merged.json)?;
@@ -498,6 +896,7 @@ fn edit_settings<F: FnMut(usize)>(
         if result? {
             return Ok(EditOutcome {
                 foreign_helper: false,
+                removed_gateway: merged.removed_gateway,
             });
         }
     }
@@ -523,7 +922,7 @@ fn backup_settings(base_dir: &Path, name: &str, original: &[u8], now: DateTime<U
 }
 
 /// Remove a copied command that would bill a different profile's key.
-pub fn strip_copied_helper(path: &Path) -> Result<()> {
+pub fn strip_copied_helper(path: &Path, base_dir: &Path) -> Result<()> {
     let Some(metadata) = fs::symlink_metadata(path).ok() else {
         return Ok(());
     };
@@ -533,13 +932,26 @@ pub fn strip_copied_helper(path: &Path) -> Result<()> {
     let object = json
         .as_object_mut()
         .context("Copied settings.json is not a JSON object.")?;
-    if object
+    if let Some(source_name) = object
         .get("apiKeyHelper")
         .and_then(Value::as_str)
         .and_then(managed_helper_name)
-        .is_some()
     {
         object.remove("apiKeyHelper");
+        if object.get("env").is_some_and(|value| !value.is_object()) {
+            bail!("Copied settings.json env is not an object.");
+        }
+        if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+            env.remove("ANTHROPIC_BASE_URL");
+            if let Some(names) = read_manifest(base_dir, &source_name).ok().flatten() {
+                for name in names {
+                    env.remove(&name);
+                }
+            }
+            if env.is_empty() {
+                object.remove("env");
+            }
+        }
         let output = serde_json::to_vec_pretty(&json)?;
         atomic::write_private(path, &output)?;
         #[cfg(unix)]
@@ -555,6 +967,7 @@ pub enum InputStep {
     Continue,
     Complete,
     Abort,
+    TooLong,
 }
 
 pub fn apply_key_event(buffer: &mut String, key: KeyEvent) -> InputStep {
@@ -587,6 +1000,33 @@ pub fn apply_key_event(buffer: &mut String, key: KeyEvent) -> InputStep {
     }
 }
 
+pub fn apply_gateway_event(buffer: &mut String, key: KeyEvent) -> InputStep {
+    if key.kind != KeyEventKind::Press {
+        return InputStep::Continue;
+    }
+    if key.code == KeyCode::Enter {
+        let trimmed = buffer.trim();
+        if trimmed.is_empty()
+            || !trimmed.starts_with('{')
+            || serde_json::from_str::<Value>(trimmed).is_ok()
+        {
+            return InputStep::Complete;
+        }
+        buffer.push('\n');
+    } else {
+        match apply_key_event(buffer, key) {
+            InputStep::Continue => {}
+            step => return step,
+        }
+    }
+    if buffer.len() > 65_536 {
+        buffer.clear();
+        InputStep::TooLong
+    } else {
+        InputStep::Continue
+    }
+}
+
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
@@ -611,12 +1051,42 @@ pub fn read_key_input() -> Result<String> {
                 InputStep::Continue => {}
                 InputStep::Complete => break Ok(buffer),
                 InputStep::Abort => break Err(anyhow::anyhow!("API key entry cancelled.")),
+                InputStep::TooLong => unreachable!(),
             }
         }
     };
     drop(guard);
     println!();
     result
+}
+
+pub fn read_gateway_input(current: &str) -> Result<GatewayInput> {
+    println!("Gateway now: {current}");
+    println!(
+        "Base URL, or the provider's settings JSON (hidden; Enter keeps it, \"none\" for the Anthropic API):"
+    );
+    io::stdout().flush()?;
+    crossterm::terminal::enable_raw_mode()?;
+    let guard = RawModeGuard;
+    let mut buffer = String::new();
+    let result = loop {
+        if let Event::Key(key) = event::read()? {
+            match apply_gateway_event(&mut buffer, key) {
+                InputStep::Continue => {}
+                InputStep::Complete => break parse_gateway_input(&buffer),
+                InputStep::Abort => break Err(anyhow::anyhow!("Gateway entry cancelled.")),
+                InputStep::TooLong => break Err(anyhow::anyhow!("Gateway input is too long.")),
+            }
+        }
+    };
+    buffer.clear();
+    drop(guard);
+    println!();
+    result
+}
+
+pub fn parse_gateway_input(input: &str) -> Result<GatewayInput> {
+    gateway::parse_gateway_input(input)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,6 +1159,21 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
     use tempfile::TempDir;
+
+    static EMPTY_NAMES: BTreeSet<String> = BTreeSet::new();
+    fn test_set(helper: &str, replace: bool) -> Edit<'_> {
+        Edit::Set {
+            helper,
+            replace,
+            gateway: GatewayEdit::Keep,
+            owned: &EMPTY_NAMES,
+        }
+    }
+    fn test_clear() -> Edit<'static> {
+        Edit::Clear {
+            owned: &EMPTY_NAMES,
+        }
+    }
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()
@@ -776,30 +1261,30 @@ mod tests {
     fn settings_merge_preserves_other_fields_and_refuses_bad_inputs() {
         // Known-bad: a string replacement loses unrelated fields or clear removes a foreign helper.
         let source = json!({"theme":"dark", "permissions":{"allow":["Read"]}, "apiKeyHelper":"foreign helper"});
-        assert!(merge_settings(&source, "n", Edit::Set("cswitch key print n", false)).is_err());
-        let merged = merge_settings(&source, "n", Edit::Set("cswitch key print n", true)).unwrap();
+        assert!(merge_settings(&source, "n", test_set("cswitch key print n", false)).is_err());
+        let merged = merge_settings(&source, "n", test_set("cswitch key print n", true)).unwrap();
         assert_eq!(merged.json["theme"], "dark");
         assert_eq!(merged.json["permissions"]["allow"][0], "Read");
-        let foreign = merge_settings(&source, "n", Edit::Clear).unwrap();
+        let foreign = merge_settings(&source, "n", test_clear()).unwrap();
         assert!(!foreign.changed);
         assert_eq!(foreign.json, source);
         let other = json!({"apiKeyHelper":"cswitch key print other"});
-        assert!(!merge_settings(&other, "n", Edit::Clear).unwrap().changed);
+        assert!(!merge_settings(&other, "n", test_clear()).unwrap().changed);
         let owned = json!({"theme":"dark", "apiKeyHelper":"cswitch key print n"});
         assert_eq!(
-            merge_settings(&owned, "n", Edit::Clear).unwrap().json,
+            merge_settings(&owned, "n", test_clear()).unwrap().json,
             json!({"theme":"dark"})
         );
         assert!(
             merge_settings(
                 &json!({"apiKeyHelper":42}),
                 "n",
-                Edit::Set("cswitch key print n", false)
+                test_set("cswitch key print n", false)
             )
             .is_err()
         );
         assert_eq!(
-            merge_settings(&json!({}), "n", Edit::Set("cswitch key print n", false))
+            merge_settings(&json!({}), "n", test_set("cswitch key print n", false))
                 .unwrap()
                 .json,
             json!({"apiKeyHelper":"cswitch key print n"})
@@ -983,7 +1468,7 @@ mod tests {
             &path,
             tmp.path(),
             "n",
-            Edit::Set("cswitch key print n", false),
+            test_set("cswitch key print n", false),
             now(),
             |attempt| {
                 if attempt == 0 {
@@ -1013,7 +1498,7 @@ mod tests {
                 &path,
                 tmp.path(),
                 "n",
-                Edit::Set("cswitch key print n", false),
+                test_set("cswitch key print n", false),
                 now(),
                 |_| {}
             )
@@ -1025,7 +1510,7 @@ mod tests {
             &path,
             tmp.path(),
             "n",
-            Edit::Set("cswitch key print n", false),
+            test_set("cswitch key print n", false),
             now(),
             |_| {},
         )
@@ -1049,7 +1534,7 @@ mod tests {
             &path,
             tmp.path(),
             "n",
-            Edit::Set("cswitch key print n", false),
+            test_set("cswitch key print n", false),
             now(),
             |_| {},
         )
@@ -1062,7 +1547,7 @@ mod tests {
                 0o600
             );
             fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-            edit_settings(&path, tmp.path(), "n", Edit::Clear, now(), |_| {}).unwrap();
+            edit_settings(&path, tmp.path(), "n", test_clear(), now(), |_| {}).unwrap();
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o640
@@ -1169,5 +1654,365 @@ mod tests {
         assert!(set_key(&manager, "n", "bad key", &executable, false, now()).is_err());
         assert!(!has_key(&manager, "n"));
         assert!(!manager.profile_dir("n").join("settings.json").exists());
+    }
+
+    #[test]
+    fn g4_gateway_enter_waits_for_complete_json_and_aborts_cleanly() {
+        // Known-bad: the first Enter truncates a multi-line JSON paste.
+        let mut buffer = String::new();
+        for ch in "{\"env\": {".chars() {
+            assert_eq!(
+                apply_gateway_event(
+                    &mut buffer,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                ),
+                InputStep::Continue
+            );
+        }
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Continue
+        );
+        for ch in "\"ANTHROPIC_BASE_URL\":\"https://gateway.example.com\"}}".chars() {
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Complete
+        );
+        assert!(matches!(
+            parse_gateway_input(&buffer).unwrap(),
+            GatewayInput::Json { .. }
+        ));
+        buffer.clear();
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Complete
+        );
+        buffer.push_str("https://gateway.example.com");
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            InputStep::Complete
+        );
+        assert_eq!(
+            apply_gateway_event(&mut buffer, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputStep::Abort
+        );
+        assert!(buffer.is_empty());
+        buffer.push('x');
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            InputStep::Abort
+        );
+        assert!(buffer.is_empty());
+        buffer = "x".repeat(65_536);
+        assert_eq!(
+            apply_gateway_event(
+                &mut buffer,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            InputStep::TooLong
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn g5_json_set_uses_one_settings_backup_and_exact_manifest() {
+        // Known-bad: writing helper and gateway separately makes two backups or loses ownership names.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        let input = parse_gateway_input(r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com/a","ANTHROPIC_MODEL":"vendor/claude-model","ANTHROPIC_AUTH_TOKEN":"TOKEN-CANARY"}}"#).unwrap();
+        let outcome = set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &input,
+            true,
+            now(),
+        )
+        .unwrap();
+        let json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            json["apiKeyHelper"]
+                .as_str()
+                .unwrap()
+                .contains("key print n")
+        );
+        assert_eq!(
+            json["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example.com/a"
+        );
+        assert_eq!(json["env"]["ANTHROPIC_MODEL"], "vendor/claude-model");
+        assert!(json["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert_eq!(
+            read_manifest(&manager.base_dir, "n").unwrap().unwrap(),
+            BTreeSet::from(["ANTHROPIC_BASE_URL".into(), "ANTHROPIC_MODEL".into()])
+        );
+        assert_eq!(
+            fs::read_dir(manager.base_dir.join("backups/settings/n"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            outcome
+                .gateway_lines
+                .iter()
+                .any(|line| line.contains("Ignored ANTHROPIC_AUTH_TOKEN"))
+        );
+        assert!(
+            !fs::read(manager.base_dir.join("gateways.json"))
+                .unwrap()
+                .windows(12)
+                .any(|window| window == b"TOKEN-CANARY")
+        );
+    }
+
+    #[test]
+    fn g6_switch_removes_old_names_and_reports_foreign_overwrite() {
+        // Known-bad: old manifest names survive a gateway switch, or a foreign override stays silent.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let first = parse_gateway_input(
+            r#"{"ANTHROPIC_BASE_URL":"https://gateway.example.com/first","A":"a","B":"b"}"#,
+        )
+        .unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &first,
+            false,
+            now(),
+        )
+        .unwrap();
+        let path = manager.profile_dir("n").join("settings.json");
+        let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["env"]["C"] = Value::String("foreign".into());
+        json["env"]["OTHER"] = Value::String("preserve".into());
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let second = parse_gateway_input(
+            r#"{"ANTHROPIC_BASE_URL":"https://gateway.example.com/second","C":"new"}"#,
+        )
+        .unwrap();
+        let outcome = set_key_with_gateway(
+            &manager,
+            "n",
+            "NEWKEY",
+            &executable,
+            false,
+            &second,
+            false,
+            now(),
+        )
+        .unwrap();
+        let result: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            result["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example.com/second"
+        );
+        assert_eq!(result["env"]["C"], "new");
+        assert_eq!(result["env"]["OTHER"], "preserve");
+        assert!(result["env"].get("A").is_none() && result["env"].get("B").is_none());
+        assert!(
+            outcome
+                .gateway_lines
+                .iter()
+                .any(|line| line == "Replaced C, which cswitch didn't set.")
+        );
+    }
+
+    #[test]
+    fn g7_keep_preserves_env_for_managed_and_foreign_gateway() {
+        // Known-bad: Enter at the gateway step wipes or reserializes env settings.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        let original = json!({"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_MODEL":"vendor/claude-model"},"apiKeyHelper":"foreign helper"});
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            true,
+            &GatewayInput::Keep,
+            false,
+            now(),
+        )
+        .unwrap();
+        let first: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(first["env"], original["env"]);
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "NEWKEY",
+            &executable,
+            false,
+            &GatewayInput::Keep,
+            false,
+            now(),
+        )
+        .unwrap();
+        let second: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(second["env"], original["env"]);
+    }
+
+    #[test]
+    fn g8_clear_removes_base_even_without_manifest() {
+        // Known-bad: clear leaves ANTHROPIC_BASE_URL and sends the fallback login to the gateway.
+        let (_tmp, manager, executable) = manager_with_profile();
+        set_key(&manager, "n", "TESTKEY", &executable, false, now()).unwrap();
+        let path = manager.profile_dir("n").join("settings.json");
+        let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["env"] = json!({"ANTHROPIC_BASE_URL":"https://gateway.example.com","OTHER":"keep"});
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let result = clear_key(&manager, "n", now()).unwrap();
+        let cleared: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cleared["env"], json!({"OTHER":"keep"}));
+        assert!(cleared.get("apiKeyHelper").is_none());
+        assert!(result.gateway_line.unwrap().contains("gateway.example.com"));
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn g9_foreign_helper_clear_keeps_settings_and_manifest() {
+        // Known-bad: clear removes a foreign helper's gateway settings.
+        let (_tmp, manager, _) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        let bytes = br#"{"apiKeyHelper":"foreign helper","env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com"}}"#;
+        fs::write(&path, bytes).unwrap();
+        write_manifest(
+            &manager.base_dir,
+            "n",
+            &BTreeSet::from(["ANTHROPIC_BASE_URL".into()]),
+        )
+        .unwrap();
+        store_key(&manager.base_dir, "n", "TESTKEY").unwrap();
+        let outcome = clear_key(&manager, "n", now()).unwrap();
+        assert!(outcome.foreign_helper);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(manifest_path(&manager.base_dir, "n").exists());
+        assert!(!has_key(&manager, "n"));
+    }
+
+    #[test]
+    fn g12_url_applies_normalized_defaults_and_unknown_sets_base_only() {
+        // Known-bad: defaults are keyed by the raw pasted URL, or an unknown URL inherits stale names.
+        let (_tmp, manager, executable) = manager_with_profile();
+        let json = parse_gateway_input(r#"{"ANTHROPIC_BASE_URL":"https://gateway.example.com/a","ANTHROPIC_MODEL":"vendor/claude-model"}"#).unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "TESTKEY",
+            &executable,
+            false,
+            &json,
+            true,
+            now(),
+        )
+        .unwrap();
+        let url = parse_gateway_input("HTTPS://GATEWAY.EXAMPLE.COM/a/").unwrap();
+        let result = set_key_with_gateway(
+            &manager,
+            "n",
+            "NEWKEY",
+            &executable,
+            false,
+            &url,
+            false,
+            now(),
+        )
+        .unwrap();
+        assert!(result.gateway_lines[0].contains("Using the 2 saved settings"));
+        let unknown = parse_gateway_input("https://gateway.example.com/b").unwrap();
+        set_key_with_gateway(
+            &manager,
+            "n",
+            "NEWKEY",
+            &executable,
+            false,
+            &unknown,
+            false,
+            now(),
+        )
+        .unwrap();
+        let settings: Value = serde_json::from_slice(
+            &fs::read(manager.profile_dir("n").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["env"],
+            json!({"ANTHROPIC_BASE_URL":"https://gateway.example.com/b"})
+        );
+    }
+
+    #[test]
+    fn g14_display_uses_normalized_or_masked_url() {
+        // Known-bad: info or Auth prints an untrusted raw URL with a token query.
+        let (_tmp, manager, _) = manager_with_profile();
+        let path = manager.profile_dir("n").join("settings.json");
+        fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"HTTPS://GATEWAY.EXAMPLE.COM/a/"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gateway_info(&manager, "n"),
+            "https://gateway.example.com/a (set outside cswitch)"
+        );
+        assert!(
+            read_auth_mode(&manager, "n", Ok(None))
+                .label()
+                .contains("via gateway.example.com")
+        );
+        fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com/?token=TOKEN-CANARY"}}"#,
+        )
+        .unwrap();
+        assert!(gateway_info(&manager, "n").contains("(unrecognized base URL)"));
+        assert!(
+            !read_auth_mode(&manager, "n", Ok(None))
+                .label()
+                .contains("TOKEN-CANARY")
+        );
+    }
+
+    #[test]
+    fn g15_mistaken_key_paste_fails_before_writing() {
+        // Known-bad: a URL or JSON at the first prompt is stored as the API key.
+        let (_tmp, manager, executable) = manager_with_profile();
+        for input in ["https://gateway.example.com", "{\"env\":{}}"] {
+            let error = set_key(&manager, "n", input, &executable, false, now())
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "That looks like a URL or JSON: paste the key first; the gateway step comes next."
+            );
+            assert!(!has_key(&manager, "n"));
+        }
     }
 }

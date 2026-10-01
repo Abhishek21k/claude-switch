@@ -638,7 +638,7 @@ impl ProfileManager {
             fs::remove_file(&creds)?;
         }
         sanitize_claude_json(&profile_dir.join(".claude.json"))?;
-        strip_copied_helper(&profile_dir.join("settings.json"))?;
+        strip_copied_helper(&profile_dir.join("settings.json"), &self.base_dir)?;
 
         Ok(true)
     }
@@ -658,6 +658,9 @@ impl ProfileManager {
         if !src.exists() {
             bail!("Source directory '{}' does not exist.", src.display());
         }
+        if force {
+            remove_key(&self.base_dir, name)?;
+        }
         let dest = self.profiles_dir.join(name);
         if dest.exists() {
             if force {
@@ -670,10 +673,7 @@ impl ProfileManager {
             }
         }
         copy_dir_all_filtered(&src, &dest, &seed_skip(include_history))?;
-        strip_copied_helper(&dest.join("settings.json"))?;
-        if force {
-            remove_key(&self.base_dir, name)?;
-        }
+        strip_copied_helper(&dest.join("settings.json"), &self.base_dir)?;
         self.seed_skills_from(&src.join("skills"), &dest);
         let email = read_email_from_dir(&dest);
         let profile = Profile {
@@ -2376,11 +2376,17 @@ mod tests {
 
     #[test]
     fn seeded_and_copied_settings_drop_source_managed_helper() {
-        // Known-bad: a copied helper bills the source profile's key.
+        // Known-bad: a copied helper or base URL sends the new login to the source gateway.
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         fs::create_dir_all(&mgr.claude_home).unwrap();
-        let settings = serde_json::json!({"theme":"dark", "apiKeyHelper":"'/opt/tools/cswitch' key print source"});
+        fs::create_dir_all(mgr.base_dir.join("keys")).unwrap();
+        fs::write(
+            mgr.base_dir.join("keys/source.gateway"),
+            r#"["ANTHROPIC_BASE_URL","ANTHROPIC_MODEL"]"#,
+        )
+        .unwrap();
+        let settings = serde_json::json!({"theme":"dark", "apiKeyHelper":"'/opt/tools/cswitch' key print source", "env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_MODEL":"vendor/claude-model","OTHER":"keep"}});
         fs::write(mgr.claude_home.join("settings.json"), settings.to_string()).unwrap();
         let dest = mgr.profile_dir("seeded");
         fs::create_dir_all(&dest).unwrap();
@@ -2389,6 +2395,7 @@ mod tests {
             serde_json::from_slice(&fs::read(dest.join("settings.json")).unwrap()).unwrap();
         assert!(seeded.get("apiKeyHelper").is_none());
         assert_eq!(seeded["theme"], "dark");
+        assert_eq!(seeded["env"], serde_json::json!({"OTHER":"keep"}));
         mgr.add_profile_from("copied", &mgr.claude_home).unwrap();
         let copied: serde_json::Value = serde_json::from_slice(
             &fs::read(mgr.profile_dir("copied").join("settings.json")).unwrap(),
@@ -2396,11 +2403,12 @@ mod tests {
         .unwrap();
         assert!(copied.get("apiKeyHelper").is_none());
         assert_eq!(copied["theme"], "dark");
+        assert_eq!(copied["env"], serde_json::json!({"OTHER":"keep"}));
     }
 
     #[test]
     fn remove_and_refresh_delete_saved_key() {
-        // Known-bad: deleting or refreshing a profile leaves its key orphaned.
+        // Known-bad: deleting or refreshing a profile leaves a key or gateway manifest orphaned.
         let tmp = TempDir::new().unwrap();
         let mgr = make_manager(&tmp);
         let source = tmp.path().join("source");
@@ -2414,9 +2422,21 @@ mod tests {
             "synthetic\n",
         )
         .unwrap();
+        fs::write(
+            crate::key::manifest_path(&mgr.base_dir, "remove"),
+            r#"["ANTHROPIC_BASE_URL"]"#,
+        )
+        .unwrap();
+        fs::write(
+            crate::key::manifest_path(&mgr.base_dir, "refresh"),
+            r#"["ANTHROPIC_BASE_URL"]"#,
+        )
+        .unwrap();
         mgr.remove_profile("remove").unwrap();
         assert!(!crate::key::has_key(&mgr, "remove"));
+        assert!(!crate::key::manifest_path(&mgr.base_dir, "remove").exists());
         mgr.add_profile_from_force("refresh", &source).unwrap();
         assert!(!crate::key::has_key(&mgr, "refresh"));
+        assert!(!crate::key::manifest_path(&mgr.base_dir, "refresh").exists());
     }
 }

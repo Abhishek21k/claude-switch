@@ -1,4 +1,5 @@
 mod atomic;
+mod gateway;
 mod key;
 mod limits;
 mod profile;
@@ -101,6 +102,12 @@ enum Commands {
         action: KeyAction,
     },
 
+    /// Manage saved gateway settings
+    Gateway {
+        #[command(subcommand)]
+        action: GatewayAction,
+    },
+
     /// Remove a saved profile
     Remove {
         /// Profile name to remove
@@ -193,6 +200,55 @@ enum KeyAction {
     Print { name: String },
 }
 
+#[derive(Subcommand)]
+enum GatewayAction {
+    /// List saved gateway URLs and setting names
+    List,
+    /// Forget defaults for a base URL
+    Forget { url: String },
+}
+
+fn ask_save_defaults(base_dir: &Path, input: &gateway::GatewayInput) -> Result<bool> {
+    let gateway::GatewayInput::Json {
+        url,
+        settings,
+        dropped,
+    } = input
+    else {
+        return Ok(false);
+    };
+    println!(
+        "Read settings: {}.",
+        settings.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if !dropped.is_empty() {
+        println!("Ignored credential names: {}.", dropped.join(", "));
+    }
+    let existing = gateway::read_defaults(base_dir)?;
+    let replace = existing.get(url).is_some_and(|old| old != settings);
+    let suffix = if replace {
+        " (replaces the saved ones)"
+    } else {
+        ""
+    };
+    loop {
+        print!(
+            "Save these {} settings as the defaults for {url}? [Y/n]{suffix} ",
+            settings.len()
+        );
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            anyhow::bail!("Gateway defaults answer cancelled.");
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     if let Some(Commands::Key {
@@ -254,17 +310,31 @@ fn main() -> Result<()> {
                 name,
                 replace_helper,
             } => {
+                let terminal = io::stdin().is_terminal();
                 let input = key::read_key_input()?;
+                key::validate_key_input(&input)?;
+                key::precheck_set_key(&manager, &name, replace_helper)?;
+                let gateway_input = if terminal {
+                    key::read_gateway_input(&key::gateway_display(&manager, &name))?
+                } else {
+                    gateway::GatewayInput::Keep
+                };
+                let save_defaults = ask_save_defaults(&manager.base_dir, &gateway_input)?;
                 let executable = std::env::current_exe()?;
-                let result = key::set_key(
+                let result = key::set_key_with_gateway(
                     &manager,
                     &name,
                     &input,
                     &executable,
                     replace_helper,
+                    &gateway_input,
+                    save_defaults,
                     Utc::now(),
                 )?;
                 println!("API key saved for profile '{name}'.");
+                for line in result.gateway_lines {
+                    println!("{line}");
+                }
                 if result.running_session {
                     println!("Restart this profile's running Claude sessions to use the key.");
                 }
@@ -286,8 +356,19 @@ fn main() -> Result<()> {
                 if result.foreign_helper {
                     println!("A foreign apiKeyHelper remains in settings.json.");
                 }
+                if let Some(line) = result.gateway_line {
+                    println!("{line}");
+                }
             }
             KeyAction::Print { .. } => unreachable!("handled before manager setup"),
+        },
+
+        Some(Commands::Gateway { action }) => match action {
+            GatewayAction::List => print!("{}", gateway::list(&manager.base_dir)?),
+            GatewayAction::Forget { url } => println!(
+                "Forgot saved defaults for {}.",
+                gateway::forget(&manager.base_dir, &url)?
+            ),
         },
 
         Some(Commands::Remove { name, purge_usage }) => {
@@ -342,6 +423,7 @@ fn main() -> Result<()> {
                 let claude = read_claude_json(&dir);
                 let auth = key::read_auth_mode(&manager, &p.name, claude.clone());
                 println!("Auth:      {}", auth.label());
+                println!("Gateway:   {}", key::gateway_info(&manager, &p.name));
                 println!("Added:     {}", p.added.format("%Y-%m-%d %H:%M UTC"));
                 println!(
                     "Last used: {}",
