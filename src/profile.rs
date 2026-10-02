@@ -36,13 +36,17 @@ mod stage_b_tests {
     }
 
     fn register(manager: &ProfileManager, name: &str, tool: Tool, email: &str) {
+        register_with_email(manager, name, tool, Some(email));
+    }
+
+    fn register_with_email(manager: &ProfileManager, name: &str, tool: Tool, email: Option<&str>) {
         let mut registry = manager.load_registry().unwrap();
         registry.profiles.insert(
             name.into(),
             Profile {
                 name: name.into(),
                 tool,
-                email: Some(email.into()),
+                email: email.map(str::to_owned),
                 added: Utc::now(),
                 last_used: None,
             },
@@ -382,6 +386,36 @@ mod stage_b_tests {
         register(&manager, &claude_name, Tool::Claude, "c@example.com");
         register(&manager, &codex_name, Tool::Codex, "o@example.com");
         let profiles = manager.list_profiles().unwrap();
+        let shell = manager.generate_shell_aliases(&profiles).unwrap();
+        let powershell = manager.generate_powershell_aliases(&profiles).unwrap();
+        for (prefix, name) in [("claude", claude_name), ("codex", codex_name)] {
+            assert!(
+                shell.contains(&format!("alias {prefix}-{name}='cswitch use {name}'")),
+                "{shell}"
+            );
+            assert!(
+                powershell.contains(&format!(
+                    "function {prefix}-{name} {{ cswitch use {name} @args }}"
+                )),
+                "{powershell}"
+            );
+        }
+        assert!(!shell.contains("alias omitted"));
+        assert!(!powershell.contains("alias omitted"));
+    }
+
+    #[test]
+    fn long_profile_names_without_email_keep_aliases_in_both_shells() {
+        // Known-bad: the no-comment return in limit_alias_line replaces long aliases
+        // with "# alias omitted: profile name exceeds 120 columns".
+        let tmp = TempDir::new().unwrap();
+        let manager = manager(&tmp);
+        let claude_name = "c".repeat(50);
+        let codex_name = "o".repeat(50);
+        register_with_email(&manager, &claude_name, Tool::Claude, None);
+        register_with_email(&manager, &codex_name, Tool::Codex, None);
+        let profiles = manager.list_profiles().unwrap();
+        assert!(profiles.iter().all(|profile| profile.email.is_none()));
         let shell = manager.generate_shell_aliases(&profiles).unwrap();
         let powershell = manager.generate_powershell_aliases(&profiles).unwrap();
         for (prefix, name) in [("claude", claude_name), ("codex", codex_name)] {
