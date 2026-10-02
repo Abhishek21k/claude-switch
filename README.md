@@ -134,9 +134,38 @@ cswitch usage --explain <session-id>
 cswitch usage --unattributed
 cswitch usage label <session-id> <workspace/project>
 cswitch usage verify
+cswitch usage alias 'acme/claude-x.5' claude-opus-5-5
+cswitch usage alias 'acme/claude-x.5' --remove
+cswitch usage plan work 20 --label Pro
+cswitch usage rate keyed --flat 1 --model-prefix 'acme/'
+cswitch usage rate keyed --input 1 --output 5 --cache-write-5m 1.25 --cache-write-1h 2 --cache-read 0.1
+cswitch usage topup keyed 10 --date 2030-01-01
+cswitch usage topup keyed --list
+cswitch usage topup keyed --undo
 ```
 
 `--since` accepts `7d` (default), `30d`, `all`, or `YYYY-MM-DD`; `--by` accepts `profile`, `workspace`, `project`, `session`, `model`, or `day`. The default view is a workspace › project › session tree. Set `CSWITCH_USAGE_DIR` to use another ledger directory, for example when ingesting into a temporary directory. The ledger survives profile removal; `cswitch remove <name> --purge-usage` opts into deleting that profile's rows.
+
+`cswitch list` includes `30D $`: per-token spend or `~` list-price value for other Claude profiles. `cswitch info` shows today, 7-day and 30-day token totals, estimated spend and list value, owner-entered credits or plan fee, and a weekly capacity estimate. Both read the last offline hourly rollup; run `cswitch usage` to refresh. An absent ledger shows `—` and a refresh hint. `$*` marks unpriced usage. These estimates use the owner's settings and transcript counters; they are not gateway balance queries.
+
+List prices stay in `rates.json`. Its optional `aliases` object maps exact transcript model names to existing rate model IDs, for example `"acme/claude-x.5": "claude-opus-5-5"`. No name normalization occurs; unaliased names remain unpriced. `usage verify` skips aliased requests because Claude Code's cost state cannot price them.
+
+Owner billing settings live in private `~/.claude-switch/usage/billing.json`, created atomically with mode `0600`. Rates are USD per million tokens. A rate applies only to its listed model prefixes; without prefixes it applies to every model. Other models use list price. Example with synthetic values:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "work": { "plan": { "label": "Pro", "fee_usd": 20.0 } },
+    "keyed": {
+      "rate": { "model_prefixes": ["acme/"], "flat": 1.0 },
+      "top_ups": [ { "date": "2030-01-01", "usd": 10.0 }, { "date": "2030-01-15", "usd": 5.0 } ]
+    }
+  }
+}
+```
+
+Credits subtract estimated spend only since the earliest recorded top-up's local date. `cswitch remove` retains billing settings; `--purge-usage` deletes them with ledger rows. Weekly capacity uses a window from `resets_at` minus seven days through its highest utilization snapshot. It divides list-price usage up to that snapshot by its utilization fraction, only from 20% onward and after the ledger catches up. The newest four eligible windows give a range. This is an estimate from one account's observed model mix, and unpriced models make it partial.
 
 Without configuration, attribution uses the nearest Git root. A private `~/.claude-switch/usage/config.json` can add project folders, workspace names, and aliases. This synthetic example uses only placeholder paths:
 
