@@ -2049,6 +2049,13 @@ mod billing_view_tests {
         assert!(!usage.join("rates.json").exists());
         assert!(!usage.join("billing.json").exists());
         assert!(!usage.join(".lock").exists());
+        fs::write(
+            usage.join("billing.json"),
+            r#"{"version":1,"profiles":{"p":{"top_ups":[{"date":"2026-01-01","usd":1.0}]}}}"#,
+        )
+        .unwrap();
+        let over = info_output(&manager, "p", now).unwrap();
+        assert!(over.contains("$4.00 over"), "{over}"); // Known-bad: showing a negative balance as dollars left.
     }
 }
 
@@ -2126,5 +2133,93 @@ mod billing_cli_tests {
             "{text}"
         );
         assert!(!text.contains("spent"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod billing_list_variants_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::fs;
+    #[test]
+    fn wide_list_and_every_money_cell_variant_fit_120_columns() {
+        // Known-bad: a 121-column row or assuming every Claude request has a price.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 8, 12, 0, 0).unwrap();
+        let long = "abcdefghijklmnopqrst";
+        let mut registry = profile::Registry::default();
+        for (name, auth) in [
+            (long, "{\"primaryApiKey\":\"synthetic\"}"),
+            ("plan", "{\"oauthAccount\":{}}"),
+            ("other", "{}"),
+        ] {
+            registry.profiles.insert(
+                name.into(),
+                profile::Profile {
+                    name: name.into(),
+                    tool: Tool::Claude,
+                    email: Some("forty.characters.long.address@example.com".into()),
+                    added: now,
+                    last_used: None,
+                },
+            );
+            fs::create_dir_all(manager.profile_dir(name)).unwrap();
+            fs::write(manager.profile_dir(name).join(".claude.json"), auth).unwrap();
+        }
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let usage = manager.base_dir.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        let row = |profile: &str, model: &str| usage::metrics::Bucket {
+            profile: profile.into(),
+            hour: now - chrono::Duration::hours(1),
+            model: model.into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![
+                row(long, "unknown"),
+                row("plan", "claude-opus-5"),
+                row("other", "claude-opus-5"),
+                row("other", "unknown"),
+            ],
+        };
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let out = list_output(&manager, now).unwrap();
+        assert!(out.lines().all(|line| line.chars().count() <= 120), "{out}");
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with(long) && line.contains("$*")),
+            "{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("plan ") && line.contains("~$5.00")),
+            "{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("other ") && line.contains("~$5.00*")),
+            "{out}"
+        );
+        assert!(out.contains("30D $ = last 30 days"));
     }
 }

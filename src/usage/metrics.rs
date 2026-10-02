@@ -435,6 +435,31 @@ mod tests {
         assert_eq!(sums[1].tokens, 2_000_000);
     }
     #[test]
+    fn seven_and_thirty_day_hour_edges_are_half_open() {
+        // Known-bad: counting the hour before a rolling-window edge or the current hour.
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let now = at("2030-02-01T12:30:00Z");
+        let rates = rates::seed();
+        let rows = vec![
+            b("2030-01-02T11:00:00Z", "claude-opus-5"),
+            b("2030-01-02T12:00:00Z", "claude-opus-5"),
+            b("2030-01-25T11:00:00Z", "claude-opus-5"),
+            b("2030-01-25T12:00:00Z", "claude-opus-5"),
+            b("2030-02-01T12:00:00Z", "claude-opus-5"),
+        ];
+        let sums = windows(
+            &rows,
+            "p",
+            now,
+            FixedOffset::east_opt(0).unwrap(),
+            &rates,
+            None,
+            false,
+        );
+        assert_eq!(sums[1].tokens, 2_000_000); // edge hour and current hour
+        assert_eq!(sums[2].tokens, 4_000_000); // thirty-day edge through current hour
+    }
+    #[test]
     fn capacity_uses_highest_snapshot_and_marks_unpriced() {
         // Known-bad: using the newest lower percent, or silently treating unpriced rows as complete.
         let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().to_utc();
@@ -469,10 +494,16 @@ mod tests {
         let result = capacity("p", &snapshots, &hourly, &rates::seed()).unwrap();
         assert_eq!(result.value, 10.0);
         assert!(result.partial);
-        let mut low = snapshots;
+        let mut low = snapshots.clone();
         low[0].weekly.percent = 3.0;
         low[1].weekly.percent = 4.0;
         assert!(capacity("p", &low, &hourly, &rates::seed()).is_none());
+        let behind = Hourly {
+            version: 1,
+            generated_at: at("2030-01-03T00:00:00Z"),
+            rows: hourly.rows.clone(),
+        };
+        assert!(capacity("p", &snapshots, &behind, &rates::seed()).is_none()); // Known-bad: estimating before ingest catches up.
     }
 }
 
@@ -541,6 +572,23 @@ mod persistence_tests {
         append_history(&dir, &sources).unwrap();
         append_history(&dir, &sources).unwrap();
         assert_eq!(history(&dir).len(), 1);
+        let mismatch = tmp.path().join("mismatch");
+        fs::create_dir_all(&mismatch).unwrap();
+        let bad = data.replacen(
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+            1,
+        );
+        fs::write(mismatch.join(".claude.json"), bad).unwrap();
+        append_history(
+            &dir,
+            &[Source {
+                profile: "other".into(),
+                directory: mismatch,
+            }],
+        )
+        .unwrap();
+        assert_eq!(history(&dir).len(), 1); // Known-bad: saving an account-mismatched snapshot.
         assert_eq!(fs::read_to_string(&source).unwrap(), data);
         assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
     }
