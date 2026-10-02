@@ -1,5 +1,7 @@
 pub mod attribute;
+pub mod billing;
 pub mod ledger;
+pub mod metrics;
 pub mod parse;
 pub mod rates;
 pub mod report;

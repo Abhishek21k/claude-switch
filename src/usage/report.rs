@@ -209,6 +209,7 @@ pub(crate) fn refresh_summary(store: &Store, ledger: &Ledger) -> Result<Vec<Repo
     let rates = load_or_seed(&store.dir)?;
     let rows = make_rows(ledger, &config, &labels, &rates);
     write_summary(store, &rows)?;
+    super::metrics::write(&store.dir, ledger, Utc::now())?;
     Ok(rows)
 }
 
@@ -496,10 +497,13 @@ pub fn verify(store: &Store) -> Result<(String, i32)> {
             .filter(|row| row.profile == session.profile && row.session == session.id)
             .collect::<Vec<_>>();
         if session_requests.iter().any(|row| {
-            row.web_searches > 0 || row.web_fetches > 0 || row.speed.as_deref() == Some("fast")
+            row.web_searches > 0
+                || row.web_fetches > 0
+                || row.speed.as_deref() == Some("fast")
+                || rates.aliases.contains_key(&row.model)
         }) {
             output.push_str(&format!(
-                "  {name}: excluded (web tools or fast requests)\n"
+                "  {name}: excluded (web tools, fast, or aliased requests)\n"
             ));
             continue;
         }
@@ -844,5 +848,45 @@ mod tests {
                 .iter()
                 .all(|row| row["project"] == "blue/two")
         );
+    }
+}
+
+#[cfg(test)]
+mod alias_verify_tests {
+    use super::*;
+    use crate::usage::ledger::Source;
+    use std::fs;
+    #[test]
+    fn verify_skips_aliased_gateway_requests() {
+        // Known-bad: comparing an alias-priced gateway request with Claude Code cost-state.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        let projects = profile.join("projects/demo");
+        fs::create_dir_all(&projects).unwrap();
+        let request = serde_json::json!({"type":"assistant","timestamp":"2030-01-01T12:00:00Z","sessionId":"s",
+            "requestId":"req","message":{"id":"msg","model":"acme/claude-x.5","usage":{"input_tokens":1_000_000}}});
+        let state = serde_json::json!({"type":"cost-state","sessionId":"s","modelUsage":{"acme/claude-x.5":{
+            "inputTokens":1_000_000,"outputTokens":0,"cacheCreationInputTokens":0,"cacheReadInputTokens":0,"costUSD":999.0}}});
+        fs::write(projects.join("s.jsonl"), format!("{request}\n{state}\n")).unwrap();
+        let store = Store::new(
+            tmp.path().join("usage"),
+            vec![Source {
+                profile: "p".into(),
+                directory: profile,
+            }],
+        );
+        fs::create_dir_all(&store.dir).unwrap();
+        let mut rates = super::super::rates::seed();
+        rates
+            .aliases
+            .insert("acme/claude-x.5".into(), "claude-opus-5".into());
+        fs::write(
+            store.dir.join("rates.json"),
+            serde_json::to_vec(&rates).unwrap(),
+        )
+        .unwrap();
+        let (output, exit) = verify(&store).unwrap();
+        assert_eq!(exit, 2, "{output}");
+        assert!(output.contains("aliased requests"), "{output}");
     }
 }

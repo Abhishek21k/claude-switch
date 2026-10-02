@@ -434,6 +434,7 @@ impl Store {
         ledger.cursors.synthetic_skipped += report.synthetic_skipped;
         self.save_data(&ledger)?;
         super::report::refresh_summary(self, &ledger)?;
+        super::metrics::append_history(&self.dir, &self.sources)?;
         // Cursor is last: a failed data or summary write leaves a harmless
         // replay for deduplication on the next ingest.
         save_json(&self.dir.join("cursors.json"), &ledger.cursors)?;

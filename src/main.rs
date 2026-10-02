@@ -9,7 +9,7 @@ mod tui;
 mod usage;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset, Utc};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use limits::{Limits, Window, format_info, parse_limits, read_claude_json};
 use profile::{LoginMethod, LoginOutcome, ProfileManager, Tool, detect_current_account};
@@ -194,6 +194,53 @@ enum UsageAction {
     Label { session: String, project: String },
     /// Compare priced requests with matching cost-state snapshots
     Verify,
+    /// Map a transcript model to a list-price model
+    Alias {
+        model: String,
+        rates_model_id: Option<String>,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Set a subscription plan fee
+    Plan {
+        profile: String,
+        fee_usd: Option<f64>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Set per-token prices in USD per million tokens
+    Rate {
+        profile: String,
+        #[arg(long, conflicts_with_all = ["input", "output", "cache_write_5m", "cache_write_1h", "cache_read", "clear"])]
+        flat: Option<f64>,
+        #[arg(long)]
+        input: Option<f64>,
+        #[arg(long)]
+        output: Option<f64>,
+        #[arg(long)]
+        cache_write_5m: Option<f64>,
+        #[arg(long)]
+        cache_write_1h: Option<f64>,
+        #[arg(long)]
+        cache_read: Option<f64>,
+        #[arg(long = "model-prefix")]
+        model_prefix: Vec<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Record, list or undo a credit top-up
+    Topup {
+        profile: String,
+        usd: Option<f64>,
+        #[arg(long)]
+        date: Option<NaiveDate>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        undo: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -404,7 +451,9 @@ fn main() -> Result<()> {
             if purge_usage {
                 manager.get_profile(&name)?;
                 let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
-                usage::report::purge_profile(&usage::store(&manager, directory)?, &name)?;
+                let store = usage::store(&manager, directory)?;
+                usage::report::purge_profile(&store, &name)?;
+                usage::billing::purge(&store, &name)?;
             }
             match manager.remove_profile(&name) {
                 Ok(_) => println!("Profile '{}' removed.", name),
@@ -457,6 +506,149 @@ fn main() -> Result<()> {
                 Some(UsageAction::Label { session, project }) => {
                     usage::report::label(&store, &session, &project)?
                 }
+                Some(UsageAction::Alias {
+                    model,
+                    rates_model_id,
+                    remove,
+                }) => {
+                    let Some(_lock) = store.try_lock()? else {
+                        anyhow::bail!("usage store busy; try again")
+                    };
+                    if remove {
+                        if rates_model_id.is_some() {
+                            anyhow::bail!("--remove takes no rates model id")
+                        }
+                    } else if rates_model_id.is_none() {
+                        anyhow::bail!("provide a rates model id or --remove")
+                    }
+                    usage::rates::edit_alias(&store.dir, &model, rates_model_id.as_deref())?;
+                    format!("Alias updated for {model}.\n")
+                }
+                Some(UsageAction::Plan {
+                    profile,
+                    fee_usd,
+                    label,
+                    clear,
+                }) => {
+                    require_billing_class(&manager, &profile, false)?;
+                    if clear {
+                        if fee_usd.is_some() || label.is_some() {
+                            anyhow::bail!("--clear takes no fee or label")
+                        }
+                    } else if fee_usd.is_none() {
+                        anyhow::bail!("provide a fee or --clear")
+                    }
+                    usage::billing::edit(&store, Local::now().date_naive(), |billing| {
+                        let entry = billing.profiles.entry(profile.clone()).or_default();
+                        entry.plan = if clear {
+                            None
+                        } else {
+                            Some(usage::billing::Plan {
+                                label: label.unwrap_or_else(|| "Plan".into()),
+                                fee_usd: fee_usd.unwrap(),
+                            })
+                        };
+                        Ok(())
+                    })?;
+                    format!("Plan updated for {profile}.\n")
+                }
+                Some(UsageAction::Rate {
+                    profile,
+                    flat,
+                    input,
+                    output,
+                    cache_write_5m,
+                    cache_write_1h,
+                    cache_read,
+                    model_prefix,
+                    clear,
+                }) => {
+                    require_billing_class(&manager, &profile, true)?;
+                    let typed = [input, output, cache_write_5m, cache_write_1h, cache_read];
+                    if clear {
+                        if flat.is_some()
+                            || typed.iter().any(Option::is_some)
+                            || !model_prefix.is_empty()
+                        {
+                            anyhow::bail!("--clear takes no rates or prefixes")
+                        }
+                    } else if flat.is_none() && !typed.iter().all(Option::is_some) {
+                        anyhow::bail!("provide --flat or all five per-type rates")
+                    }
+                    usage::billing::edit(&store, Local::now().date_naive(), |billing| {
+                        let entry = billing.profiles.entry(profile.clone()).or_default();
+                        entry.rate = if clear {
+                            None
+                        } else {
+                            Some(usage::billing::Rate {
+                                model_prefixes: model_prefix,
+                                price: if let Some(flat) = flat {
+                                    usage::billing::RatePrice::Flat { flat }
+                                } else {
+                                    usage::billing::RatePrice::PerType(usage::rates::Price {
+                                        input: input.unwrap(),
+                                        output: output.unwrap(),
+                                        cache_write_5m: cache_write_5m.unwrap(),
+                                        cache_write_1h: cache_write_1h.unwrap(),
+                                        cache_read: cache_read.unwrap(),
+                                    })
+                                },
+                            })
+                        };
+                        Ok(())
+                    })?;
+                    format!("Rate updated for {profile}.\n")
+                }
+                Some(UsageAction::Topup {
+                    profile,
+                    usd,
+                    date,
+                    list,
+                    undo,
+                }) => {
+                    require_billing_class(&manager, &profile, true)?;
+                    let today = Local::now().date_naive();
+                    if list {
+                        if usd.is_some() || date.is_some() || undo {
+                            anyhow::bail!("--list takes no amount or date")
+                        }
+                        let settings = usage::billing::read(&store.dir, today)?;
+                        settings
+                            .profiles
+                            .get(&profile)
+                            .map(|entry| {
+                                entry
+                                    .top_ups
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, t)| format!("{}. {} ${:.2}\n", i + 1, t.date, t.usd))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        if undo {
+                            if usd.is_some() || date.is_some() {
+                                anyhow::bail!("--undo takes no amount or date")
+                            }
+                        } else if usd.is_none() {
+                            anyhow::bail!("provide an amount, --list or --undo")
+                        }
+                        usage::billing::edit(&store, today, |billing| {
+                            let entry = billing.profiles.entry(profile.clone()).or_default();
+                            if undo {
+                                entry.top_ups.pop();
+                            } else {
+                                entry.top_ups.push(usage::billing::TopUp {
+                                    date: date.unwrap_or(today),
+                                    usd: usd.unwrap(),
+                                });
+                                entry.top_ups.sort_by_key(|t| t.date);
+                            }
+                            Ok(())
+                        })?;
+                        format!("Top-ups updated for {profile}.\n")
+                    }
+                }
                 Some(UsageAction::Verify) => {
                     let (output, exit_code) = usage::report::verify(&store)?;
                     verify_exit_code = exit_code;
@@ -485,6 +677,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) -> Result<()> {
+    let profile = manager.get_profile(name)?;
+    if profile.tool != Tool::Claude {
+        anyhow::bail!("{name} is not a Claude profile")
+    }
+    let mode = key::read_auth_mode(manager, name, read_claude_json(&manager.profile_dir(name)));
+    if per_token && !mode.api_billed() {
+        anyhow::bail!(
+            "{name} is not a per-token profile; rates and top-ups apply to per-token profiles"
+        )
+    }
+    if !per_token && mode != key::AuthMode::Subscription {
+        anyhow::bail!("{name} is not a subscription profile; plans apply to subscription profiles")
+    }
+    Ok(())
+}
+
 fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Result<String> {
     let profile = manager.get_profile(name)?;
     let dir = manager.profile_dir(&profile.name);
@@ -506,6 +715,15 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
             .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
             .unwrap_or(Limits::Unreadable);
         output.push_str(&format_info(&limits, now));
+        let usage_dir = usage_directory(manager);
+        output.push_str(&usage_info(
+            &usage_dir,
+            &profile.name,
+            &auth,
+            now,
+            Local::now().offset().fix(),
+            &limits,
+        ));
     } else {
         output.push_str("Auth:      —\nGateway:   —\n");
         if profile.tool == Tool::Codex {
@@ -530,95 +748,270 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
     Ok(output)
 }
 
+fn usage_directory(manager: &ProfileManager) -> std::path::PathBuf {
+    std::env::var_os("CSWITCH_USAGE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| manager.base_dir.join("usage"))
+}
+
+fn usage_info(
+    dir: &Path,
+    name: &str,
+    auth: &key::AuthMode,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    limits: &Limits,
+) -> String {
+    use usage::metrics as m;
+    let Some(hourly) = m::read(dir) else {
+        return "Usage:     no ledger yet — run `cswitch usage`\n".into();
+    };
+    let Some((rates, billing)) = m::load_settings(dir, now.with_timezone(&offset).date_naive())
+    else {
+        return "Usage:     billing settings unreadable\n".into();
+    };
+    let per_token = auth.api_billed();
+    let entry = billing.profiles.get(name);
+    let sums = m::windows(&hourly.rows, name, now, offset, &rates, entry, per_token);
+    let age = profile::describe_age((now - hourly.generated_at).num_seconds().max(0) as u64);
+    let mut out = format!("Usage (ledger as of {age}):\n");
+    for (label, value) in ["Today", "7 days", "30 days"].iter().zip(sums.iter()) {
+        let money = if per_token {
+            format!(
+                "{} spent · {} list price",
+                value.spend_cell(),
+                value.list_info_cell()
+            )
+        } else {
+            format!("{} list price", value.list_info_cell())
+        };
+        out.push_str(&format!(
+            "  {label:<9} {:>8} tok   {money}\n",
+            m::tokens(value.tokens)
+        ));
+    }
+    if now - hourly.generated_at > chrono::Duration::hours(24) {
+        out.push_str("  usage figures are over 24 h old — run cswitch usage to refresh\n");
+    }
+    if per_token {
+        if let Some(rate) = entry.and_then(|e| e.rate.as_ref()) {
+            let prices = match &rate.price {
+                usage::billing::RatePrice::Flat { flat } => {
+                    format!("{} per 1M tokens, flat", m::money(*flat))
+                }
+                usage::billing::RatePrice::PerType(p) => format!(
+                    "per 1M tokens: input {}, output {}, 5m write {}, 1h write {}, read {}",
+                    m::money(p.input),
+                    m::money(p.output),
+                    m::money(p.cache_write_5m),
+                    m::money(p.cache_write_1h),
+                    m::money(p.cache_read)
+                ),
+            };
+            let scope = if rate.model_prefixes.is_empty() {
+                "all models".into()
+            } else {
+                format!(
+                    "models {}*; other models at list price",
+                    rate.model_prefixes.join("*, ")
+                )
+            };
+            out.push_str(&format!("Rate:      {prices} ({scope})\n"));
+        } else {
+            out.push_str(&format!(
+                "Rate:      not set — cswitch usage rate {name} --flat <usd>\n"
+            ));
+        }
+        if let Some(entry) = entry
+            && let Some((first, total, spent)) =
+                m::credits(entry, &hourly.rows, name, now, offset, &rates)
+        {
+            let balance = total - spent;
+            let left = if balance < 0.0 {
+                format!("{} over", m::money(-balance))
+            } else {
+                format!("{} left", m::money(balance))
+            };
+            out.push_str(&format!(
+                "Credits:   {} topped up since {first} · {} spent · {left}\n",
+                m::money(total),
+                m::money(spent)
+            ));
+        }
+    } else if *auth == key::AuthMode::Subscription {
+        if let Some(plan) = entry.and_then(|e| e.plan.as_ref()) {
+            let value = sums[2].value;
+            let ratio = if plan.fee_usd > 0.0 {
+                format!(" ({:.0}× the fee)", value / plan.fee_usd)
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "Plan:      {} · {}/mo · last 30 days {} of list-price usage{ratio}\n",
+                plan.label,
+                m::money(plan.fee_usd),
+                m::money(value)
+            ));
+        } else {
+            out.push_str(&format!(
+                "Plan:      not set — cswitch usage plan {name} <fee> --label <text>\n"
+            ));
+        }
+        let mut history = m::history(dir);
+        if let Limits::Snapshot(snapshot) = limits
+            && let Some(weekly) = snapshot
+                .weekly()
+                .filter(|w| w.kind == "weekly_all")
+                .and_then(|w| {
+                    w.resets_at.map(|r| m::Weekly {
+                        percent: w.percent,
+                        resets_at: r,
+                    })
+                })
+        {
+            history.push(m::LimitRow {
+                profile: name.into(),
+                fetched_at: snapshot.fetched_at,
+                weekly,
+            });
+        }
+        if let Some(c) = m::capacity(name, &history, &hourly, &rates) {
+            let star = if c.partial { "*" } else { "" };
+            out.push_str(&format!("Capacity:  weekly limit ≈ {}{star} of list-price usage (est. from {:.0}% at {}; last 4 weeks {}–{})\n",
+                m::money(c.value),c.snapshot.weekly.percent,c.snapshot.fetched_at.with_timezone(&offset).format("%m-%d %H:%M"),m::money(c.min),m::money(c.max)));
+        } else {
+            let reason = if history.iter().any(|r| {
+                r.profile == name && r.weekly.percent >= 20.0 && r.fetched_at > hourly.generated_at
+            }) {
+                "waiting for an ingest"
+            } else {
+                "no snapshot ≥ 20%"
+            };
+            out.push_str(&format!("Capacity:  not enough data yet ({reason})\n"));
+        }
+    }
+    out
+}
+
 fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
+    use usage::metrics as m;
     let profiles = manager.list_profiles()?;
     if profiles.is_empty() {
-        return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".to_string());
+        return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".into());
     }
     let header = format!(
-        "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}",
-        "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+        "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}",
+        "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "30D $", "LAST USED"
     );
-    let mut output = format!("{}\n{}\n", header, "─".repeat(header.chars().count()));
+    let mut out = format!("{header}\n{}\n", "─".repeat(header.chars().count()));
+    let dir = usage_directory(manager);
+    let hourly = m::read(&dir);
+    let settings = m::load_settings(
+        &dir,
+        now.with_timezone(&Local::now().offset().fix()).date_naive(),
+    );
     let mut saw_reset = false;
     let mut saw_flag = false;
     let mut saw_api = false;
-
-    for profile in profiles {
-        let name: String = profile.name.chars().take(20).collect();
-        let email: String = profile
-            .email
-            .as_deref()
-            .unwrap_or("—")
-            .chars()
-            .take(30)
-            .collect();
-        let tool = profile.tool.label();
-        let last_used = profile
+    let mut saw_usage = false;
+    let mut saw_claude = false;
+    for p in profiles {
+        let name: String = p.name.chars().take(20).collect();
+        let email: String = p.email.as_deref().unwrap_or("—").chars().take(27).collect();
+        let tool: String = p.tool.label().chars().take(11).collect();
+        let last = p
             .last_used
-            .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "never".to_string());
-        if profile.tool != Tool::Claude {
-            output.push_str(&format!(
-                "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
-                name, tool, email, "—", "—", "—", last_used
-            ));
-            continue;
-        }
-        let dir = manager.profile_dir(&profile.name);
-        let claude = read_claude_json(&dir);
-        let auth = key::read_auth_mode(manager, &profile.name, claude.clone());
-        let limits = claude
-            .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
-            .unwrap_or(Limits::Unreadable);
-        if auth.api_billed() {
-            saw_api = true;
-            output.push_str(&format!(
-                "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
-                name,
-                tool,
-                email,
-                "—",
-                "—",
-                "api",
-                profile
-                    .last_used
-                    .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "never".to_string())
-            ));
-            continue;
-        }
-        let (session, weekly, age) = match &limits {
-            Limits::Snapshot(snapshot) => {
-                let session = list_window(snapshot.session(), now, false);
-                let weekly = list_window(snapshot.weekly(), now, true);
-                saw_reset |= session.1 || weekly.1;
-                saw_flag |= session.2 || weekly.2;
-                (session.0, weekly.0, snapshot.age(now))
-            }
-            Limits::NoSnapshot => ("—".to_string(), "—".to_string(), "no data".to_string()),
-            Limits::AccountMismatch => ("—".to_string(), "—".to_string(), "mismatch".to_string()),
-            Limits::Unreadable => ("—".to_string(), "—".to_string(), "unreadable".to_string()),
+            .map(|t| t.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".into());
+        let (session, weekly, age, cell) = if p.tool != Tool::Claude {
+            ("—".into(), "—".into(), "—".into(), "—".into())
+        } else {
+            saw_claude = true;
+            let dir = manager.profile_dir(&p.name);
+            let claude = read_claude_json(&dir);
+            let auth = key::read_auth_mode(manager, &p.name, claude.clone());
+            let limits = claude
+                .map(|j| j.map_or(Limits::Unreadable, |v| parse_limits(&v)))
+                .unwrap_or(Limits::Unreadable);
+            let (session, weekly, age) = if auth.api_billed() {
+                saw_api = true;
+                ("—".into(), "—".into(), "api".into())
+            } else {
+                match limits {
+                    Limits::Snapshot(snapshot) => {
+                        let a = list_window(snapshot.session(), now, false);
+                        let b = list_window(snapshot.weekly(), now, true);
+                        saw_reset |= a.1 || b.1;
+                        saw_flag |= a.2 || b.2;
+                        (a.0, b.0, snapshot.age(now))
+                    }
+                    Limits::NoSnapshot => ("—".into(), "—".into(), "no data".into()),
+                    Limits::AccountMismatch => ("—".into(), "—".into(), "mismatch".into()),
+                    Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
+                }
+            };
+            let cell = if let (Some(hourly), Some((rates, billing))) = (&hourly, &settings) {
+                let entry = billing.profiles.get(&p.name);
+                let value = m::windows(
+                    &hourly.rows,
+                    &p.name,
+                    now,
+                    Local::now().offset().fix(),
+                    rates,
+                    entry,
+                    auth.api_billed(),
+                );
+                if auth.api_billed() {
+                    value[2].spend_cell()
+                } else {
+                    value[2].list_cell()
+                }
+            } else {
+                "—".into()
+            };
+            saw_usage |= cell != "—";
+            (session, weekly, age, cell)
         };
-        output.push_str(&format!(
-            "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
-            name, tool, email, session, weekly, age, last_used
+        out.push_str(&format!(
+            "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}\n",
+            name,
+            tool,
+            email,
+            session,
+            weekly,
+            age,
+            cell.chars().take(9).collect::<String>(),
+            last
         ));
     }
     if saw_api {
-        output.push_str("\napi = billed per token, no plan limits\n");
+        out.push_str("\napi = billed per token, no plan limits\n")
     }
     if saw_reset || saw_flag {
         let mut parts = Vec::new();
         if saw_reset {
-            parts.push("reset = that window restarted after the snapshot was taken");
+            parts.push("reset = that window restarted after the snapshot was taken")
         }
         if saw_flag {
-            parts.push("! = Claude Code flags this limit");
+            parts.push("! = Claude Code flags this limit")
         }
-        output.push_str(&format!("\n{}\n", parts.join(" · ")));
+        out.push_str(&format!("\n{}\n", parts.join(" · ")));
     }
-    Ok(output)
+    if saw_usage {
+        out.push_str("\n30D $ = last 30 days: spend for per-token profiles · ~ = list-price value of a plan's usage\n")
+    }
+    if saw_claude && hourly.is_none() {
+        out.push_str("\nno ledger yet — run `cswitch usage`\n");
+    }
+    if let Some(hourly) = hourly
+        && now - hourly.generated_at > chrono::Duration::hours(24)
+    {
+        out.push_str(&format!(
+            "usage figures as of {} — run cswitch usage to refresh\n",
+            profile::describe_age((now - hourly.generated_at).num_seconds().max(0) as u64)
+        ));
+    }
+    Ok(out)
 }
 
 fn list_window(
@@ -1220,29 +1613,40 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
 
         let header = format!(
-            "{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}",
-            "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+            "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}",
+            "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "30D $", "LAST USED"
         );
+        let row = |name: &str, email: &str, five: &str, seven: &str, age: &str, last: &str| {
+            format!(
+                "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}\n",
+                name,
+                "claude",
+                email.chars().take(27).collect::<String>(),
+                five,
+                seven,
+                age,
+                "—",
+                last
+            )
+        };
         let expected = format!(
-            "{header}\n{}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n",
-            "─".repeat(header.chars().count()),
-            "active",
-            "claude",
-            "thirtyx.characters@example.com",
-            "12%",
-            "88% █████████░",
-            "1 h ago",
-            "2030-01-07 06:31",
-            "fresh",
-            "claude",
-            "b@example.com",
-            "—",
-            "—",
-            "no data",
-            "never"
+            "{header}\n{}\n{}{}",
+            "─".repeat(120),
+            row(
+                "active",
+                "thirtyx.characters@example.com",
+                "12%",
+                "88% █████████░",
+                "1 h ago",
+                "01-07 06:31"
+            ),
+            row("fresh", "b@example.com", "—", "—", "no data", "never")
         );
         let output = list_output(&manager, now).unwrap();
-        assert_eq!(output, expected);
+        assert_eq!(
+            output,
+            format!("{expected}\nno ledger yet — run `cswitch usage`\n")
+        );
         assert!(output.lines().all(|line| line.chars().count() <= 120));
 
         cache["cachedUsageUtilization"]["utilization"]["limits"][0]["resets_at"] =
@@ -1252,24 +1656,22 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
         let changed = list_output(&manager, now).unwrap();
         let expected_changed = format!(
-            "{header}\n{}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n{:<20} {:<12} {:<30} {:<7} {:<18} {:<11} {}\n\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
-            "─".repeat(header.chars().count()),
-            "active",
-            "claude",
-            "thirtyx.characters@example.com",
-            "reset",
-            "88% █████████░ !",
-            "1 h ago",
-            "2030-01-07 06:31",
-            "fresh",
-            "claude",
-            "b@example.com",
-            "—",
-            "—",
-            "no data",
-            "never"
+            "{header}\n{}\n{}{}\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
+            "─".repeat(120),
+            row(
+                "active",
+                "thirtyx.characters@example.com",
+                "reset",
+                "88% █████████░ !",
+                "1 h ago",
+                "01-07 06:31"
+            ),
+            row("fresh", "b@example.com", "—", "—", "no data", "never")
         );
-        assert_eq!(changed, expected_changed);
+        assert_eq!(
+            changed,
+            format!("{expected_changed}\nno ledger yet — run `cswitch usage`\n")
+        );
         assert!(changed.lines().all(|line| line.chars().count() <= 120));
 
         cache["cachedUsageUtilization"]["accountUuid"] =
@@ -1526,7 +1928,7 @@ mod tests {
         let output = list_output(&manager, Utc::now()).unwrap();
         assert!(output.contains("o                    codex"), "{output}");
         assert!(
-            output.contains("u                    unknown tool"),
+            output.contains("u                    unknown too"),
             "{output}"
         );
         assert!(output.lines().all(|line| line.chars().count() <= 120));
@@ -1560,7 +1962,7 @@ mod tests {
         let profile = manager.get_profile("c").unwrap();
         let claude = info_output(&manager, "c", now).unwrap();
         let expected = format!(
-            "Name:      c\nTool:      claude\nEmail:     {}\nAuth:      not logged in\nGateway:   the Anthropic API\nPlan limits: the file couldn't be read.\nAdded:     {}\nLast used: never\nDirectory: {}\n\nLaunch:\n  cswitch use c\n",
+            "Name:      c\nTool:      claude\nEmail:     {}\nAuth:      not logged in\nGateway:   the Anthropic API\nPlan limits: the file couldn't be read.\nUsage:     no ledger yet — run `cswitch usage`\nAdded:     {}\nLast used: never\nDirectory: {}\n\nLaunch:\n  cswitch use c\n",
             profile.email.unwrap(),
             profile.added.format("%Y-%m-%d %H:%M UTC"),
             manager.profile_dir("c").display()
@@ -1574,5 +1976,155 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let manager = mixed_tool_manager(&tmp);
         assert_eq!(sync_target_names(&manager, true, None).unwrap(), ["c"]);
+    }
+}
+
+#[cfg(test)]
+mod billing_view_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::fs;
+    use tempfile::TempDir;
+    #[test]
+    fn read_only_views_preserve_usage_files_and_show_age() {
+        // Known-bad: a list/info read seeds rates, takes the lock, or rewrites the rollup.
+        let tmp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 8, 12, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "p".into(),
+            profile::Profile {
+                name: "p".into(),
+                tool: Tool::Claude,
+                email: Some("p@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("p")).unwrap();
+        fs::write(
+            manager.profile_dir("p").join(".claude.json"),
+            r#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        let usage = manager.base_dir.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now - chrono::Duration::hours(25),
+            rows: vec![usage::metrics::Bucket {
+                profile: "p".into(),
+                hour: now - chrono::Duration::hours(1),
+                model: "claude-opus-5".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        };
+        let path = usage.join("hourly.json");
+        let bytes = serde_json::to_vec(&hourly).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let list = list_output(&manager, now).unwrap();
+        assert!(list.contains("$5.00"), "{list}");
+        assert!(list.contains("usage figures as of"));
+        assert!(list.lines().all(|line| line.chars().count() <= 120));
+        let info = info_output(&manager, "p", now).unwrap();
+        assert!(info.contains("Usage (ledger as of"), "{info}");
+        assert!(info.contains("usage figures are over 24 h old"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert!(!usage.join("rates.json").exists());
+        assert!(!usage.join("billing.json").exists());
+        assert!(!usage.join(".lock").exists());
+    }
+}
+
+#[cfg(test)]
+mod billing_cli_tests {
+    use super::*;
+    #[test]
+    fn flat_and_per_type_flags_conflict_at_parse_time() {
+        // Known-bad: accepting both flat and per-type prices and silently choosing one.
+        assert!(
+            Cli::try_parse_from([
+                "cswitch", "usage", "rate", "p", "--flat", "1", "--input", "2"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn plan_usage_block_shows_fee_and_list_value_without_spend() {
+        // Known-bad: treating a subscription's list value as spent or adding its fee per request.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = DateTime::parse_from_rfc3339("2030-01-08T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![usage::metrics::Bucket {
+                profile: "p".into(),
+                hour: now - chrono::Duration::hours(1),
+                model: "claude-opus-5".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        };
+        std::fs::write(
+            dir.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let settings = usage::billing::Billing {
+            version: 1,
+            profiles: std::collections::BTreeMap::from([(
+                "p".into(),
+                usage::billing::ProfileBilling {
+                    plan: Some(usage::billing::Plan {
+                        label: "Pro".into(),
+                        fee_usd: 2.0,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.join("billing.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        let text = usage_info(
+            dir,
+            "p",
+            &key::AuthMode::Subscription,
+            now,
+            FixedOffset::east_opt(0).unwrap(),
+            &Limits::NoSnapshot,
+        );
+        assert!(text.contains("$5.00 list price"), "{text}");
+        assert!(
+            text.contains("Pro · $2.00/mo · last 30 days $5.00 of list-price usage (2× the fee)"),
+            "{text}"
+        );
+        assert!(!text.contains("spent"), "{text}");
     }
 }

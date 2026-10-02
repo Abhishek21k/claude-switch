@@ -27,6 +27,8 @@ pub struct Rates {
     pub source: String,
     pub unit: String,
     pub models: BTreeMap<String, ModelRate>,
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -67,6 +69,7 @@ pub fn seed() -> Rates {
     Rates {
         source: "Anthropic first-party list prices, Claude Code 2.1.280 bundled API reference (2026-06-24)".into(),
         unit: "USD per million tokens".into(),
+        aliases: BTreeMap::new(),
         models: BTreeMap::from([
             ("claude-opus-5-5".into(), model(4.0, 20.0, 5.0, 8.0, 0.2)),
             ("claude-opus-5".into(), model(5.0, 25.0, 6.25, 10.0, 0.5)),
@@ -94,10 +97,32 @@ pub fn read_or_seed(dir: &Path) -> Result<Rates> {
     }
 }
 
+impl Rates {
+    pub fn model_rate(&self, name: &str) -> Option<&ModelRate> {
+        self.models
+            .get(name)
+            .or_else(|| self.aliases.get(name).and_then(|id| self.models.get(id)))
+    }
+}
+
+pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<()> {
+    let mut rates = load_or_seed(dir)?;
+    if let Some(target) = target {
+        anyhow::ensure!(
+            rates.models.contains_key(target),
+            "unknown rates model id: {target}"
+        );
+        rates.aliases.insert(model.into(), target.into());
+    } else {
+        rates.aliases.remove(model);
+    }
+    atomic::write(&dir.join("rates.json"), &serde_json::to_vec_pretty(&rates)?)
+}
+
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
     // Known-bad: prefix matching "sonnet" or pricing fast as standard silently
     // invents a rate. Both cases must remain unpriced until explicitly listed.
-    let model = rates.models.get(&request.model)?;
+    let model = rates.model_rate(&request.model)?;
     let price = if request.speed.as_deref() == Some("fast") {
         model.fast.as_ref()?
     } else {
@@ -172,5 +197,49 @@ mod tests {
         let loaded = load_or_seed(tmp.path()).unwrap();
         assert_eq!(loaded.models["claude-sonnet-5"].standard.input, 9.0);
         assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    #[test]
+    fn exact_alias_prices_only_the_named_gateway_model() {
+        // Known-bad: normalizing dots, stripping prefixes, or accepting a dangling alias.
+        let mut rates = seed();
+        assert!(rates.model_rate("acme/claude-x.5").is_none());
+        rates
+            .aliases
+            .insert("acme/claude-x.5".into(), "claude-opus-5".into());
+        assert_eq!(
+            rates.model_rate("acme/claude-x.5").unwrap().standard.input,
+            5.0
+        );
+        assert!(rates.model_rate("ACME/claude-x.5").is_none());
+        rates.aliases.insert("bad".into(), "missing".into());
+        assert!(rates.model_rate("bad").is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(edit_alias(tmp.path(), "another", Some("missing")).is_err());
+        assert!(
+            !tmp.path().join("rates.json").exists()
+                || !read_or_seed(tmp.path())
+                    .unwrap()
+                    .aliases
+                    .contains_key("another")
+        );
+    }
+}
+
+#[cfg(test)]
+mod alias_file_tests {
+    use super::*;
+    #[test]
+    fn malformed_rates_file_is_left_unchanged() {
+        // Known-bad: a failed alias edit replacing malformed user rates with the seed.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rates.json");
+        fs::write(&path, b"{bad").unwrap();
+        assert!(edit_alias(tmp.path(), "acme/x", Some("claude-opus-5")).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"{bad");
     }
 }
