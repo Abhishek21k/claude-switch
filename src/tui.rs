@@ -3093,6 +3093,23 @@ mod tests {
     }
 
     #[test]
+    fn first_run_empty_name_does_not_queue_codex_login() {
+        // Known-bad: removing the empty-name guard from the `3` arm queues a blank login.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = true;
+        app.input_buffer.clear();
+        assert!(app.pending.is_none());
+
+        app.handle_first_run_key(KeyCode::Char('3'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert!(app.pending.is_none());
+        assert_eq!(app.mode, Mode::FirstRun);
+    }
+
+    #[test]
     fn codex_login_without_identity_has_explicit_tui_confirmation() {
         // Known-bad: an unreadable Codex identity is refused before the TUI can confirm it.
         let outcome = LoginOutcome {
