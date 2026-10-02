@@ -305,30 +305,44 @@ mod stage_b_tests {
 
     #[test]
     fn codex_login_command_failure_refuses_registration() {
-        // Known-bad: a failed browser login is accepted because an old auth.json remains.
-        assert!(codex_login_verdict(false, true, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+        // Known-bad: a failed browser login is accepted because an old auth.json remains,
+        // or is reported as a missing auth.json instead of a failed login.
+        assert_eq!(
+            codex_login_verdict(false, true, true, Some(SYNTHETIC_CODEX_AUTH))
+                .unwrap_err()
+                .message("work"),
+            "Codex login did not complete for profile 'work'. Nothing was registered."
+        );
     }
 
     #[test]
     fn codex_login_status_failure_refuses_registration() {
-        // Known-bad: a failed `login status` is ignored when auth.json exists.
-        assert!(codex_login_verdict(true, false, true, Some(SYNTHETIC_CODEX_AUTH)).is_none());
+        // Known-bad: a failed `login status` with auth.json present reports the file as missing.
+        assert_eq!(
+            codex_login_verdict(true, false, true, Some(SYNTHETIC_CODEX_AUTH))
+                .unwrap_err()
+                .message("work"),
+            "Codex login status failed for profile 'work'. Nothing was registered."
+        );
     }
 
     #[test]
     fn codex_missing_auth_file_refuses_registration() {
-        // Known-bad: exit code zero alone registers a profile without auth.json.
-        assert!(codex_login_verdict(true, true, false, None).is_none());
+        // Known-bad: exit code zero alone registers a profile without auth.json,
+        // or reports a failed login status instead of the missing file.
+        assert_eq!(
+            codex_login_verdict(true, true, false, None)
+                .unwrap_err()
+                .message("work"),
+            "Codex did not leave auth.json. Nothing was registered."
+        );
     }
 
     #[test]
     fn codex_unreadable_identity_still_registers_without_email() {
         // Known-bad: successful login with auth.json containing unreadable claims is discarded.
-        assert_eq!(
-            codex_login_verdict(true, true, true, Some(b"{}")),
-            Some(None)
-        );
-        assert_eq!(codex_login_verdict(true, true, true, None), Some(None));
+        assert_eq!(codex_login_verdict(true, true, true, Some(b"{}")), Ok(None));
+        assert_eq!(codex_login_verdict(true, true, true, None), Ok(None));
     }
 
     #[test]
@@ -1171,22 +1185,27 @@ impl ProfileManager {
                 .status()
                 .context("Failed to launch codex. Is it installed and in your PATH?")?
                 .success();
-            if !logged_in {
-                bail!("Codex login did not complete for profile '{name}'. Nothing was registered.");
-            }
-            let status = std::process::Command::new("codex")
-                .args(["login", "status"])
-                .env("CODEX_HOME", &profile_dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .context("Could not check Codex login status")?
-                .success();
+            let status = if logged_in {
+                std::process::Command::new("codex")
+                    .args(["login", "status"])
+                    .env("CODEX_HOME", &profile_dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .context("Could not check Codex login status")?
+                    .success()
+            } else {
+                false
+            };
             let auth_path = profile_dir.join("auth.json");
-            let auth = fs::read(&auth_path).ok();
+            let auth = if status {
+                fs::read(&auth_path).ok()
+            } else {
+                None
+            };
             let identity =
                 codex_login_verdict(logged_in, status, auth_path.exists(), auth.as_deref())
-                    .context("Codex did not leave auth.json. Nothing was registered.")?;
+                    .map_err(|reason| anyhow::anyhow!("{}", reason.message(name)))?;
             let email = identity.map(|identity| identity.email);
             let same_account_as = match email.as_deref() {
                 Some(email) => self.profiles_with_email(email, Tool::Codex)?,
@@ -1442,16 +1461,43 @@ fn limit_alias_line(line: String) -> String {
     line
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginRefusal {
+    LoginFailed,
+    StatusFailed,
+    MissingAuth,
+}
+
+impl CodexLoginRefusal {
+    fn message(self, name: &str) -> String {
+        match self {
+            Self::LoginFailed => format!(
+                "Codex login did not complete for profile '{name}'. Nothing was registered."
+            ),
+            Self::StatusFailed => {
+                format!("Codex login status failed for profile '{name}'. Nothing was registered.")
+            }
+            Self::MissingAuth => "Codex did not leave auth.json. Nothing was registered.".into(),
+        }
+    }
+}
+
 fn codex_login_verdict(
     login_ok: bool,
     status_ok: bool,
     auth_exists: bool,
     auth: Option<&[u8]>,
-) -> Option<Option<codex::Identity>> {
-    if !login_ok || !status_ok || !auth_exists {
-        return None;
+) -> std::result::Result<Option<codex::Identity>, CodexLoginRefusal> {
+    if !login_ok {
+        return Err(CodexLoginRefusal::LoginFailed);
     }
-    Some(auth.and_then(codex::identity_from_auth))
+    if !status_ok {
+        return Err(CodexLoginRefusal::StatusFailed);
+    }
+    if !auth_exists {
+        return Err(CodexLoginRefusal::MissingAuth);
+    }
+    Ok(auth.and_then(codex::identity_from_auth))
 }
 
 const CODEX_SEED_ALLOWLIST: &[&str] = &["config.toml", "AGENTS.md", "agents", "rules", "skills"];
