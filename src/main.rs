@@ -734,15 +734,15 @@ fn usage_info(
         if let Some(rate) = entry.and_then(|e| e.rate.as_ref()) {
             let prices = match &rate.price {
                 usage::billing::RatePrice::Flat { flat } => {
-                    format!("{} per 1M tokens, flat", m::money(*flat))
+                    format!("{} per 1M tokens, flat", m::rate_money(*flat))
                 }
                 usage::billing::RatePrice::PerType(p) => format!(
                     "per 1M tokens: input {}, output {}, 5m write {}, 1h write {}, read {}",
-                    m::money(p.input),
-                    m::money(p.output),
-                    m::money(p.cache_write_5m),
-                    m::money(p.cache_write_1h),
-                    m::money(p.cache_read)
+                    m::rate_money(p.input),
+                    m::rate_money(p.output),
+                    m::rate_money(p.cache_write_5m),
+                    m::rate_money(p.cache_write_1h),
+                    m::rate_money(p.cache_read)
                 ),
             };
             let scope = if rate.model_prefixes.is_empty() {
@@ -759,6 +759,14 @@ fn usage_info(
                 "Rate:      not set — cswitch usage rate {name} --flat <usd>\n"
             ));
         }
+        if sums[2].tokens > 0 {
+            let rate = sums[2].spend * 1_000_000.0 / sums[2].tokens as f64;
+            let star = if sums[2].spend_unpriced > 0 { "*" } else { "" };
+            out.push_str(&format!(
+                "Effective: {}{star} per 1M tokens over 30 days (spend ÷ tokens)\n",
+                m::rate_money(rate)
+            ));
+        }
     } else if *auth == key::AuthMode::Subscription {
         if let Some(plan) = entry.and_then(|e| e.plan.as_ref()) {
             let value = sums[2].value;
@@ -773,6 +781,12 @@ fn usage_info(
                 m::money(plan.fee_usd),
                 m::money(value)
             ));
+            if sums[2].tokens > 0 {
+                out.push_str(&format!(
+                    "Effective: {} per 1M tokens over 30 days (fee ÷ tokens)\n",
+                    m::rate_money(plan.fee_usd * 1_000_000.0 / sums[2].tokens as f64)
+                ));
+            }
         } else {
             out.push_str(&format!(
                 "Plan:      not set — cswitch usage plan {name} <fee> --label <text>\n"
@@ -2051,7 +2065,84 @@ mod billing_cli_tests {
             text.contains("Pro · $2.00/mo · last 30 days $5.00 of list-price usage (2× the fee)"),
             "{text}"
         );
+        assert!(
+            text.contains("Effective: $2.00 per 1M tokens over 30 days (fee ÷ tokens)"),
+            "{text}"
+        );
         assert!(!text.contains("spent"), "{text}");
+    }
+    #[test]
+    fn effective_spend_and_rate_line_keep_subdollar_precision() {
+        // Known-bad: rounding rate 0.135 to cents or dividing by a million twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-01-08T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![usage::metrics::Bucket {
+                profile: "p".into(),
+                hour: now - chrono::Duration::hours(1),
+                model: "acme/model".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        };
+        std::fs::write(
+            tmp.path().join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let billing = usage::billing::Billing {
+            version: 1,
+            profiles: std::collections::BTreeMap::from([(
+                "p".into(),
+                usage::billing::ProfileBilling {
+                    rate: Some(usage::billing::Rate {
+                        model_prefixes: vec!["acme/".into()],
+                        price: usage::billing::RatePrice::Flat { flat: 0.135 },
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        std::fs::write(
+            tmp.path().join("billing.json"),
+            serde_json::to_vec(&billing).unwrap(),
+        )
+        .unwrap();
+        let render = || {
+            usage_info(
+                tmp.path(),
+                "p",
+                &key::AuthMode::ApiKey(None),
+                now,
+                FixedOffset::east_opt(0).unwrap(),
+                &Limits::NoSnapshot,
+            )
+        };
+        let text = render();
+        assert!(
+            text.contains("Rate:      $0.135 per 1M tokens, flat"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Effective: $0.135 per 1M tokens over 30 days (spend ÷ tokens)"),
+            "{text}"
+        );
+        hourly.rows.clear();
+        std::fs::write(
+            tmp.path().join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        assert!(!render().contains("Effective:")); // Known-bad: dividing by zero tokens.
     }
 }
 

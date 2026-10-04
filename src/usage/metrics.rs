@@ -136,6 +136,16 @@ pub fn money(value: f64) -> String {
         parts.into_iter().rev().collect::<Vec<_>>().join(",")
     )
 }
+pub fn rate_money(value: f64) -> String {
+    if value > 0.0 && value < 0.0001 {
+        return "<$0.0001".into();
+    }
+    let mut text = format!("${value:.4}");
+    while text.ends_with('0') && text.split('.').next_back().unwrap().len() > 2 {
+        text.pop();
+    }
+    text
+}
 pub fn start_today(now: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
     now.with_timezone(&offset)
         .date_naive()
@@ -380,6 +390,21 @@ pub fn load_settings(dir: &Path, today: NaiveDate) -> Option<(Rates, Billing)> {
 mod tests {
     use super::*;
     use crate::usage::rates;
+    #[test]
+    fn rate_money_keeps_four_decimal_precision() {
+        // Known-bad: formatting a per-million price as cents.
+        for (value, expected) in [
+            (1.0, "$1.00"),
+            (0.85, "$0.85"),
+            (0.135, "$0.135"),
+            (0.0375, "$0.0375"),
+            (12.5, "$12.50"),
+            (0.0, "$0.00"),
+            (0.00001, "<$0.0001"),
+        ] {
+            assert_eq!(rate_money(value), expected);
+        }
+    }
     fn b(hour: &str, model: &str) -> Bucket {
         Bucket {
             profile: "p".into(),
