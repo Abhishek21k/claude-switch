@@ -23,8 +23,6 @@ pub struct ProfileBilling {
     pub plan: Option<Plan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<Rate>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub top_ups: Vec<TopUp>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,13 +43,6 @@ pub enum RatePrice {
     Flat { flat: f64 },
     PerType(Price),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TopUp {
-    pub date: NaiveDate,
-    pub usd: f64,
-}
-
 pub fn valid_amount(value: f64) -> Result<f64> {
     if value.is_finite() && (0.0..=1_000_000.0).contains(&value) {
         Ok(value)
@@ -63,7 +54,7 @@ fn valid_prefix(prefix: &str) -> bool {
     (1..=64).contains(&prefix.len()) && prefix.bytes().all(|b| (32..=126).contains(&b))
 }
 impl Billing {
-    pub fn validate(&self, today: NaiveDate) -> Result<()> {
+    pub fn validate(&self, _today: NaiveDate) -> Result<()> {
         if self.version != 1 {
             bail!("unsupported billing version")
         }
@@ -95,12 +86,6 @@ impl Billing {
                             valid_amount(x)?;
                         }
                     }
-                }
-            }
-            for topup in &entry.top_ups {
-                valid_amount(topup.usd)?;
-                if topup.date > today {
-                    bail!("top-up date is in the future")
                 }
             }
         }
@@ -392,25 +377,20 @@ mod tests {
 mod validation_tests {
     use super::*;
     #[test]
-    fn invalid_amounts_and_future_topups_are_refused() {
-        // Known-bad: accepting NaN, negative dollars, or future-dated credit.
+    fn invalid_amounts_are_refused() {
+        // Known-bad: accepting NaN or negative dollars in billing settings.
         assert!(valid_amount(f64::NAN).is_err());
         assert!(valid_amount(-1.0).is_err());
-        let date = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
-        let entry = ProfileBilling {
-            top_ups: vec![TopUp {
-                date: date.succ_opt().unwrap(),
-                usd: 1.0,
-            }],
-            ..Default::default()
-        };
-        assert!(
-            Billing {
-                version: 1,
-                profiles: BTreeMap::from([("p".into(), entry)])
-            }
-            .validate(date)
-            .is_err()
-        );
+    }
+    #[test]
+    fn removed_topups_are_rejected_on_read() {
+        // Known-bad: accepting the removed top_ups field in billing.json.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("billing.json"),
+            r#"{"version":1,"profiles":{"p":{"top_ups":[{"date":"2030-01-01","usd":1.0}]}}}"#,
+        )
+        .unwrap();
+        assert!(read(tmp.path(), NaiveDate::from_ymd_opt(2030, 1, 2).unwrap()).is_err());
     }
 }

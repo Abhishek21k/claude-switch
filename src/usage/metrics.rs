@@ -369,31 +369,6 @@ pub fn capacity(
         max: recent.iter().map(|e| e.1).fold(0.0, f64::max),
     })
 }
-pub fn credits(
-    entry: &billing::ProfileBilling,
-    rows: &[Bucket],
-    profile: &str,
-    now: DateTime<Utc>,
-    offset: FixedOffset,
-    rates: &Rates,
-) -> Option<(NaiveDate, f64, f64)> {
-    let first = entry.top_ups.first()?.date;
-    let start = first
-        .and_hms_opt(0, 0, 0)?
-        .and_local_timezone(offset)
-        .single()?
-        .to_utc();
-    let spend = window(
-        rows.iter().filter(|b| b.profile == profile),
-        start,
-        now,
-        rates,
-        Some(entry),
-        true,
-    )
-    .spend;
-    Some((first, entry.top_ups.iter().map(|t| t.usd).sum(), spend))
-}
 pub fn load_settings(dir: &Path, today: NaiveDate) -> Option<(Rates, Billing)> {
     Some((
         super::rates::read_or_seed(dir).ok()?,
@@ -591,54 +566,5 @@ mod persistence_tests {
         assert_eq!(history(&dir).len(), 1); // Known-bad: saving an account-mismatched snapshot.
         assert_eq!(fs::read_to_string(&source).unwrap(), data);
         assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
-    }
-}
-
-#[cfg(test)]
-mod credit_tests {
-    use super::*;
-    use crate::usage::{billing, rates};
-    #[test]
-    fn credits_start_at_earliest_topup_local_midnight() {
-        // Known-bad: subtracting all-time spend, including before the first top-up.
-        let date = NaiveDate::from_ymd_opt(2030, 1, 2).unwrap();
-        let entry = billing::ProfileBilling {
-            rate: Some(billing::Rate {
-                model_prefixes: vec![],
-                price: billing::RatePrice::Flat { flat: 1.0 },
-            }),
-            top_ups: vec![
-                billing::TopUp { date, usd: 10.0 },
-                billing::TopUp {
-                    date: date.succ_opt().unwrap(),
-                    usd: 5.0,
-                },
-            ],
-            ..Default::default()
-        };
-        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().to_utc();
-        let make = |s: &str| Bucket {
-            profile: "p".into(),
-            hour: at(s),
-            model: "m".into(),
-            speed: None,
-            requests: 1,
-            input: 1_000_000,
-            output: 0,
-            cache_write_5m: 0,
-            cache_write_1h: 0,
-            cache_read: 0,
-        };
-        let rows = vec![make("2030-01-02T02:00:00Z"), make("2030-01-02T03:00:00Z")];
-        let result = credits(
-            &entry,
-            &rows,
-            "p",
-            at("2030-01-04T00:00:00Z"),
-            FixedOffset::west_opt(3 * 3600).unwrap(),
-            &rates::seed(),
-        )
-        .unwrap();
-        assert_eq!(result, (date, 15.0, 1.0));
     }
 }

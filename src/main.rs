@@ -9,7 +9,7 @@ mod tui;
 mod usage;
 
 use anyhow::Result;
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use limits::{Limits, Window, format_info, parse_limits, read_claude_json};
 use profile::{LoginMethod, LoginOutcome, ProfileManager, Tool, detect_current_account};
@@ -229,17 +229,6 @@ enum UsageAction {
         model_prefix: Vec<String>,
         #[arg(long)]
         clear: bool,
-    },
-    /// Record, list or undo a credit top-up
-    Topup {
-        profile: String,
-        usd: Option<f64>,
-        #[arg(long)]
-        date: Option<NaiveDate>,
-        #[arg(long)]
-        list: bool,
-        #[arg(long)]
-        undo: bool,
     },
 }
 
@@ -599,56 +588,6 @@ fn main() -> Result<()> {
                     })?;
                     format!("Rate updated for {profile}.\n")
                 }
-                Some(UsageAction::Topup {
-                    profile,
-                    usd,
-                    date,
-                    list,
-                    undo,
-                }) => {
-                    require_billing_class(&manager, &profile, true)?;
-                    let today = Local::now().date_naive();
-                    if list {
-                        if usd.is_some() || date.is_some() || undo {
-                            anyhow::bail!("--list takes no amount or date")
-                        }
-                        let settings = usage::billing::read(&store.dir, today)?;
-                        settings
-                            .profiles
-                            .get(&profile)
-                            .map(|entry| {
-                                entry
-                                    .top_ups
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, t)| format!("{}. {} ${:.2}\n", i + 1, t.date, t.usd))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        if undo {
-                            if usd.is_some() || date.is_some() {
-                                anyhow::bail!("--undo takes no amount or date")
-                            }
-                        } else if usd.is_none() {
-                            anyhow::bail!("provide an amount, --list or --undo")
-                        }
-                        usage::billing::edit(&store, today, |billing| {
-                            let entry = billing.profiles.entry(profile.clone()).or_default();
-                            if undo {
-                                entry.top_ups.pop();
-                            } else {
-                                entry.top_ups.push(usage::billing::TopUp {
-                                    date: date.unwrap_or(today),
-                                    usd: usd.unwrap(),
-                                });
-                                entry.top_ups.sort_by_key(|t| t.date);
-                            }
-                            Ok(())
-                        })?;
-                        format!("Top-ups updated for {profile}.\n")
-                    }
-                }
                 Some(UsageAction::Verify) => {
                     let (output, exit_code) = usage::report::verify(&store)?;
                     verify_exit_code = exit_code;
@@ -684,9 +623,7 @@ fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) 
     }
     let mode = key::read_auth_mode(manager, name, read_claude_json(&manager.profile_dir(name)));
     if per_token && !mode.api_billed() {
-        anyhow::bail!(
-            "{name} is not a per-token profile; rates and top-ups apply to per-token profiles"
-        )
+        anyhow::bail!("{name} is not a per-token profile; rates apply to per-token profiles")
     }
     if !per_token && mode != key::AuthMode::Subscription {
         anyhow::bail!("{name} is not a subscription profile; plans apply to subscription profiles")
@@ -820,22 +757,6 @@ fn usage_info(
         } else {
             out.push_str(&format!(
                 "Rate:      not set — cswitch usage rate {name} --flat <usd>\n"
-            ));
-        }
-        if let Some(entry) = entry
-            && let Some((first, total, spent)) =
-                m::credits(entry, &hourly.rows, name, now, offset, &rates)
-        {
-            let balance = total - spent;
-            let left = if balance < 0.0 {
-                format!("{} over", m::money(-balance))
-            } else {
-                format!("{} left", m::money(balance))
-            };
-            out.push_str(&format!(
-                "Credits:   {} topped up since {first} · {} spent · {left}\n",
-                m::money(total),
-                m::money(spent)
             ));
         }
     } else if *auth == key::AuthMode::Subscription {
@@ -2049,19 +1970,17 @@ mod billing_view_tests {
         assert!(!usage.join("rates.json").exists());
         assert!(!usage.join("billing.json").exists());
         assert!(!usage.join(".lock").exists());
-        fs::write(
-            usage.join("billing.json"),
-            r#"{"version":1,"profiles":{"p":{"top_ups":[{"date":"2026-01-01","usd":1.0}]}}}"#,
-        )
-        .unwrap();
-        let over = info_output(&manager, "p", now).unwrap();
-        assert!(over.contains("$4.00 over"), "{over}"); // Known-bad: showing a negative balance as dollars left.
     }
 }
 
 #[cfg(test)]
 mod billing_cli_tests {
     use super::*;
+    #[test]
+    fn removed_topup_command_is_rejected() {
+        // Known-bad: the removed topup command still parsing.
+        assert!(Cli::try_parse_from(["cswitch", "usage", "topup", "p", "1"]).is_err());
+    }
     #[test]
     fn flat_and_per_type_flags_conflict_at_parse_time() {
         // Known-bad: accepting both flat and per-type prices and silently choosing one.
