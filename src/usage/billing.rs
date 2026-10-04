@@ -288,14 +288,7 @@ pub fn price(
     per_token: bool,
 ) -> (Option<f64>, Option<f64>) {
     let list = rates
-        .model_rate(model)
-        .and_then(|m| {
-            if speed == Some("fast") {
-                m.fast.as_ref()
-            } else {
-                Some(&m.standard)
-            }
-        })
+        .price_for(model, speed)
         .map(|p| price_tokens(tokens[0], tokens[1], tokens[2], tokens[3], tokens[4], p).total());
     let spend = if per_token {
         entry
@@ -321,6 +314,117 @@ mod tests {
     use super::*;
     use crate::usage::ledger::Source;
     use crate::usage::rates;
+    #[test]
+    fn per_type_rate_charges_all_five_kinds_and_fast_uses_fast_list_price() {
+        // Known-bads: returning list price for a per-type spend and pricing fast as standard.
+        let entry = ProfileBilling {
+            rate: Some(Rate {
+                model_prefixes: vec!["acme/".into()],
+                price: RatePrice::PerType(Price {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_write_5m: 3.0,
+                    cache_write_1h: 4.0,
+                    cache_read: 5.0,
+                }),
+            }),
+            ..Default::default()
+        };
+        let (list, spend) = price(
+            "acme/m",
+            None,
+            [1_000_000; 5],
+            &rates::seed(),
+            Some(&entry),
+            true,
+        );
+        assert_eq!(list, None);
+        assert_eq!(spend, Some(15.0));
+        let mut rates = rates::seed();
+        let standard = rates.models["claude-opus-5"].standard.clone();
+        let mut fast = standard.clone();
+        fast.input = 9.0;
+        rates.models.get_mut("claude-opus-5").unwrap().fast = Some(fast);
+        assert_eq!(
+            price(
+                "claude-opus-5",
+                Some("fast"),
+                [1_000_000, 0, 0, 0, 0],
+                &rates,
+                None,
+                false
+            )
+            .0,
+            Some(9.0)
+        );
+        rates.models.get_mut("claude-opus-5").unwrap().fast = None;
+        assert_eq!(
+            price(
+                "claude-opus-5",
+                Some("fast"),
+                [1_000_000, 0, 0, 0, 0],
+                &rates,
+                None,
+                false
+            )
+            .0,
+            None
+        );
+    }
+    #[test]
+    fn strict_profile_and_rate_shapes_refuse_unknown_or_mixed_fields() {
+        // Known-bads: ignoring an unknown profile field or letting the flat arm absorb per-type fields.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("billing.json");
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        fs::write(&path, r#"{"version":1,"profiles":{"p":{"unknown":1}}}"#).unwrap();
+        assert!(read(tmp.path(), now).is_err());
+        fs::write(
+            &path,
+            r#"{"version":1,"profiles":{"p":{"rate":{"flat":1,"input":2}}}}"#,
+        )
+        .unwrap();
+        assert!(read(tmp.path(), now).is_err());
+    }
+    #[test]
+    fn prefixes_and_amount_boundaries_are_strict() {
+        // Known-bads: accepting an empty or 65-character prefix, a 21-character label, or >$1M.
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(valid_amount(1_000_000.0).unwrap(), 1_000_000.0);
+        assert!(valid_amount(1_000_000.01).is_err());
+        for prefix in ["".to_string(), "x".repeat(65)] {
+            let entry = ProfileBilling {
+                rate: Some(Rate {
+                    model_prefixes: vec![prefix],
+                    price: RatePrice::Flat { flat: 1.0 },
+                }),
+                ..Default::default()
+            };
+            let billing = Billing {
+                version: 1,
+                profiles: BTreeMap::from([("p".into(), entry)]),
+            };
+            assert!(billing.validate(now).is_err());
+        }
+        let billing = Billing {
+            version: 1,
+            profiles: BTreeMap::from([(
+                "p".into(),
+                ProfileBilling {
+                    plan: Some(Plan {
+                        label: "x".repeat(21),
+                        fee_usd: 20.0,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+        };
+        assert!(billing.validate(now).is_err());
+    }
     #[test]
     fn plan_fee_change_keeps_existing_label() {
         // Known-bad: changing only a fee resets an existing label to Plan.

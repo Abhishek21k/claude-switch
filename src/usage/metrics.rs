@@ -583,8 +583,65 @@ mod tests {
         // Known-bad: $1000.00, 1000 k, and 100.0 k at rounded unit boundaries.
         assert_eq!(money(999.996), "$1,000");
         assert_eq!(money(999.99), "$999.99");
+        assert_eq!(money(12_345.6), "$12,346");
         assert_eq!(tokens(999_999), "1.00 M");
         assert_eq!(tokens(99_999), "100 k");
+    }
+    #[test]
+    fn token_format_scales_all_magnitudes() {
+        // Known-bad: reporting raw token integers without k, M and B scaling.
+        for (value, expected) in [
+            (950, "950"),
+            (12_300, "12.3 k"),
+            (4_560_000, "4.56 M"),
+            (678_000_000, "678 M"),
+            (4_560_000_000, "4.56 B"),
+        ] {
+            assert_eq!(tokens(value), expected);
+        }
+    }
+    #[test]
+    fn fast_hourly_bucket_uses_only_an_explicit_fast_list_rate() {
+        // Known-bad: pricing a fast hourly bucket at the standard rate.
+        let mut rates = rates::seed();
+        let mut fast = rates.models["claude-opus-5"].standard.clone();
+        fast.input = 9.0;
+        rates.models.get_mut("claude-opus-5").unwrap().fast = Some(fast);
+        let now = DateTime::parse_from_rfc3339("2030-01-02T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let bucket = Bucket {
+            profile: "p".into(),
+            hour: now - Duration::hours(1),
+            model: "claude-opus-5".into(),
+            speed: Some("fast".into()),
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        let amount = window(
+            std::iter::once(&bucket),
+            now - Duration::hours(2),
+            now,
+            &rates,
+            None,
+            false,
+        );
+        assert_eq!(amount.value, 9.0);
+        rates.models.get_mut("claude-opus-5").unwrap().fast = None;
+        let missing = window(
+            std::iter::once(&bucket),
+            now - Duration::hours(2),
+            now,
+            &rates,
+            None,
+            false,
+        );
+        assert_eq!(missing.priced, 0);
+        assert_eq!(missing.unpriced, 1);
     }
     fn b(hour: &str, model: &str) -> Bucket {
         Bucket {
@@ -931,6 +988,28 @@ mod reset_capacity_tests {
         assert_eq!(result.min, 20.0);
         assert_eq!(result.max, 50.0);
     }
+    #[test]
+    fn capacity_threshold_tie_and_overfull_percent_are_bounded() {
+        // Known-bads: excluding exactly 20%, picking the older tie, or dividing by 105%.
+        let rows = [
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 20.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 20.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-05T00:00:00Z",
+            vec![bucket("2030-01-02T00:00:00Z", 1)],
+        );
+        let result = estimate(&rows, &usage, &[]).estimate.unwrap();
+        assert_eq!(result.lower, 25.0);
+        assert_eq!(result.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
+        let over = [row(
+            "2030-01-03T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            105.0,
+            None,
+        )];
+        assert_eq!(estimate(&over, &usage, &[]).estimate.unwrap().lower, 5.0);
+    }
 }
 
 #[cfg(test)]
@@ -938,6 +1017,33 @@ mod persistence_tests {
     use super::*;
     use crate::usage::ledger::{Source, Store};
     use std::fs;
+    #[test]
+    fn ingest_calls_history_append_once_for_unchanged_snapshot() {
+        // Known-bad: removing append_history from Store::ingest while direct append tests still pass.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        fs::create_dir_all(profile.join("projects")).unwrap();
+        fs::write(
+            profile.join(".claude.json"),
+            serde_json::json!({
+                "cachedUsageUtilization":{"fetchedAtMs":1893456000000_i64,
+                    "utilization":{"limits":[{"kind":"weekly_all","group":"weekly","percent":50,
+                        "resets_at":"2030-01-08T00:00:00Z"}]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = Store::new(
+            tmp.path().join("usage"),
+            vec![Source {
+                profile: "p".into(),
+                directory: profile,
+            }],
+        );
+        store.ingest().unwrap();
+        store.ingest().unwrap();
+        assert_eq!(history(&store.dir).len(), 1);
+    }
     #[test]
     fn rollup_from_deduplicated_ledger_and_incremental_ingest() {
         // Known-bad: summing raw transcript records instead of the deduplicated ledger.
@@ -947,7 +1053,10 @@ mod persistence_tests {
         fs::create_dir_all(&project).unwrap();
         let record = |id: &str| {
             serde_json::json!({"type":"assistant","timestamp":"2030-01-01T12:05:00Z","sessionId":"s",
-          "requestId":format!("req-{id}"),"message":{"id":format!("msg-{id}"),"model":"claude-opus-5","usage":{"input_tokens":10}}}).to_string()
+          "requestId":format!("req-{id}"),"message":{"id":format!("msg-{id}"),"model":"claude-opus-5",
+          "usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":70,
+            "cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":40},
+            "cache_read_input_tokens":50,"speed":"fast"}}}).to_string()
         };
         fs::write(
             project.join("a.jsonl"),
@@ -966,6 +1075,11 @@ mod persistence_tests {
         assert_eq!(first.rows.len(), 1);
         assert_eq!(first.rows[0].requests, 1);
         assert_eq!(first.rows[0].input, 10);
+        assert_eq!(first.rows[0].output, 20);
+        assert_eq!(first.rows[0].cache_write_5m, 30);
+        assert_eq!(first.rows[0].cache_write_1h, 40);
+        assert_eq!(first.rows[0].cache_read, 50);
+        assert_eq!(first.rows[0].speed.as_deref(), Some("fast"));
         fs::write(
             project.join("a.jsonl"),
             format!("{}\n{}\n{}\n", record("1"), record("1"), record("2")),
@@ -975,6 +1089,11 @@ mod persistence_tests {
         let second = read(&store.dir).unwrap();
         assert_eq!(second.rows[0].requests, 2);
         assert_eq!(second.rows[0].input, 20);
+        assert_eq!(second.rows[0].output, 40);
+        assert_eq!(second.rows[0].cache_write_5m, 60);
+        assert_eq!(second.rows[0].cache_write_1h, 80);
+        assert_eq!(second.rows[0].cache_read, 100);
+        assert_eq!(second.rows[0].speed.as_deref(), Some("fast"));
     }
     #[test]
     fn history_deduplicates_and_never_writes_claude_json() {

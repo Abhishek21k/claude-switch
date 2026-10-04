@@ -2054,6 +2054,127 @@ mod billing_view_tests {
     use chrono::TimeZone;
     use std::fs;
     use tempfile::TempDir;
+    fn usage_tree(
+        root: &Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, (Option<Vec<u8>>, std::time::SystemTime)>
+    {
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<
+                std::path::PathBuf,
+                (Option<Vec<u8>>, std::time::SystemTime),
+            >,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::metadata(&path).unwrap();
+                let bytes = if meta.is_file() {
+                    Some(fs::read(&path).unwrap())
+                } else {
+                    None
+                };
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    (bytes, meta.modified().unwrap()),
+                );
+                if meta.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+    #[test]
+    fn plan_views_union_live_snapshot_without_writing_any_usage_file() {
+        // Known-bads: omitting the live snapshot when history is absent, or creating limits.jsonl on a read path.
+        let tmp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 7, 12, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "p".into(),
+            profile::Profile {
+                name: "p".into(),
+                tool: Tool::Claude,
+                email: Some("p@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("p")).unwrap();
+        let live = serde_json::json!({"oauthAccount":{},"cachedUsageUtilization":{
+            "fetchedAtMs":Utc.with_ymd_and_hms(2030,1,5,0,0,0).unwrap().timestamp_millis(),
+            "utilization":{"limits":[{"kind":"weekly_all","group":"weekly","percent":50,
+                "resets_at":"2030-01-08T00:00:00Z"}],
+                "seven_day_breakdown":{"window_started_at":"2030-01-01T00:00:00Z"}}}});
+        fs::write(
+            manager.profile_dir("p").join(".claude.json"),
+            live.to_string(),
+        )
+        .unwrap();
+        let usage = manager.base_dir.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: Utc.with_ymd_and_hms(2030, 1, 6, 0, 0, 0).unwrap(),
+            rows: vec![usage::metrics::Bucket {
+                profile: "p".into(),
+                hour: Utc.with_ymd_and_hms(2030, 1, 2, 0, 0, 0).unwrap(),
+                model: "claude-opus-5".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        };
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            usage.join("billing.json"),
+            r#"{"version":1,"profiles":{"p":{"plan":{"label":"Pro","fee_usd":20.0}}}}"#,
+        )
+        .unwrap();
+        let without_history = info_output(&manager, "p", now).unwrap();
+        assert!(
+            without_history.contains("Capacity:  weekly limit ≈ $10 of list-price usage"),
+            "{without_history}"
+        );
+        assert!(!usage.join("limits.jsonl").exists());
+        fs::write(
+            usage.join("limits.jsonl"),
+            serde_json::json!({"profile":"p",
+            "fetched_at":"2030-01-03T00:00:00Z","weekly":{"percent":40,
+                "resets_at":"2030-01-08T00:00:00Z"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let before = usage_tree(&usage);
+        let list = list_output(&manager, now).unwrap();
+        let info = info_output(&manager, "p", now).unwrap();
+        assert!(list.contains("30D $"));
+        assert!(
+            info.contains("Capacity:  weekly limit ≈ $10 of list-price usage"),
+            "{info}"
+        );
+        assert_eq!(usage_tree(&usage), before);
+    }
     #[test]
     fn read_only_views_preserve_usage_files_and_show_age() {
         // Known-bad: a list/info read seeds rates, takes the lock, or rewrites the rollup.
@@ -2181,6 +2302,59 @@ mod billing_view_tests {
 #[cfg(test)]
 mod billing_cli_tests {
     use super::*;
+    #[test]
+    fn class_guards_refuse_every_wrong_profile_type() {
+        // Known-bad: removing a plan, rate, reset, missing-auth or Codex class guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let mut registry = profile::Registry::default();
+        for (name, tool, auth) in [
+            ("plan", Tool::Claude, r#"{"oauthAccount":{}}"#),
+            ("keyed", Tool::Claude, r#"{"primaryApiKey":"synthetic"}"#),
+            ("empty", Tool::Claude, "{}"),
+            ("codex", Tool::Codex, "{}"),
+        ] {
+            registry.profiles.insert(
+                name.into(),
+                profile::Profile {
+                    name: name.into(),
+                    tool,
+                    email: Some(format!("{name}@example.com")),
+                    added: Utc::now(),
+                    last_used: None,
+                },
+            );
+            std::fs::create_dir_all(manager.profile_dir(name)).unwrap();
+            std::fs::write(manager.profile_dir(name).join(".claude.json"), auth).unwrap();
+        }
+        std::fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        assert!(require_billing_class(&manager, "plan", false).is_ok());
+        assert!(require_billing_class(&manager, "keyed", true).is_ok());
+        assert!(require_billing_class(&manager, "plan", true).is_err());
+        assert!(require_billing_class(&manager, "keyed", false).is_err());
+        for name in ["empty", "codex"] {
+            assert!(require_billing_class(&manager, name, true).is_err());
+            assert!(require_billing_class(&manager, name, false).is_err());
+        }
+        let store = usage::store(&manager, None).unwrap();
+        assert!(
+            reset_action(
+                &manager,
+                &store,
+                "keyed",
+                ResetCommand::Record(None),
+                Utc::now(),
+                FixedOffset::east_opt(0).unwrap()
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn reset_cli_uses_local_brackets_and_private_locked_settings() {
         // Known-bads: treating a local date as a UTC day, allowing a per-token reset,
@@ -2723,6 +2897,77 @@ mod billing_list_variants_tests {
     use chrono::TimeZone;
     use std::fs;
     #[test]
+    fn ten_day_bucket_counts_in_thirty_day_list_and_info_only() {
+        // Known-bad: the 30D list cell reading the seven-day window.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 2, 1, 12, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "p".into(),
+            profile::Profile {
+                name: "p".into(),
+                tool: Tool::Claude,
+                email: Some("p@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("p")).unwrap();
+        fs::write(
+            manager.profile_dir("p").join(".claude.json"),
+            r#"{"oauthAccount":{}}"#,
+        )
+        .unwrap();
+        let usage = manager.base_dir.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        let hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![usage::metrics::Bucket {
+                profile: "p".into(),
+                hour: now - chrono::Duration::days(10),
+                model: "claude-opus-5".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        };
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let list = list_output(&manager, now).unwrap();
+        let info = info_output(&manager, "p", now).unwrap();
+        assert!(
+            list.lines()
+                .any(|line| line.starts_with("p ") && line.contains("~$5.00")),
+            "{list}"
+        );
+        let seven = info
+            .lines()
+            .find(|line| line.trim_start().starts_with("7 days"))
+            .unwrap();
+        let thirty = info
+            .lines()
+            .find(|line| line.trim_start().starts_with("30 days"))
+            .unwrap();
+        assert!(seven.contains("— list price"), "{seven}");
+        assert!(thirty.contains("$5.00 list price"), "{thirty}");
+    }
+    #[test]
     fn wide_list_and_every_money_cell_variant_fit_120_columns() {
         // Known-bad: a 121-column row or assuming every Claude request has a price.
         let tmp = tempfile::tempdir().unwrap();
@@ -2734,6 +2979,7 @@ mod billing_list_variants_tests {
         let mut registry = profile::Registry::default();
         for (name, auth) in [
             (long, "{\"primaryApiKey\":\"synthetic\"}"),
+            ("keyed", "{\"primaryApiKey\":\"synthetic\"}"),
             ("plan", "{\"oauthAccount\":{}}"),
             ("other", "{}"),
         ] {
@@ -2783,12 +3029,15 @@ mod billing_list_variants_tests {
             cache_write_1h: 0,
             cache_read: 0,
         };
+        let mut plan_row = row("plan", "claude-opus-5");
+        plan_row.input = 2_469_120_000; // Known-bad: $12,345.60 rendered with cents or no comma.
         let hourly = usage::metrics::Hourly {
             version: 1,
             generated_at: now,
             rows: vec![
                 row(long, "unknown"),
-                row("plan", "claude-opus-5"),
+                row("keyed", "acme/claude-x.5"),
+                plan_row,
                 row("other", "claude-opus-5"),
                 row("other", "unknown"),
             ],
@@ -2798,6 +3047,16 @@ mod billing_list_variants_tests {
             serde_json::to_vec(&hourly).unwrap(),
         )
         .unwrap();
+        let mut rates = usage::rates::seed();
+        rates
+            .aliases
+            .insert("acme/claude-x.5".into(), "claude-opus-5".into());
+        fs::write(
+            usage.join("rates.json"),
+            serde_json::to_vec(&rates).unwrap(),
+        )
+        .unwrap();
+        fs::write(usage.join("billing.json"),r#"{"version":1,"profiles":{"keyed":{"rate":{"model_prefixes":["acme/"],"flat":1.0}}}}"#).unwrap();
         let out = list_output(&manager, now).unwrap();
         assert!(out.lines().all(|line| line.chars().count() <= 120), "{out}");
         assert!(
@@ -2807,9 +3066,14 @@ mod billing_list_variants_tests {
         );
         assert!(
             out.lines()
-                .any(|line| line.starts_with("plan ") && line.contains("~$5.00")),
+                .any(|line| line.starts_with("plan ") && line.contains("~$12,346")),
             "{out}"
         );
+        let keyed = out.lines().find(|line| line.starts_with("keyed ")).unwrap();
+        assert!(
+            keyed.contains("$1.00") && !keyed.contains("$5.00"),
+            "{keyed}"
+        ); // Known-bad: per-token cell using list value.
         assert!(
             out.lines()
                 .any(|line| line.starts_with("other ") && line.contains("~$5.00*")),

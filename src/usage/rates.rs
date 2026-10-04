@@ -103,6 +103,14 @@ impl Rates {
             .get(name)
             .or_else(|| self.aliases.get(name).and_then(|id| self.models.get(id)))
     }
+    pub fn price_for(&self, name: &str, speed: Option<&str>) -> Option<&Price> {
+        let model = self.model_rate(name)?;
+        if speed == Some("fast") {
+            model.fast.as_ref()
+        } else {
+            Some(&model.standard)
+        }
+    }
 }
 
 pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<bool> {
@@ -141,12 +149,7 @@ pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<bool>
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
     // Known-bad: prefix matching "sonnet" or pricing fast as standard silently
     // invents a rate. Both cases must remain unpriced until explicitly listed.
-    let model = rates.model_rate(&request.model)?;
-    let price = if request.speed.as_deref() == Some("fast") {
-        model.fast.as_ref()?
-    } else {
-        &model.standard
-    };
+    let price = rates.price_for(&request.model, request.speed.as_deref())?;
     let per_million = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
     Some(Cost {
         input: per_million(request.input, price.input),
@@ -235,6 +238,7 @@ mod alias_tests {
             5.0
         );
         assert!(rates.model_rate("ACME/claude-x.5").is_none());
+        assert!(rates.model_rate("acme/claude-opus-5.5").is_none()); // Known-bad: stripping a prefix and normalizing the dot to a dash.
         rates.aliases.insert("bad".into(), "missing".into());
         assert!(rates.model_rate("bad").is_none());
         let tmp = tempfile::tempdir().unwrap();
