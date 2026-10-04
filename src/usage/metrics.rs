@@ -865,25 +865,25 @@ mod reset_capacity_tests {
     fn recorded_and_detected_reset_merge_to_the_intersection() {
         // Known-bad: splitting one recorded and detected event twice.
         let rows = [
-            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
-            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 30.0, None),
+            row("2030-01-03T12:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-04T12:00:00Z", "2030-01-08T00:00:00Z", 30.0, None),
         ];
-        let point = at("2030-01-03T12:00:00Z");
         let reset = billing::LimitReset {
-            from: point,
-            to: point,
+            from: at("2030-01-03T00:00:00Z"),
+            to: at("2030-01-04T00:00:00Z"),
         };
         let usage = hourly(
             "2030-01-05T00:00:00Z",
             vec![
                 bucket("2030-01-03T13:00:00Z", 1),
                 bucket("2030-01-04T00:00:00Z", 1),
+                bucket("2030-01-04T12:00:00Z", 1),
             ],
         );
         let result = estimate(&rows, &usage, &[reset]).estimate.unwrap();
-        assert_eq!(result.after_reset, Some(point));
+        assert_eq!(result.after_reset, Some(at("2030-01-03T12:00:00Z")));
         assert!((result.lower - 10.0 / 0.3).abs() < 0.001);
-        assert_eq!(result.lower, result.upper);
+        assert!((result.upper - 15.0 / 0.3).abs() < 0.001);
     }
     #[test]
     fn snapshot_strictly_inside_recorded_day_has_no_segment() {
