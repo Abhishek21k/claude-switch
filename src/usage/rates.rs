@@ -105,7 +105,7 @@ impl Rates {
     }
 }
 
-pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<()> {
+pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<bool> {
     let path = dir.join("rates.json");
     if !path.exists() {
         atomic::write_once(&path, &serde_json::to_vec_pretty(&seed())?)?;
@@ -127,11 +127,15 @@ pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<()> {
             .unwrap()
             .insert(model.into(), target.into());
     } else {
-        if let Some(aliases) = raw.get_mut("aliases") {
-            aliases.as_object_mut().unwrap().remove(model);
+        let Some(aliases) = raw.get_mut("aliases") else {
+            return Ok(false);
+        };
+        if aliases.as_object_mut().unwrap().remove(model).is_none() {
+            return Ok(false);
         }
     }
-    atomic::write(&path, &serde_json::to_vec_pretty(&raw)?)
+    atomic::write(&path, &serde_json::to_vec_pretty(&raw)?)?;
+    Ok(true)
 }
 
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
@@ -282,5 +286,17 @@ mod alias_file_tests {
         );
         assert_eq!(removed["note"], "synthetic note");
         assert_eq!(removed["models"]["claude-opus-5"]["standard"]["extra"], 42);
+    }
+    #[test]
+    fn removing_missing_alias_is_a_noop() {
+        // Known-bad: claiming an absent alias was updated and rewriting rates.json.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rates.json");
+        let data = serde_json::to_vec(&seed()).unwrap();
+        fs::write(&path, &data).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(!edit_alias(tmp.path(), "acme/missing", None).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
     }
 }

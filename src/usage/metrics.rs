@@ -121,7 +121,7 @@ fn money_cell(value: f64, priced: u64, unpriced: u64, approx: bool) -> String {
     format!("{marker}{}{star}", money(value))
 }
 pub fn money(value: f64) -> String {
-    if value.abs() < 1000.0 {
+    if (value * 100.0).round().abs() < 100_000.0 {
         return format!("${value:.2}");
     }
     let rounded = value.round() as i64;
@@ -233,22 +233,43 @@ pub fn tokens(value: u64) -> String {
     if value < 1000 {
         return value.to_string();
     }
-    let (scale, suffix) = if value >= 1_000_000_000 {
-        (1e9, "B")
+    let units = [(1e3, "k"), (1e6, "M"), (1e9, "B")];
+    let mut unit = if value >= 1_000_000_000 {
+        2
     } else if value >= 1_000_000 {
-        (1e6, "M")
-    } else {
-        (1e3, "k")
-    };
-    let n = value as f64 / scale;
-    let precision = if n >= 100.0 {
-        0
-    } else if n >= 10.0 {
         1
     } else {
-        2
+        0
     };
-    format!("{n:.precision$} {suffix}")
+    loop {
+        let (scale, suffix) = units[unit];
+        let n = value as f64 / scale;
+        let mut precision = if n >= 100.0 {
+            0
+        } else if n >= 10.0 {
+            1
+        } else {
+            2
+        };
+        let mut rounded = format!("{n:.precision$}").parse::<f64>().unwrap();
+        if rounded >= 1000.0 && unit < 2 {
+            unit += 1;
+            continue;
+        }
+        precision = if rounded >= 100.0 {
+            0
+        } else if rounded >= 10.0 {
+            1
+        } else {
+            2
+        };
+        rounded = format!("{n:.precision$}").parse::<f64>().unwrap();
+        if rounded >= 1000.0 && unit < 2 {
+            unit += 1;
+            continue;
+        }
+        return format!("{n:.precision$} {suffix}");
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Weekly {
@@ -379,11 +400,23 @@ pub fn capacity(
         max: recent.iter().map(|e| e.1).fold(0.0, f64::max),
     })
 }
-pub fn load_settings(dir: &Path, today: NaiveDate) -> Option<(Rates, Billing)> {
-    Some((
-        super::rates::read_or_seed(dir).ok()?,
-        billing::read(dir, today).ok()?,
-    ))
+pub fn load_settings(
+    dir: &Path,
+    today: NaiveDate,
+) -> Result<(Rates, Billing), (&'static str, String)> {
+    let rates =
+        super::rates::read_or_seed(dir).map_err(|error| ("rates.json", error.to_string()))?;
+    let billing = billing::read(dir, today).map_err(|error| {
+        let reason = error.to_string();
+        (
+            "billing.json",
+            reason
+                .strip_prefix("billing.json: ")
+                .unwrap_or(&reason)
+                .to_string(),
+        )
+    })?;
+    Ok((rates, billing))
 }
 
 #[cfg(test)]
@@ -404,6 +437,14 @@ mod tests {
         ] {
             assert_eq!(rate_money(value), expected);
         }
+    }
+    #[test]
+    fn rounded_money_and_tokens_choose_the_right_unit() {
+        // Known-bad: $1000.00, 1000 k, and 100.0 k at rounded unit boundaries.
+        assert_eq!(money(999.996), "$1,000");
+        assert_eq!(money(999.99), "$999.99");
+        assert_eq!(tokens(999_999), "1.00 M");
+        assert_eq!(tokens(99_999), "100 k");
     }
     fn b(hour: &str, model: &str) -> Bucket {
         Bucket {

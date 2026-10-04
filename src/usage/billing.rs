@@ -30,6 +30,12 @@ pub struct Plan {
     pub label: String,
     pub fee_usd: f64,
 }
+pub fn set_plan(entry: &mut ProfileBilling, fee_usd: f64, label: Option<String>) {
+    let label = label
+        .or_else(|| entry.plan.as_ref().map(|plan| plan.label.clone()))
+        .unwrap_or_else(|| "Plan".into());
+    entry.plan = Some(Plan { label, fee_usd });
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rate {
     #[serde(default)]
@@ -93,6 +99,9 @@ impl Billing {
     }
 }
 pub fn read(dir: &Path, today: NaiveDate) -> Result<Billing> {
+    read_inner(dir, today).map_err(|error| anyhow::anyhow!("billing.json: {error}"))
+}
+fn read_inner(dir: &Path, today: NaiveDate) -> Result<Billing> {
     let path = dir.join("billing.json");
     if !path.exists() {
         return Ok(Billing {
@@ -145,10 +154,35 @@ where
 }
 pub fn purge(store: &Store, profile: &str) -> Result<()> {
     let today = Local::now().date_naive();
-    edit(store, today, |billing| {
-        billing.profiles.remove(profile);
-        Ok(())
-    })
+    let Some(_lock) = store.try_lock()? else {
+        bail!("usage store busy; try again")
+    };
+    // Known-bad: purging ledger rows before refusing a malformed billing.json.
+    let mut billing = read(&store.dir, today)?;
+    let history_path = store.dir.join("limits.jsonl");
+    let retained = if history_path.exists() {
+        let raw = fs::read_to_string(&history_path)?;
+        let mut kept = String::new();
+        for line in raw.lines() {
+            let row: super::metrics::LimitRow = serde_json::from_str(line)?;
+            if row.profile != profile {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        Some(kept)
+    } else {
+        None
+    };
+    store.purge_profile_locked(profile)?;
+    if let Some(retained) = retained {
+        atomic::write(&history_path, retained.as_bytes())?;
+    }
+    billing.profiles.remove(profile);
+    atomic::write_private(
+        &store.dir.join("billing.json"),
+        &serde_json::to_vec_pretty(&billing)?,
+    )
 }
 
 pub fn price_tokens(
@@ -208,7 +242,120 @@ pub fn price(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::ledger::Source;
     use crate::usage::rates;
+    #[test]
+    fn plan_fee_change_keeps_existing_label() {
+        // Known-bad: changing only a fee resets an existing label to Plan.
+        let mut entry = ProfileBilling::default();
+        set_plan(&mut entry, 20.0, Some("Pro".into()));
+        set_plan(&mut entry, 25.0, None);
+        assert_eq!(entry.plan.as_ref().unwrap().label, "Pro");
+        assert_eq!(entry.plan.as_ref().unwrap().fee_usd, 25.0);
+        let mut new = ProfileBilling::default();
+        set_plan(&mut new, 1.0, None);
+        assert_eq!(new.plan.unwrap().label, "Plan");
+    }
+    #[test]
+    fn purge_validates_billing_first_and_removes_limit_history() {
+        // Known-bad: purging ledger rows before a malformed billing.json is refused,
+        // or leaving a removed profile's capacity history behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let usage = tmp.path().join("usage");
+        let mut sources = Vec::new();
+        for name in ["p", "q"] {
+            let profile = tmp.path().join(name);
+            let project = profile.join("projects/demo");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(
+                project.join("a.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"assistant","timestamp":"2030-01-01T12:05:00Z",
+                    "sessionId":format!("session-{name}"),"requestId":format!("req-{name}"),
+                    "message":{"id":format!("msg-{name}"),"model":"claude-opus-5",
+                        "usage":{"input_tokens":10}}})
+                ),
+            )
+            .unwrap();
+            sources.push(Source {
+                profile: name.into(),
+                directory: profile,
+            });
+        }
+        let store = Store::new(usage.clone(), sources);
+        store.ingest().unwrap();
+        assert_eq!(store.load().unwrap().requests.len(), 2);
+        let history_path = usage.join("limits.jsonl");
+        let history = ["p", "q"]
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "profile":name,"fetched_at":"2030-01-03T00:00:00Z",
+                    "weekly":{"percent":50,"resets_at":"2030-01-08T00:00:00Z"}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&history_path, &history).unwrap();
+        fs::write(usage.join("billing.json"), b"{bad").unwrap();
+        let ledger_before = serde_json::to_vec(&store.load().unwrap().requests).unwrap();
+        let error = purge(&store, "p").unwrap_err().to_string();
+        assert!(error.contains("billing.json"), "{error}");
+        assert_eq!(
+            serde_json::to_vec(&store.load().unwrap().requests).unwrap(),
+            ledger_before
+        );
+        assert_eq!(fs::read_to_string(&history_path).unwrap(), history);
+        assert_eq!(fs::read(usage.join("billing.json")).unwrap(), b"{bad");
+        let valid = Billing {
+            version: 1,
+            profiles: BTreeMap::from([
+                ("p".into(), ProfileBilling::default()),
+                ("q".into(), ProfileBilling::default()),
+            ]),
+        };
+        fs::write(
+            usage.join("billing.json"),
+            serde_json::to_vec(&valid).unwrap(),
+        )
+        .unwrap();
+        purge(&store, "p").unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .requests
+                .iter()
+                .map(|r| r.profile.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q"]
+        );
+        assert_eq!(
+            super::super::metrics::history(&usage)
+                .iter()
+                .map(|r| r.profile.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q"]
+        );
+        let remaining = read(&usage, Local::now().date_naive()).unwrap();
+        assert!(!remaining.profiles.contains_key("p"));
+        assert!(remaining.profiles.contains_key("q"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(usage.join("billing.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
     #[test]
     fn flat_rate_prices_all_five_kinds_without_list_multipliers() {
         // Known-bad: applying list-price cache multipliers to a flat gateway rate.

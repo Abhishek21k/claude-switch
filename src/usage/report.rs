@@ -460,10 +460,6 @@ pub fn label(store: &Store, session: &str, project: &str) -> Result<String> {
     Ok(format!("Label saved in labels.json.\n{explanations}"))
 }
 
-pub fn purge_profile(store: &Store, profile: &str) -> Result<usize> {
-    store.purge_profile(profile)
-}
-
 pub fn verify(store: &Store) -> Result<(String, i32)> {
     let ingest = store.ingest()?;
     let ledger = store.load()?;

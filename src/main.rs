@@ -117,7 +117,7 @@ enum Commands {
     Remove {
         /// Profile name to remove
         name: String,
-        /// Also delete this profile's token ledger rows
+        /// Also delete this profile's token ledger rows, billing settings and limit history
         #[arg(long)]
         purge_usage: bool,
     },
@@ -437,14 +437,8 @@ fn main() -> Result<()> {
         },
 
         Some(Commands::Remove { name, purge_usage }) => {
-            if purge_usage {
-                manager.get_profile(&name)?;
-                let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
-                let store = usage::store(&manager, directory)?;
-                usage::report::purge_profile(&store, &name)?;
-                usage::billing::purge(&store, &name)?;
-            }
-            match manager.remove_profile(&name) {
+            let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
+            match remove_profile_with_usage(&manager, &name, purge_usage, directory) {
                 Ok(_) => println!("Profile '{}' removed.", name),
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -510,8 +504,13 @@ fn main() -> Result<()> {
                     } else if rates_model_id.is_none() {
                         anyhow::bail!("provide a rates model id or --remove")
                     }
-                    usage::rates::edit_alias(&store.dir, &model, rates_model_id.as_deref())?;
-                    format!("Alias updated for {model}.\n")
+                    let changed =
+                        usage::rates::edit_alias(&store.dir, &model, rates_model_id.as_deref())?;
+                    if changed {
+                        format!("Alias updated for {model}.\n")
+                    } else {
+                        format!("No alias for {model}; nothing changed.\n")
+                    }
                 }
                 Some(UsageAction::Plan {
                     profile,
@@ -529,14 +528,11 @@ fn main() -> Result<()> {
                     }
                     usage::billing::edit(&store, Local::now().date_naive(), |billing| {
                         let entry = billing.profiles.entry(profile.clone()).or_default();
-                        entry.plan = if clear {
-                            None
+                        if clear {
+                            entry.plan = None;
                         } else {
-                            Some(usage::billing::Plan {
-                                label: label.unwrap_or_else(|| "Plan".into()),
-                                fee_usd: fee_usd.unwrap(),
-                            })
-                        };
+                            usage::billing::set_plan(entry, fee_usd.unwrap(), label);
+                        }
                         Ok(())
                     })?;
                     format!("Plan updated for {profile}.\n")
@@ -614,6 +610,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn remove_profile_with_usage(
+    manager: &ProfileManager,
+    name: &str,
+    purge_usage: bool,
+    directory: Option<std::path::PathBuf>,
+) -> Result<()> {
+    if purge_usage {
+        manager.get_profile(name)?;
+        let store = usage::store(manager, directory)?;
+        usage::billing::purge(&store, name)?;
+    }
+    manager.remove_profile(name)
 }
 
 fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) -> Result<()> {
@@ -703,9 +713,11 @@ fn usage_info(
     let Some(hourly) = m::read(dir) else {
         return "Usage:     no ledger yet — run `cswitch usage`\n".into();
     };
-    let Some((rates, billing)) = m::load_settings(dir, now.with_timezone(&offset).date_naive())
-    else {
-        return "Usage:     billing settings unreadable\n".into();
+    let (rates, billing) = match m::load_settings(dir, now.with_timezone(&offset).date_naive()) {
+        Ok(settings) => settings,
+        Err((file, reason)) => {
+            return format!("Usage:     usage settings unreadable: {file} — {reason}\n");
+        }
     };
     let per_token = auth.api_billed();
     let entry = billing.profiles.get(name);
@@ -853,7 +865,11 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     for p in profiles {
         let name: String = p.name.chars().take(20).collect();
         let email: String = p.email.as_deref().unwrap_or("—").chars().take(26).collect();
-        let tool: String = p.tool.label().chars().take(11).collect();
+        let tool: String = if matches!(p.tool, Tool::Unknown(_)) {
+            "unknown".into()
+        } else {
+            p.tool.label().chars().take(11).collect()
+        };
         let last = p
             .last_used
             .map(|t| t.format("%m-%d %H:%M").to_string())
@@ -885,7 +901,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
                     Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
                 }
             };
-            let cell = if let (Some(hourly), Some((rates, billing))) = (&hourly, &settings) {
+            let cell = if let (Some(hourly), Ok((rates, billing))) = (&hourly, &settings) {
                 let entry = billing.profiles.get(&p.name);
                 let value = m::windows(
                     &hourly.rows,
@@ -934,6 +950,9 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     }
     if saw_usage {
         out.push_str("\n30D $ = last 30 days: spend for per-token profiles · ~ = list-price value of a plan's usage\n")
+    }
+    if let Err((file, reason)) = &settings {
+        out.push_str(&format!("\nusage settings unreadable: {file} — {reason}\n"));
     }
     if saw_claude && hourly.is_none() {
         out.push_str("\nno ledger yet — run `cswitch usage`\n");
@@ -1862,10 +1881,7 @@ mod tests {
         let manager = mixed_tool_manager(&tmp);
         let output = list_output(&manager, Utc::now()).unwrap();
         assert!(output.contains("o                    codex"), "{output}");
-        assert!(
-            output.contains("u                    unknown too"),
-            "{output}"
-        );
+        assert!(output.contains("u                    unknown"), "{output}");
         assert!(output.lines().all(|line| line.chars().count() <= 120));
         let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
         assert!(codex_row.contains("—       —"), "{codex_row}");
@@ -1985,11 +2001,138 @@ mod billing_view_tests {
         assert!(!usage.join("billing.json").exists());
         assert!(!usage.join(".lock").exists());
     }
+    #[test]
+    fn malformed_settings_name_the_file_in_list_and_info() {
+        // Known-bad: list silently showing dashes, and info blaming billing.json for broken rates.json.
+        let tmp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc.with_ymd_and_hms(2030, 1, 8, 12, 0, 0).unwrap();
+        let mut registry = profile::Registry::default();
+        registry.profiles.insert(
+            "p".into(),
+            profile::Profile {
+                name: "p".into(),
+                tool: Tool::Claude,
+                email: Some("p@example.com".into()),
+                added: now,
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("p")).unwrap();
+        fs::write(
+            manager.profile_dir("p").join(".claude.json"),
+            r#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        let usage = manager.base_dir.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(&usage::metrics::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for file in ["billing.json", "rates.json"] {
+            fs::write(usage.join(file), b"{bad").unwrap();
+            let list = list_output(&manager, now).unwrap();
+            let info = info_output(&manager, "p", now).unwrap();
+            assert!(
+                list.contains(&format!("usage settings unreadable: {file} —")),
+                "{list}"
+            );
+            assert!(
+                info.contains(&format!("usage settings unreadable: {file} —")),
+                "{info}"
+            );
+            fs::remove_file(usage.join(file)).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
 mod billing_cli_tests {
     use super::*;
+    #[test]
+    fn purge_refusal_keeps_registry_and_success_removes_only_named_history() {
+        // Known-bad: registry surviving only after ledger rows were already purged,
+        // or a valid purge retaining old capacity rows for the removed name.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = Utc::now();
+        let mut registry = profile::Registry::default();
+        for name in ["p", "q"] {
+            registry.profiles.insert(
+                name.into(),
+                profile::Profile {
+                    name: name.into(),
+                    tool: Tool::Claude,
+                    email: Some(format!("{name}@example.com")),
+                    added: now,
+                    last_used: None,
+                },
+            );
+            std::fs::create_dir_all(manager.profile_dir(name)).unwrap();
+        }
+        let registry_path = manager.base_dir.join("registry.json");
+        let registry_bytes = serde_json::to_vec(&registry).unwrap();
+        std::fs::write(&registry_path, &registry_bytes).unwrap();
+        let usage = manager.base_dir.join("usage");
+        std::fs::create_dir_all(&usage).unwrap();
+        let history = ["p", "q"]
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "profile":name,"fetched_at":"2030-01-03T00:00:00Z",
+                    "weekly":{"percent":50,"resets_at":"2030-01-08T00:00:00Z"}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(usage.join("limits.jsonl"), &history).unwrap();
+        std::fs::write(usage.join("billing.json"), b"{bad").unwrap();
+        assert!(
+            remove_profile_with_usage(&manager, "p", true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("billing.json")
+        );
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry_bytes);
+        assert_eq!(
+            std::fs::read_to_string(usage.join("limits.jsonl")).unwrap(),
+            history
+        );
+        assert!(manager.profile_dir("p").exists());
+        std::fs::write(
+            usage.join("billing.json"),
+            r#"{"version":1,"profiles":{"p":{},"q":{}}}"#,
+        )
+        .unwrap();
+        remove_profile_with_usage(&manager, "p", true, None).unwrap();
+        assert!(manager.get_profile("p").is_err());
+        assert!(manager.get_profile("q").is_ok());
+        assert_eq!(
+            usage::metrics::history(&usage)
+                .iter()
+                .map(|r| r.profile.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q"]
+        );
+    }
     #[test]
     fn removed_topup_command_is_rejected() {
         // Known-bad: the removed topup command still parsing.

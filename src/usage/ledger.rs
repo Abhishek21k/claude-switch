@@ -441,10 +441,15 @@ impl Store {
         Ok(report)
     }
 
+    #[cfg(test)]
     pub fn purge_profile(&self, profile: &str) -> Result<usize> {
         let Some(_lock) = self.try_lock()? else {
             anyhow::bail!("usage ledger is busy");
         };
+        self.purge_profile_locked(profile)
+    }
+
+    pub(crate) fn purge_profile_locked(&self, profile: &str) -> Result<usize> {
         let mut ledger = self.load()?;
         let removed_sessions = ledger
             .sessions
