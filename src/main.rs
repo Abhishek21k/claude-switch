@@ -821,7 +821,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
         return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".into());
     }
     let header = format!(
-        "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}",
+        "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
         "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "30D $", "LAST USED"
     );
     let mut out = format!("{header}\n{}\n", "─".repeat(header.chars().count()));
@@ -838,7 +838,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     let mut saw_claude = false;
     for p in profiles {
         let name: String = p.name.chars().take(20).collect();
-        let email: String = p.email.as_deref().unwrap_or("—").chars().take(27).collect();
+        let email: String = p.email.as_deref().unwrap_or("—").chars().take(26).collect();
         let tool: String = p.tool.label().chars().take(11).collect();
         let last = p
             .last_used
@@ -894,7 +894,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
             (session, weekly, age, cell)
         };
         out.push_str(&format!(
-            "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}\n",
+            "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}\n",
             name,
             tool,
             email,
@@ -1534,15 +1534,15 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
 
         let header = format!(
-            "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}",
+            "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}",
             "NAME", "TOOL", "EMAIL", "5H", "7D", "AS OF", "30D $", "LAST USED"
         );
         let row = |name: &str, email: &str, five: &str, seven: &str, age: &str, last: &str| {
             format!(
-                "{:<20} {:<11} {:<27} {:<7} {:<18} {:<10} {:<9} {:<11}\n",
+                "{:<20} {:<11} {:<26} {:<7} {:<18} {:<11} {:<9} {:<11}\n",
                 name,
                 "claude",
-                email.chars().take(27).collect::<String>(),
+                email.chars().take(26).collect::<String>(),
                 five,
                 seven,
                 age,
@@ -2088,6 +2088,20 @@ mod billing_list_variants_tests {
             fs::create_dir_all(manager.profile_dir(name)).unwrap();
             fs::write(manager.profile_dir(name).join(".claude.json"), auth).unwrap();
         }
+        // Known-bad: a fresh snapshot says "seconds ago", overflowing a 10-wide AS OF column.
+        fs::write(
+            manager.profile_dir("plan").join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {},
+                "cachedUsageUtilization": {
+                    "fetchedAtMs": now.timestamp_millis() - 30_000,
+                    "utilization": {"limits": [{"kind":"weekly_all", "group":"weekly", "percent":50,
+                        "resets_at":"2030-01-10T12:00:00Z"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         fs::write(
             manager.base_dir.join("registry.json"),
             serde_json::to_vec(&registry).unwrap(),

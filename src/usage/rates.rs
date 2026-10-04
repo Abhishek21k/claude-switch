@@ -106,17 +106,32 @@ impl Rates {
 }
 
 pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<()> {
-    let mut rates = load_or_seed(dir)?;
+    let path = dir.join("rates.json");
+    if !path.exists() {
+        atomic::write_once(&path, &serde_json::to_vec_pretty(&seed())?)?;
+    }
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let rates: Rates = serde_json::from_value(raw.clone())?;
     if let Some(target) = target {
         anyhow::ensure!(
             rates.models.contains_key(target),
             "unknown rates model id: {target}"
         );
-        rates.aliases.insert(model.into(), target.into());
+        let aliases = raw
+            .as_object_mut()
+            .unwrap()
+            .entry("aliases")
+            .or_insert_with(|| serde_json::json!({}));
+        aliases
+            .as_object_mut()
+            .unwrap()
+            .insert(model.into(), target.into());
     } else {
-        rates.aliases.remove(model);
+        if let Some(aliases) = raw.get_mut("aliases") {
+            aliases.as_object_mut().unwrap().remove(model);
+        }
     }
-    atomic::write(&dir.join("rates.json"), &serde_json::to_vec_pretty(&rates)?)
+    atomic::write(&path, &serde_json::to_vec_pretty(&raw)?)
 }
 
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
@@ -241,5 +256,31 @@ mod alias_file_tests {
         fs::write(&path, b"{bad").unwrap();
         assert!(edit_alias(tmp.path(), "acme/x", Some("claude-opus-5")).is_err());
         assert_eq!(fs::read(path).unwrap(), b"{bad");
+    }
+    #[test]
+    fn alias_edit_preserves_unknown_fields_at_both_depths() {
+        // Known-bad: serializing through Rates drops hand-edited fields.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rates.json");
+        let mut raw = serde_json::to_value(seed()).unwrap();
+        raw["note"] = serde_json::json!("synthetic note");
+        raw["models"]["claude-opus-5"]["standard"]["extra"] = serde_json::json!(42);
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        edit_alias(tmp.path(), "acme/x", Some("claude-opus-5")).unwrap();
+        let set: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(set["aliases"]["acme/x"], "claude-opus-5");
+        assert_eq!(set["note"], "synthetic note");
+        assert_eq!(set["models"]["claude-opus-5"]["standard"]["extra"], 42);
+        edit_alias(tmp.path(), "acme/x", None).unwrap();
+        let removed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            removed["aliases"]
+                .as_object()
+                .unwrap()
+                .get("acme/x")
+                .is_none()
+        );
+        assert_eq!(removed["note"], "synthetic note");
+        assert_eq!(removed["models"]["claude-opus-5"]["standard"]["extra"], 42);
     }
 }
