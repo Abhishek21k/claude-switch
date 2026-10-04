@@ -29,6 +29,7 @@ pub struct Window {
 pub struct Snapshot {
     pub fetched_at: DateTime<Utc>,
     pub windows: Vec<Window>,
+    pub window_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +91,11 @@ pub fn parse_limits(claude_json: &Value) -> Limits {
     Limits::Snapshot(Snapshot {
         fetched_at,
         windows,
+        window_started_at: parse_reset(
+            utilization
+                .get("seven_day_breakdown")
+                .and_then(|breakdown| breakdown.get("window_started_at")),
+        ),
     })
 }
 
@@ -321,6 +327,21 @@ mod tests {
             panic!("expected snapshot");
         };
         snapshot
+    }
+
+    #[test]
+    fn weekly_breakdown_start_is_optional_and_malformed_values_are_ignored() {
+        // Known-bad: ignoring window_started_at or failing a snapshot when it is malformed.
+        let mut value = cache();
+        value["cachedUsageUtilization"]["utilization"]["seven_day_breakdown"] =
+            json!({"window_started_at":"2030-01-03T20:00:00Z", "other":123});
+        assert_eq!(
+            snapshot(parse_limits(&value)).window_started_at,
+            Some(at("2030-01-03T20:00:00Z"))
+        );
+        value["cachedUsageUtilization"]["utilization"]["seven_day_breakdown"]["window_started_at"] =
+            json!("bad");
+        assert_eq!(snapshot(parse_limits(&value)).window_started_at, None);
     }
 
     #[test]

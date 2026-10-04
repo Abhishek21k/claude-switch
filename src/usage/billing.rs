@@ -3,7 +3,7 @@ use super::ledger::Store;
 use super::rates::{Cost, Price, Rates};
 use crate::atomic;
 use anyhow::{Result, bail};
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +23,68 @@ pub struct ProfileBilling {
     pub plan: Option<Plan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<Rate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limit_resets: Vec<LimitReset>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitReset {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+pub fn parse_reset_bracket(
+    input: Option<&str>,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Result<LimitReset> {
+    let bracket = if let Some(input) = input {
+        if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+            if date > now.with_timezone(&offset).date_naive() {
+                bail!("reset date is in the future")
+            }
+            let next = date
+                .succ_opt()
+                .ok_or_else(|| anyhow::anyhow!("invalid reset date"))?;
+            let from = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(offset)
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("invalid reset date"))?
+                .to_utc();
+            let to = next
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(offset)
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("invalid reset date"))?
+                .to_utc();
+            LimitReset { from, to }
+        } else {
+            let minute = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M").map_err(|_| {
+                anyhow::anyhow!("reset time must be YYYY-MM-DD or YYYY-MM-DD HH:MM")
+            })?;
+            let at = minute
+                .and_local_timezone(offset)
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("invalid reset time"))?
+                .to_utc();
+            LimitReset { from: at, to: at }
+        }
+    } else {
+        let at = now
+            .with_timezone(&offset)
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap()
+            .to_utc();
+        LimitReset { from: at, to: at }
+    };
+    if bracket.from > now {
+        bail!("reset date is in the future")
+    }
+    Ok(bracket)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +122,7 @@ fn valid_prefix(prefix: &str) -> bool {
     (1..=64).contains(&prefix.len()) && prefix.bytes().all(|b| (32..=126).contains(&b))
 }
 impl Billing {
-    pub fn validate(&self, _today: NaiveDate) -> Result<()> {
+    pub fn validate(&self, now: DateTime<Utc>) -> Result<()> {
         if self.version != 1 {
             bail!("unsupported billing version")
         }
@@ -94,14 +156,29 @@ impl Billing {
                     }
                 }
             }
+            for reset in &entry.limit_resets {
+                if reset.from > reset.to || reset.to - reset.from > Duration::hours(48) {
+                    bail!("reset bracket must be ordered and at most 48 h")
+                }
+                if reset.from > now {
+                    bail!("reset date is in the future")
+                }
+            }
+            if entry
+                .limit_resets
+                .windows(2)
+                .any(|pair| pair[0].from > pair[1].from)
+            {
+                bail!("limit resets must be sorted by start")
+            }
         }
         Ok(())
     }
 }
-pub fn read(dir: &Path, today: NaiveDate) -> Result<Billing> {
-    read_inner(dir, today).map_err(|error| anyhow::anyhow!("billing.json: {error}"))
+pub fn read(dir: &Path, now: DateTime<Utc>) -> Result<Billing> {
+    read_inner(dir, now).map_err(|error| anyhow::anyhow!("billing.json: {error}"))
 }
-fn read_inner(dir: &Path, today: NaiveDate) -> Result<Billing> {
+fn read_inner(dir: &Path, now: DateTime<Utc>) -> Result<Billing> {
     let path = dir.join("billing.json");
     if !path.exists() {
         return Ok(Billing {
@@ -134,31 +211,31 @@ fn read_inner(dir: &Path, today: NaiveDate) -> Result<Billing> {
         }
     }
     let billing: Billing = serde_json::from_value(raw)?;
-    billing.validate(today)?;
+    billing.validate(now)?;
     Ok(billing)
 }
-pub fn edit<F>(store: &Store, today: NaiveDate, change: F) -> Result<()>
+pub fn edit<F>(store: &Store, now: DateTime<Utc>, change: F) -> Result<()>
 where
     F: FnOnce(&mut Billing) -> Result<()>,
 {
     let Some(_lock) = store.try_lock()? else {
         bail!("usage store busy; try again")
     };
-    let mut billing = read(&store.dir, today)?;
+    let mut billing = read(&store.dir, now)?;
     change(&mut billing)?;
-    billing.validate(today)?;
+    billing.validate(now)?;
     atomic::write_private(
         &store.dir.join("billing.json"),
         &serde_json::to_vec_pretty(&billing)?,
     )
 }
 pub fn purge(store: &Store, profile: &str) -> Result<()> {
-    let today = Local::now().date_naive();
+    let now = Utc::now();
     let Some(_lock) = store.try_lock()? else {
         bail!("usage store busy; try again")
     };
     // Known-bad: purging ledger rows before refusing a malformed billing.json.
-    let mut billing = read(&store.dir, today)?;
+    let mut billing = read(&store.dir, now)?;
     let history_path = store.dir.join("limits.jsonl");
     let retained = if history_path.exists() {
         let raw = fs::read_to_string(&history_path)?;
@@ -340,7 +417,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["q"]
         );
-        let remaining = read(&usage, Local::now().date_naive()).unwrap();
+        let remaining = read(&usage, Utc::now()).unwrap();
         assert!(!remaining.profiles.contains_key("p"));
         assert!(remaining.profiles.contains_key("q"));
         #[cfg(unix)]
@@ -431,14 +508,24 @@ mod tests {
             r#"{"version":1,"profiles":{"p":{"rate":{"flat":1,"unknown":2}}}}"#,
         )
         .unwrap();
-        assert!(read(tmp.path(), NaiveDate::from_ymd_opt(2030, 1, 1).unwrap()).is_err());
+        assert!(
+            read(
+                tmp.path(),
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .to_utc()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn flat_and_per_type_rates_roundtrip_with_strict_fields() {
         // Known-bad: flattening an untagged rate writes JSON that the next edit cannot read.
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().to_path_buf(), vec![]);
-        let today = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        let today = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
         edit(&store, today, |b| {
             b.profiles.insert(
                 "flat".into(),
@@ -485,7 +572,9 @@ mod tests {
         // Known-bad: a world-readable file, dropping another entry, or waiting on a busy lock.
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().to_path_buf(), vec![]);
-        let today = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        let today = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
         edit(&store, today, |b| {
             b.profiles.insert("a".into(), ProfileBilling::default());
             Ok(())
@@ -538,6 +627,14 @@ mod validation_tests {
             r#"{"version":1,"profiles":{"p":{"top_ups":[{"date":"2030-01-01","usd":1.0}]}}}"#,
         )
         .unwrap();
-        assert!(read(tmp.path(), NaiveDate::from_ymd_opt(2030, 1, 2).unwrap()).is_err());
+        assert!(
+            read(
+                tmp.path(),
+                DateTime::parse_from_rfc3339("2030-01-02T00:00:00Z")
+                    .unwrap()
+                    .to_utc()
+            )
+            .is_err()
+        );
     }
 }

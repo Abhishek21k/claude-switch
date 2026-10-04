@@ -3,7 +3,7 @@ use super::billing::{self, Billing};
 use super::ledger::Ledger;
 use super::rates::Rates;
 use crate::atomic;
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -146,6 +146,18 @@ pub fn rate_money(value: f64) -> String {
     }
     text
 }
+pub fn capacity_money(value: f64) -> String {
+    let rounded = value.round() as i64;
+    let digits = rounded.abs().to_string();
+    let chunks = digits
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}${chunks}", if rounded < 0 { "-" } else { "" })
+}
 pub fn start_today(now: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
     now.with_timezone(&offset)
         .date_naive()
@@ -275,6 +287,8 @@ pub fn tokens(value: u64) -> String {
 pub struct Weekly {
     pub percent: f64,
     pub resets_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_started_at: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimitRow {
@@ -311,6 +325,7 @@ pub fn append_history(dir: &Path, sources: &[super::ledger::Source]) -> anyhow::
                 w.resets_at.map(|r| Weekly {
                     percent: w.percent,
                     resets_at: r,
+                    window_started_at: snapshot.window_started_at,
                 })
             })
         else {
@@ -344,69 +359,194 @@ pub fn append_history(dir: &Path, sources: &[super::ledger::Source]) -> anyhow::
 }
 #[derive(Clone, Debug)]
 pub struct Capacity {
-    pub value: f64,
+    pub lower: f64,
+    pub upper: f64,
     pub partial: bool,
     pub snapshot: LimitRow,
     pub min: f64,
     pub max: f64,
+    pub after_reset: Option<DateTime<Utc>>,
+}
+#[derive(Clone, Debug)]
+pub struct CapacityReport {
+    pub estimate: Option<Capacity>,
+    pub reason: &'static str,
+    pub hint: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+#[derive(Clone, Debug)]
+struct ResetEvent {
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    detected: bool,
+    covered: bool,
+}
+fn overlaps(a: &ResetEvent, b: &ResetEvent) -> bool {
+    a.from <= b.to && b.from <= a.to
 }
 pub fn capacity(
     profile: &str,
     snapshots: &[LimitRow],
     hourly: &Hourly,
     rates: &Rates,
-) -> Option<Capacity> {
-    let mut best = BTreeMap::<DateTime<Utc>, &LimitRow>::new();
+    recorded: &[billing::LimitReset],
+) -> CapacityReport {
+    let mut windows = BTreeMap::<DateTime<Utc>, Vec<&LimitRow>>::new();
     for row in snapshots.iter().filter(|r| r.profile == profile) {
-        best.entry(row.weekly.resets_at)
-            .and_modify(|current| {
-                if row.weekly.percent > current.weekly.percent
-                    || (row.weekly.percent == current.weekly.percent
-                        && row.fetched_at > current.fetched_at)
-                {
-                    *current = row
-                }
+        windows.entry(row.weekly.resets_at).or_default().push(row);
+    }
+    let newest_window = windows.keys().next_back().copied();
+    let mut estimates = Vec::<(f64, f64, bool, LimitRow, Option<DateTime<Utc>>)>::new();
+    let mut hint = None;
+    let mut waiting = false;
+    for (resets_at, mut rows) in windows {
+        rows.sort_by_key(|row| row.fetched_at);
+        let start = rows
+            .iter()
+            .rev()
+            .find_map(|row| row.weekly.window_started_at)
+            .unwrap_or(resets_at - Duration::days(7));
+        let mut events = recorded
+            .iter()
+            .filter(|reset| reset.to >= start && reset.from < resets_at)
+            .map(|reset| ResetEvent {
+                from: reset.from.max(start),
+                to: reset.to.min(resets_at),
+                detected: false,
+                covered: true,
             })
-            .or_insert(row);
-    }
-    let mut estimates = Vec::new();
-    for (_, snapshot) in best {
-        let u = snapshot.weekly.percent.min(100.0);
-        if u < 20.0 || hourly.generated_at < snapshot.fetched_at {
-            continue;
+            .collect::<Vec<_>>();
+        for pair in rows.windows(2) {
+            if pair[0].weekly.percent - pair[1].weekly.percent < 1.0 {
+                continue;
+            }
+            let detected = ResetEvent {
+                from: pair[0].fetched_at,
+                to: pair[1].fetched_at,
+                detected: true,
+                covered: false,
+            };
+            if detected.to < start || detected.from >= resets_at {
+                continue;
+            }
+            if let Some(event) = events.iter_mut().find(|event| overlaps(event, &detected)) {
+                event.from = event.from.max(detected.from);
+                event.to = event.to.min(detected.to);
+                event.detected = true;
+                event.covered = true;
+            } else {
+                events.push(detected);
+            }
         }
-        let start = floor_hour(snapshot.weekly.resets_at - Duration::days(7));
-        let end = floor_hour(snapshot.fetched_at);
-        let amount = window(
-            hourly
-                .rows
+        events.sort_by_key(|event| event.from);
+        if Some(resets_at) == newest_window {
+            hint = events
                 .iter()
-                .filter(|b| b.profile == profile && b.hour <= end),
-            start,
-            end + Duration::hours(1),
-            rates,
-            None,
-            false,
-        );
-        estimates.push((snapshot, amount.value / (u / 100.0), amount.unpriced > 0));
+                .find(|event| {
+                    event.detected && !event.covered && event.to - event.from > Duration::hours(48)
+                })
+                .map(|event| (event.from, event.to));
+        }
+        for segment in 0..=events.len() {
+            let candidates = rows
+                .iter()
+                .copied()
+                .filter(|row| {
+                    let fetched = row.fetched_at;
+                    if fetched < start || fetched >= resets_at {
+                        return false;
+                    }
+                    if events
+                        .iter()
+                        .any(|event| fetched > event.from && fetched < event.to)
+                    {
+                        return false;
+                    }
+                    let assigned = events.iter().filter(|event| fetched >= event.to).count();
+                    assigned == segment
+                })
+                .collect::<Vec<_>>();
+            if candidates
+                .iter()
+                .any(|row| row.weekly.percent >= 20.0 && row.fetched_at > hourly.generated_at)
+            {
+                waiting = true;
+            }
+            let Some(snapshot) = candidates
+                .into_iter()
+                .filter(|row| row.fetched_at <= hourly.generated_at)
+                .max_by(|a, b| {
+                    a.weekly
+                        .percent
+                        .total_cmp(&b.weekly.percent)
+                        .then(a.fetched_at.cmp(&b.fetched_at))
+                })
+            else {
+                continue;
+            };
+            let u = snapshot.weekly.percent.min(100.0);
+            if u < 20.0 {
+                continue;
+            }
+            let reset = segment.checked_sub(1).map(|index| &events[index]);
+            if reset.is_some_and(|event| event.to - event.from > Duration::hours(48)) {
+                continue;
+            }
+            let value = |from| {
+                window(
+                    hourly
+                        .rows
+                        .iter()
+                        .filter(|bucket| bucket.profile == profile),
+                    floor_hour(from),
+                    floor_hour(snapshot.fetched_at) + Duration::hours(1),
+                    rates,
+                    None,
+                    false,
+                )
+            };
+            let lower = value(reset.map_or(start, |event| event.to));
+            let upper = reset.map_or_else(|| lower.clone(), |event| value(event.from));
+            estimates.push((
+                lower.value / (u / 100.0),
+                upper.value / (u / 100.0),
+                lower.unpriced > 0 || upper.unpriced > 0,
+                snapshot.clone(),
+                reset.map(|event| event.from),
+            ));
+        }
     }
-    let newest = estimates.last()?;
-    let recent = &estimates[estimates.len().saturating_sub(4)..];
-    Some(Capacity {
-        value: newest.1,
-        partial: newest.2,
-        snapshot: newest.0.clone(),
-        min: recent.iter().map(|e| e.1).fold(f64::INFINITY, f64::min),
-        max: recent.iter().map(|e| e.1).fold(0.0, f64::max),
-    })
+    let estimate = estimates.last().map(|newest| {
+        let recent = &estimates[estimates.len().saturating_sub(4)..];
+        Capacity {
+            lower: newest.0,
+            upper: newest.1,
+            partial: newest.2,
+            snapshot: newest.3.clone(),
+            after_reset: newest.4,
+            min: recent
+                .iter()
+                .map(|item| item.0)
+                .fold(f64::INFINITY, f64::min),
+            max: recent.iter().map(|item| item.1).fold(0.0, f64::max),
+        }
+    });
+    CapacityReport {
+        estimate,
+        reason: if waiting {
+            "waiting for an ingest"
+        } else {
+            "no snapshot ≥ 20%"
+        },
+        hint,
+    }
 }
 pub fn load_settings(
     dir: &Path,
-    today: NaiveDate,
+    now: DateTime<Utc>,
 ) -> Result<(Rates, Billing), (&'static str, String)> {
     let rates =
         super::rates::read_or_seed(dir).map_err(|error| ("rates.json", error.to_string()))?;
-    let billing = billing::read(dir, today).map_err(|error| {
+    let billing = billing::read(dir, now).map_err(|error| {
         let reason = error.to_string();
         (
             "billing.json",
@@ -516,14 +656,16 @@ mod tests {
                 weekly: Weekly {
                     percent: 50.0,
                     resets_at: reset,
+                    window_started_at: None,
                 },
             },
             LimitRow {
                 profile: "p".into(),
                 fetched_at: at("2030-01-05T00:00:00Z"),
                 weekly: Weekly {
-                    percent: 30.0,
+                    percent: 50.0,
                     resets_at: reset,
+                    window_started_at: None,
                 },
             },
         ];
@@ -532,19 +674,262 @@ mod tests {
             generated_at: at("2030-01-06T00:00:00Z"),
             rows,
         };
-        let result = capacity("p", &snapshots, &hourly, &rates::seed()).unwrap();
-        assert_eq!(result.value, 10.0);
+        let result = capacity("p", &snapshots, &hourly, &rates::seed(), &[])
+            .estimate
+            .unwrap();
+        assert_eq!(result.lower, 10.0);
         assert!(result.partial);
         let mut low = snapshots.clone();
         low[0].weekly.percent = 3.0;
         low[1].weekly.percent = 4.0;
-        assert!(capacity("p", &low, &hourly, &rates::seed()).is_none());
+        assert!(
+            capacity("p", &low, &hourly, &rates::seed(), &[])
+                .estimate
+                .is_none()
+        );
         let behind = Hourly {
             version: 1,
             generated_at: at("2030-01-03T00:00:00Z"),
             rows: hourly.rows.clone(),
         };
-        assert!(capacity("p", &snapshots, &behind, &rates::seed()).is_none()); // Known-bad: estimating before ingest catches up.
+        assert!(
+            capacity("p", &snapshots, &behind, &rates::seed(), &[])
+                .estimate
+                .is_none()
+        ); // Known-bad: estimating before ingest catches up.
+    }
+}
+
+#[cfg(test)]
+mod reset_capacity_tests {
+    use super::*;
+    use crate::usage::rates;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text).unwrap().to_utc()
+    }
+    fn row(fetched: &str, reset: &str, percent: f64, start: Option<&str>) -> LimitRow {
+        LimitRow {
+            profile: "p".into(),
+            fetched_at: at(fetched),
+            weekly: Weekly {
+                percent,
+                resets_at: at(reset),
+                window_started_at: start.map(at),
+            },
+        }
+    }
+    fn bucket(hour: &str, millions: u64) -> Bucket {
+        Bucket {
+            profile: "p".into(),
+            hour: at(hour),
+            model: "claude-opus-5".into(),
+            speed: None,
+            requests: 1,
+            input: millions * 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        }
+    }
+    fn hourly(generated: &str, rows: Vec<Bucket>) -> Hourly {
+        Hourly {
+            version: 1,
+            generated_at: at(generated),
+            rows,
+        }
+    }
+    fn estimate(
+        rows: &[LimitRow],
+        usage: &Hourly,
+        resets: &[billing::LimitReset],
+    ) -> CapacityReport {
+        capacity("p", rows, usage, &rates::seed(), resets)
+    }
+    #[test]
+    fn recorded_date_reset_splits_a_week_into_a_lower_range() {
+        // Known-bad: reading a reset week as one allowance roughly doubles capacity.
+        let reset = billing::parse_reset_bracket(
+            Some("2030-01-04"),
+            at("2030-01-07T12:00:00Z"),
+            FixedOffset::west_opt(3 * 3600).unwrap(),
+        )
+        .unwrap();
+        let rows = [
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 100.0, None),
+            row("2030-01-06T00:00:00Z", "2030-01-08T00:00:00Z", 60.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-07T00:00:00Z",
+            vec![
+                bucket("2030-01-02T00:00:00Z", 1),
+                bucket("2030-01-05T00:00:00Z", 1),
+                bucket("2030-01-06T00:00:00Z", 1),
+            ],
+        );
+        let result = estimate(&rows, &usage, &[reset]).estimate.unwrap();
+        assert!(result.after_reset.is_some());
+        assert!((result.lower - 5.0 / 0.6).abs() < 0.001);
+        assert!((result.upper - 10.0 / 0.6).abs() < 0.001);
+        assert!(result.upper < 15.0 / 0.6);
+    }
+    #[test]
+    fn detects_short_reset_and_flags_long_unknown_bracket() {
+        // Known-bad: ignoring a percent drop or estimating from a >48 h bracket.
+        let short = [
+            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 30.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-06T00:00:00Z",
+            vec![
+                bucket("2030-01-02T00:00:00Z", 1),
+                bucket("2030-01-03T00:00:00Z", 1),
+            ],
+        );
+        let report = estimate(&short, &usage, &[]);
+        let result = report.estimate.unwrap();
+        assert!(result.after_reset.is_some());
+        assert!(result.upper > result.lower);
+        assert!(report.hint.is_none());
+        let long = [
+            row("2029-12-31T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-05T00:00:00Z", "2030-01-08T00:00:00Z", 30.0, None),
+        ];
+        let report = estimate(&long, &usage, &[]);
+        assert!(report.estimate.is_none());
+        assert_eq!(
+            report.hint,
+            Some((at("2029-12-31T00:00:00Z"), at("2030-01-05T00:00:00Z")))
+        );
+    }
+    #[test]
+    fn recorded_and_detected_reset_merge_to_the_intersection() {
+        // Known-bad: splitting one recorded and detected event twice.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 30.0, None),
+        ];
+        let point = at("2030-01-03T12:00:00Z");
+        let reset = billing::LimitReset {
+            from: point,
+            to: point,
+        };
+        let usage = hourly(
+            "2030-01-05T00:00:00Z",
+            vec![
+                bucket("2030-01-03T13:00:00Z", 1),
+                bucket("2030-01-04T00:00:00Z", 1),
+            ],
+        );
+        let result = estimate(&rows, &usage, &[reset]).estimate.unwrap();
+        assert_eq!(result.after_reset, Some(point));
+        assert!((result.lower - 10.0 / 0.3).abs() < 0.001);
+        assert_eq!(result.lower, result.upper);
+    }
+    #[test]
+    fn snapshot_strictly_inside_recorded_day_has_no_segment() {
+        // Known-bad: assigning an ambiguous snapshot to either side of a reset day.
+        let reset = billing::parse_reset_bracket(
+            Some("2030-01-04"),
+            at("2030-01-07T12:00:00Z"),
+            FixedOffset::west_opt(3 * 3600).unwrap(),
+        )
+        .unwrap();
+        let rows = [row(
+            "2030-01-04T12:00:00Z",
+            "2030-01-08T00:00:00Z",
+            70.0,
+            None,
+        )];
+        assert!(
+            estimate(&rows, &hourly("2030-01-07T00:00:00Z", vec![]), &[reset])
+                .estimate
+                .is_none()
+        );
+    }
+    #[test]
+    fn breakdown_start_wins_and_hour_before_it_is_excluded() {
+        // Known-bad: using reset minus seven days despite window_started_at, or excluding its first hour.
+        let rows = [row(
+            "2030-01-03T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            50.0,
+            Some("2030-01-02T00:00:00Z"),
+        )];
+        let usage = hourly(
+            "2030-01-04T00:00:00Z",
+            vec![
+                bucket("2030-01-01T23:00:00Z", 1),
+                bucket("2030-01-02T00:00:00Z", 1),
+            ],
+        );
+        assert_eq!(estimate(&rows, &usage, &[]).estimate.unwrap().lower, 10.0);
+        let fallback = [row(
+            "2030-01-03T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            50.0,
+            None,
+        )];
+        assert_eq!(
+            estimate(&fallback, &usage, &[]).estimate.unwrap().lower,
+            20.0
+        );
+    }
+    #[test]
+    fn caught_up_snapshot_remains_usable_when_live_one_is_newer() {
+        // Known-bad: a too-new live snapshot blocks an older ingested snapshot in the same segment.
+        let rows = [
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 60.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-03T12:00:00Z",
+            vec![bucket("2030-01-02T00:00:00Z", 1)],
+        );
+        let report = estimate(&rows, &usage, &[]);
+        assert_eq!(
+            report.estimate.unwrap().snapshot.fetched_at,
+            at("2030-01-03T00:00:00Z")
+        );
+        let only_new = estimate(&rows[1..], &usage, &[]);
+        assert!(only_new.estimate.is_none());
+        assert_eq!(only_new.reason, "waiting for an ingest");
+    }
+    #[test]
+    fn newest_four_estimates_exclude_usage_after_snapshot_hour() {
+        // Known-bads: counting later buckets, using only the newest range, or starting the min at zero.
+        let mut rows = Vec::new();
+        let mut buckets = Vec::new();
+        for week in 0..5 {
+            let reset = at("2030-01-08T00:00:00Z") + Duration::days(7 * week);
+            let fetched = reset - Duration::days(1);
+            rows.push(LimitRow {
+                profile: "p".into(),
+                fetched_at: fetched,
+                weekly: Weekly {
+                    percent: 50.0,
+                    resets_at: reset,
+                    window_started_at: None,
+                },
+            });
+            buckets.push(Bucket {
+                hour: fetched,
+                input: (week as u64 + 1) * 1_000_000,
+                ..bucket("2030-01-01T00:00:00Z", 1)
+            });
+        }
+        buckets.push(bucket("2030-02-07T00:00:00Z", 100));
+        let usage = Hourly {
+            version: 1,
+            generated_at: at("2030-02-07T12:00:00Z"),
+            rows: buckets,
+        };
+        let result = estimate(&rows, &usage, &[]).estimate.unwrap();
+        assert_eq!(result.lower, 50.0);
+        assert_eq!(result.min, 20.0);
+        assert_eq!(result.max, 50.0);
     }
 }
 
@@ -601,7 +986,8 @@ mod persistence_tests {
         let data=serde_json::json!({"oauthAccount":{"accountUuid":"00000000-0000-4000-8000-000000000001"},
           "cachedUsageUtilization":{"accountUuid":"00000000-0000-4000-8000-000000000001","fetchedAtMs":1893456000000_i64,
           "utilization":{"limits":[{"kind":"weekly_all","group":"weekly","percent":50,
-          "resets_at":"2030-01-08T00:00:00Z"}]}}}).to_string();
+          "resets_at":"2030-01-08T00:00:00Z"}],
+          "seven_day_breakdown":{"window_started_at":"2030-01-01T00:00:00Z"}}}}).to_string();
         fs::write(&source, &data).unwrap();
         let modified = fs::metadata(&source).unwrap().modified().unwrap();
         let dir = tmp.path().join("usage");
@@ -613,6 +999,14 @@ mod persistence_tests {
         append_history(&dir, &sources).unwrap();
         append_history(&dir, &sources).unwrap();
         assert_eq!(history(&dir).len(), 1);
+        assert_eq!(
+            history(&dir)[0].weekly.window_started_at,
+            Some(
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .to_utc()
+            )
+        );
         let mismatch = tmp.path().join("mismatch");
         fs::create_dir_all(&mismatch).unwrap();
         let bad = data.replacen(

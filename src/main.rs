@@ -230,6 +230,17 @@ enum UsageAction {
         #[arg(long)]
         clear: bool,
     },
+    /// Record, list or undo a free weekly plan-limit reset
+    Reset {
+        profile: String,
+        /// Local day (YYYY-MM-DD) or minute (YYYY-MM-DD HH:MM)
+        #[arg(long, conflicts_with_all = ["list", "undo"])]
+        at: Option<String>,
+        #[arg(long, conflicts_with = "undo")]
+        list: bool,
+        #[arg(long)]
+        undo: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -526,7 +537,7 @@ fn main() -> Result<()> {
                     } else if fee_usd.is_none() {
                         anyhow::bail!("provide a fee or --clear")
                     }
-                    usage::billing::edit(&store, Local::now().date_naive(), |billing| {
+                    usage::billing::edit(&store, Utc::now(), |billing| {
                         let entry = billing.profiles.entry(profile.clone()).or_default();
                         if clear {
                             entry.plan = None;
@@ -560,7 +571,7 @@ fn main() -> Result<()> {
                     } else if flat.is_none() && !typed.iter().all(Option::is_some) {
                         anyhow::bail!("provide --flat or all five per-type rates")
                     }
-                    usage::billing::edit(&store, Local::now().date_naive(), |billing| {
+                    usage::billing::edit(&store, Utc::now(), |billing| {
                         let entry = billing.profiles.entry(profile.clone()).or_default();
                         entry.rate = if clear {
                             None
@@ -583,6 +594,28 @@ fn main() -> Result<()> {
                         Ok(())
                     })?;
                     format!("Rate updated for {profile}.\n")
+                }
+                Some(UsageAction::Reset {
+                    profile,
+                    at,
+                    list,
+                    undo,
+                }) => {
+                    let local_now = Local::now();
+                    reset_action(
+                        &manager,
+                        &store,
+                        &profile,
+                        if list {
+                            ResetCommand::List
+                        } else if undo {
+                            ResetCommand::Undo
+                        } else {
+                            ResetCommand::Record(at.as_deref())
+                        },
+                        local_now.with_timezone(&Utc),
+                        local_now.offset().fix(),
+                    )?
                 }
                 Some(UsageAction::Verify) => {
                     let (output, exit_code) = usage::report::verify(&store)?;
@@ -639,6 +672,66 @@ fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) 
         anyhow::bail!("{name} is not a subscription profile; plans apply to subscription profiles")
     }
     Ok(())
+}
+
+enum ResetCommand<'a> {
+    Record(Option<&'a str>),
+    List,
+    Undo,
+}
+
+fn reset_action(
+    manager: &ProfileManager,
+    store: &usage::ledger::Store,
+    profile: &str,
+    command: ResetCommand<'_>,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Result<String> {
+    require_billing_class(manager, profile, false)?;
+    if matches!(command, ResetCommand::List) {
+        let settings = usage::billing::read(&store.dir, now)?;
+        let Some(entry) = settings.profiles.get(profile) else {
+            return Ok(format!("No resets recorded for {profile}.\n"));
+        };
+        if entry.limit_resets.is_empty() {
+            return Ok(format!("No resets recorded for {profile}.\n"));
+        }
+        return Ok(entry
+            .limit_resets
+            .iter()
+            .enumerate()
+            .map(|(index, reset)| {
+                let from = reset.from.with_timezone(&offset).format("%Y-%m-%d %H:%M");
+                let to = reset.to.with_timezone(&offset).format("%Y-%m-%d %H:%M");
+                format!("{}. {from} to {to}\n", index + 1)
+            })
+            .collect());
+    }
+    if matches!(command, ResetCommand::Undo) {
+        let mut removed = false;
+        usage::billing::edit(store, now, |billing| {
+            let entry = billing.profiles.entry(profile.into()).or_default();
+            removed = entry.limit_resets.pop().is_some();
+            Ok(())
+        })?;
+        return Ok(if removed {
+            format!("Newest reset removed for {profile}.\n")
+        } else {
+            format!("No resets recorded for {profile}.\n")
+        });
+    }
+    let ResetCommand::Record(at) = command else {
+        unreachable!()
+    };
+    let bracket = usage::billing::parse_reset_bracket(at, now, offset)?;
+    usage::billing::edit(store, now, |billing| {
+        let entry = billing.profiles.entry(profile.into()).or_default();
+        entry.limit_resets.push(bracket);
+        entry.limit_resets.sort_by_key(|reset| reset.from);
+        Ok(())
+    })?;
+    Ok(format!("Reset recorded for {profile}.\n"))
 }
 
 fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Result<String> {
@@ -713,7 +806,7 @@ fn usage_info(
     let Some(hourly) = m::read(dir) else {
         return "Usage:     no ledger yet — run `cswitch usage`\n".into();
     };
-    let (rates, billing) = match m::load_settings(dir, now.with_timezone(&offset).date_naive()) {
+    let (rates, billing) = match m::load_settings(dir, now) {
         Ok(settings) => settings,
         Err((file, reason)) => {
             return format!("Usage:     usage settings unreadable: {file} — {reason}\n");
@@ -813,6 +906,7 @@ fn usage_info(
                     w.resets_at.map(|r| m::Weekly {
                         percent: w.percent,
                         resets_at: r,
+                        window_started_at: snapshot.window_started_at,
                     })
                 })
         {
@@ -822,19 +916,46 @@ fn usage_info(
                 weekly,
             });
         }
-        if let Some(c) = m::capacity(name, &history, &hourly, &rates) {
+        let report = m::capacity(
+            name,
+            &history,
+            &hourly,
+            &rates,
+            entry.map_or(&[][..], |entry| entry.limit_resets.as_slice()),
+        );
+        if let Some(c) = report.estimate {
             let star = if c.partial { "*" } else { "" };
-            out.push_str(&format!("Capacity:  weekly limit ≈ {}{star} of list-price usage (est. from {:.0}% at {}; last 4 weeks {}–{})\n",
-                m::money(c.value),c.snapshot.weekly.percent,c.snapshot.fetched_at.with_timezone(&offset).format("%m-%d %H:%M"),m::money(c.min),m::money(c.max)));
-        } else {
-            let reason = if history.iter().any(|r| {
-                r.profile == name && r.weekly.percent >= 20.0 && r.fetched_at > hourly.generated_at
-            }) {
-                "waiting for an ingest"
+            let amount = if c.after_reset.is_some() {
+                format!(
+                    "{}–{}",
+                    m::capacity_money(c.lower),
+                    m::capacity_money(c.upper)
+                )
             } else {
-                "no snapshot ≥ 20%"
+                m::capacity_money(c.lower)
             };
-            out.push_str(&format!("Capacity:  not enough data yet ({reason})\n"));
+            let reset = c
+                .after_reset
+                .map(|at| {
+                    format!(
+                        ", after the reset on {}",
+                        at.with_timezone(&offset).format("%m-%d")
+                    )
+                })
+                .unwrap_or_default();
+            out.push_str(&format!("Capacity:  weekly limit ≈ {amount}{star} of list-price usage (est. from {:.0}% at {}{reset}; last 4 estimates {}–{})\n",
+                c.snapshot.weekly.percent,c.snapshot.fetched_at.with_timezone(&offset).format("%m-%d %H:%M"),
+                m::capacity_money(c.min),m::capacity_money(c.max)));
+        } else {
+            out.push_str(&format!(
+                "Capacity:  not enough data yet ({})\n",
+                report.reason
+            ));
+        }
+        if let Some((from, to)) = report.hint {
+            out.push_str(&format!("Reset:     detected between {} and {} — record it with cswitch usage reset {name} --at <YYYY-MM-DD>\n",
+                from.with_timezone(&offset).format("%m-%d %H:%M"),
+                to.with_timezone(&offset).format("%m-%d %H:%M")));
         }
     }
     out
@@ -853,10 +974,7 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
     let mut out = format!("{header}\n{}\n", "─".repeat(header.chars().count()));
     let dir = usage_directory(manager);
     let hourly = m::read(&dir);
-    let settings = m::load_settings(
-        &dir,
-        now.with_timezone(&Local::now().offset().fix()).date_naive(),
-    );
+    let settings = m::load_settings(&dir, now);
     let mut saw_reset = false;
     let mut saw_flag = false;
     let mut saw_api = false;
@@ -2064,6 +2182,161 @@ mod billing_view_tests {
 mod billing_cli_tests {
     use super::*;
     #[test]
+    fn reset_cli_uses_local_brackets_and_private_locked_settings() {
+        // Known-bads: treating a local date as a UTC day, allowing a per-token reset,
+        // writing billing.json world-readable, or waiting for a busy usage lock.
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
+                .unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-01-11T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let offset = FixedOffset::west_opt(3 * 3600).unwrap();
+        let mut registry = profile::Registry::default();
+        for (name, auth) in [
+            ("p", r#"{"oauthAccount":{}}"#),
+            ("q", r#"{"oauthAccount":{}}"#),
+            ("k", r#"{"primaryApiKey":"synthetic"}"#),
+        ] {
+            registry.profiles.insert(
+                name.into(),
+                profile::Profile {
+                    name: name.into(),
+                    tool: Tool::Claude,
+                    email: Some(format!("{name}@example.com")),
+                    added: now,
+                    last_used: None,
+                },
+            );
+            std::fs::create_dir_all(manager.profile_dir(name)).unwrap();
+            std::fs::write(manager.profile_dir(name).join(".claude.json"), auth).unwrap();
+        }
+        std::fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let store = usage::store(&manager, None).unwrap();
+        usage::billing::edit(&store, now, |billing| {
+            billing
+                .profiles
+                .insert("q".into(), usage::billing::ProfileBilling::default());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            Cli::try_parse_from(["cswitch", "usage", "reset", "p", "--at", "2030-01-08"]).is_ok()
+        );
+        assert!(
+            reset_action(
+                &manager,
+                &store,
+                "k",
+                ResetCommand::Record(Some("2030-01-08")),
+                now,
+                offset
+            )
+            .is_err()
+        );
+        assert!(
+            reset_action(
+                &manager,
+                &store,
+                "p",
+                ResetCommand::Record(Some("2030-01-12")),
+                now,
+                offset
+            )
+            .is_err()
+        );
+        reset_action(
+            &manager,
+            &store,
+            "p",
+            ResetCommand::Record(Some("2030-01-08")),
+            now,
+            offset,
+        )
+        .unwrap();
+        let settings = usage::billing::read(&store.dir, now).unwrap();
+        let day = &settings.profiles["p"].limit_resets[0];
+        assert_eq!(
+            day.from,
+            DateTime::parse_from_rfc3339("2030-01-08T03:00:00Z")
+                .unwrap()
+                .to_utc()
+        );
+        assert_eq!(
+            day.to,
+            DateTime::parse_from_rfc3339("2030-01-09T03:00:00Z")
+                .unwrap()
+                .to_utc()
+        );
+        assert!(settings.profiles.contains_key("q"));
+        reset_action(
+            &manager,
+            &store,
+            "p",
+            ResetCommand::Record(Some("2030-01-08 14:30")),
+            now,
+            offset,
+        )
+        .unwrap();
+        let settings = usage::billing::read(&store.dir, now).unwrap();
+        let minute = &settings.profiles["p"].limit_resets[1];
+        assert_eq!(minute.from, minute.to);
+        assert_eq!(
+            minute.from,
+            DateTime::parse_from_rfc3339("2030-01-08T17:30:00Z")
+                .unwrap()
+                .to_utc()
+        );
+        let listed = reset_action(&manager, &store, "p", ResetCommand::List, now, offset).unwrap();
+        assert!(
+            listed.contains("1. 2030-01-08 00:00 to 2030-01-09 00:00"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("2. 2030-01-08 14:30 to 2030-01-08 14:30"),
+            "{listed}"
+        );
+        reset_action(&manager, &store, "p", ResetCommand::Undo, now, offset).unwrap();
+        assert_eq!(
+            usage::billing::read(&store.dir, now).unwrap().profiles["p"]
+                .limit_resets
+                .len(),
+            1
+        );
+        let lock = store.try_lock().unwrap().unwrap();
+        assert!(
+            reset_action(
+                &manager,
+                &store,
+                "p",
+                ResetCommand::Record(None),
+                now,
+                offset
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+        );
+        drop(lock);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(store.dir.join("billing.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
     fn purge_refusal_keeps_registry_and_success_removes_only_named_history() {
         // Known-bad: registry surviving only after ledger rows were already purged,
         // or a valid purge retaining old capacity rows for the removed name.
@@ -2213,6 +2486,161 @@ mod billing_cli_tests {
             "{text}"
         );
         assert!(!text.contains("spent"), "{text}");
+    }
+    #[test]
+    fn plan_capacity_line_shows_reset_range_and_waiting_reason() {
+        // Known-bads: doubling the capacity in info, omitting the reset range,
+        // or inverting the waiting-for-ingest condition.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let at = |text: &str| DateTime::parse_from_rfc3339(text).unwrap().to_utc();
+        let now = at("2030-01-07T12:00:00Z");
+        let bucket = |hour: &str| usage::metrics::Bucket {
+            profile: "p".into(),
+            hour: at(hour),
+            model: "claude-opus-5".into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        let mut hourly = usage::metrics::Hourly {
+            version: 1,
+            generated_at: at("2030-01-07T00:00:00Z"),
+            rows: vec![
+                bucket("2030-01-02T00:00:00Z"),
+                bucket("2030-01-05T00:00:00Z"),
+                bucket("2030-01-06T00:00:00Z"),
+            ],
+        };
+        std::fs::write(
+            dir.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let reset = usage::billing::parse_reset_bracket(
+            Some("2030-01-04"),
+            now,
+            FixedOffset::west_opt(3 * 3600).unwrap(),
+        )
+        .unwrap();
+        let mut billing = usage::billing::Billing {
+            version: 1,
+            profiles: std::collections::BTreeMap::from([(
+                "p".into(),
+                usage::billing::ProfileBilling {
+                    plan: Some(usage::billing::Plan {
+                        label: "Pro".into(),
+                        fee_usd: 20.0,
+                    }),
+                    limit_resets: vec![reset],
+                    ..Default::default()
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.join("billing.json"),
+            serde_json::to_vec(&billing).unwrap(),
+        )
+        .unwrap();
+        let rows = [
+            usage::metrics::LimitRow {
+                profile: "p".into(),
+                fetched_at: at("2030-01-03T00:00:00Z"),
+                weekly: usage::metrics::Weekly {
+                    percent: 100.0,
+                    resets_at: at("2030-01-08T00:00:00Z"),
+                    window_started_at: None,
+                },
+            },
+            usage::metrics::LimitRow {
+                profile: "p".into(),
+                fetched_at: at("2030-01-06T00:00:00Z"),
+                weekly: usage::metrics::Weekly {
+                    percent: 60.0,
+                    resets_at: at("2030-01-08T00:00:00Z"),
+                    window_started_at: None,
+                },
+            },
+        ];
+        let history = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.join("limits.jsonl"), history).unwrap();
+        let offset = FixedOffset::west_opt(3 * 3600).unwrap();
+        let text = usage_info(
+            dir,
+            "p",
+            &key::AuthMode::Subscription,
+            now,
+            offset,
+            &Limits::NoSnapshot,
+        );
+        assert!(text.contains("Capacity:  weekly limit ≈ $8–$17 of list-price usage (est. from 60% at 01-05 21:00, after the reset on 01-04; last 4 estimates $5–$17)"),"{text}");
+        std::fs::remove_file(dir.join("limits.jsonl")).unwrap();
+        hourly.generated_at = at("2030-01-06T00:00:00Z");
+        std::fs::write(
+            dir.join("hourly.json"),
+            serde_json::to_vec(&hourly).unwrap(),
+        )
+        .unwrap();
+        let live = parse_limits(&serde_json::json!({"cachedUsageUtilization":{
+            "fetchedAtMs":at("2030-01-07T00:00:00Z").timestamp_millis(),
+            "utilization":{"limits":[{"kind":"weekly_all","group":"weekly","percent":50,
+                "resets_at":"2030-01-08T00:00:00Z"}]}}}));
+        let waiting = usage_info(dir, "p", &key::AuthMode::Subscription, now, offset, &live);
+        assert!(
+            waiting.contains("Capacity:  not enough data yet (waiting for an ingest)"),
+            "{waiting}"
+        );
+        billing.profiles.get_mut("p").unwrap().limit_resets.clear();
+        std::fs::write(
+            dir.join("billing.json"),
+            serde_json::to_vec(&billing).unwrap(),
+        )
+        .unwrap();
+        let long = [
+            usage::metrics::LimitRow {
+                profile: "p".into(),
+                fetched_at: at("2029-12-31T00:00:00Z"),
+                weekly: usage::metrics::Weekly {
+                    percent: 80.0,
+                    resets_at: at("2030-01-08T00:00:00Z"),
+                    window_started_at: None,
+                },
+            },
+            usage::metrics::LimitRow {
+                profile: "p".into(),
+                fetched_at: at("2030-01-05T00:00:00Z"),
+                weekly: usage::metrics::Weekly {
+                    percent: 30.0,
+                    resets_at: at("2030-01-08T00:00:00Z"),
+                    window_started_at: None,
+                },
+            },
+        ];
+        let history = long
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.join("limits.jsonl"), history).unwrap();
+        let hinted = usage_info(
+            dir,
+            "p",
+            &key::AuthMode::Subscription,
+            now,
+            offset,
+            &Limits::NoSnapshot,
+        );
+        assert!(hinted.contains("Reset:     detected between 12-30 21:00 and 01-04 21:00 — record it with cswitch usage reset p --at <YYYY-MM-DD>"),"{hinted}");
     }
     #[test]
     fn effective_spend_and_rate_line_keep_subdollar_precision() {
