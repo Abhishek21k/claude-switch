@@ -137,13 +137,24 @@ cswitch usage verify
 cswitch usage alias 'acme/claude-x.5' claude-opus-5-5
 cswitch usage alias 'acme/claude-x.5' --remove
 cswitch usage plan work 20 --label Pro
+cswitch usage reset work --at 2030-01-08
+cswitch usage reset work --at '2030-01-08 14:30'
+cswitch usage reset work --list
+cswitch usage reset work --undo
 cswitch usage rate keyed --flat 1 --model-prefix 'acme/'
 cswitch usage rate keyed --input 1 --output 5 --cache-write-5m 1.25 --cache-write-1h 2 --cache-read 0.1
 ```
 
-`--since` accepts `7d` (default), `30d`, `all`, or `YYYY-MM-DD`; `--by` accepts `profile`, `workspace`, `project`, `session`, `model`, or `day`. The default view is a workspace › project › session tree. Set `CSWITCH_USAGE_DIR` to use another ledger directory, for example when ingesting into a temporary directory. The ledger survives profile removal; `cswitch remove <name> --purge-usage` opts into deleting that profile's rows.
+`--since` accepts `7d` (default), `30d`, `all`, or `YYYY-MM-DD`; `--by` accepts `profile`, `workspace`, `project`, `session`, `model`, or `day`. The default view is a workspace › project › session tree. Set `CSWITCH_USAGE_DIR` to use another ledger directory, for example when ingesting into a temporary directory. The ledger survives profile removal; `cswitch remove <name> --purge-usage` opts into deleting that profile's ledger rows, billing settings and limit history.
 
-`cswitch list` includes `30D $`: per-token spend or `~` list-price value for other Claude profiles. `cswitch info` shows today, 7-day and 30-day token totals, estimated spend and list value, an owner-entered plan fee, and a weekly capacity estimate. Both read the last offline hourly rollup; run `cswitch usage` to refresh. An absent ledger shows `—` and a refresh hint. `$*` marks unpriced usage. These estimates use the owner's settings and transcript counters; they are not gateway balance queries.
+`cswitch list` includes `30D $`: per-token spend or `~` list-price value for other Claude profiles. `cswitch info` shows today, 7-day and 30-day token totals, estimated spend and list value, an owner-entered plan fee, and a weekly capacity estimate. After a configured plan fee or per-token rate, `Effective:` divides that fee or the 30-day spend by the 30-day token count and shows USD per million tokens. It is absent when there are no tokens. Both views read the last offline hourly rollup; run `cswitch usage` to refresh. An absent ledger shows `—` and a refresh hint. `$*` marks unpriced usage. These estimates use the owner's settings and transcript counters; they are not gateway balance queries.
+
+For example, a synthetic plan can show:
+
+```text
+Effective: $0.0375 per 1M tokens over 30 days (fee ÷ tokens)
+Capacity:  weekly limit ≈ $380–$450 of list-price usage (est. from 70% at 01-10 17:00, after the reset on 01-08; last 4 estimates $360–$470)
+```
 
 List prices stay in `rates.json`. Its optional `aliases` object maps exact transcript model names to existing rate model IDs, for example `"acme/claude-x.5": "claude-opus-5-5"`. No name normalization occurs; unaliased names remain unpriced. `usage verify` skips aliased requests because Claude Code's cost state cannot price them.
 
@@ -153,13 +164,20 @@ Owner billing settings live in private `~/.claude-switch/usage/billing.json`, cr
 {
   "version": 1,
   "profiles": {
-    "work": { "plan": { "label": "Pro", "fee_usd": 20.0 } },
+    "work": {
+      "plan": { "label": "Pro", "fee_usd": 20.0 },
+      "limit_resets": [ { "from": "2030-01-08T03:00:00Z", "to": "2030-01-09T03:00:00Z" } ]
+    },
     "keyed": { "rate": { "model_prefixes": ["acme/"], "flat": 1.0 } }
   }
 }
 ```
 
-`cswitch remove` retains billing settings; `--purge-usage` deletes them with ledger rows. Weekly capacity uses a window from `resets_at` minus seven days through its highest utilization snapshot. It divides list-price usage up to that snapshot by its utilization fraction, only from 20% onward and after the ledger catches up. The newest four eligible windows give a range. This is an estimate from one account's observed model mix, and unpriced models make it partial.
+`cswitch usage reset` records a free weekly plan-limit reset when Claude Code's weekly percentage returns to zero without moving the scheduled reset time. Use `--at YYYY-MM-DD` when only the local day is known: cswitch records the whole local day as a bracket. `--at 'YYYY-MM-DD HH:MM'` records an exact local minute; omitting `--at` uses the current minute. `--list` shows the stored brackets, and `--undo` removes the newest. Only subscription profiles accept this command. A date bracket produces a capacity range because the reset could have happened at any time that day.
+
+Weekly capacity assumes the window starts at Claude Code's `window_started_at` when present, or seven days before `resets_at` otherwise. A drop of at least one percentage point between snapshots detects a reset; a recorded bracket can narrow its time. Each reset splits the weekly window into segments. For each segment, cswitch uses the highest snapshot already covered by the ledger, starting at 20% utilization, and divides that segment's list-price usage by the utilization fraction. A long detected bracket needs a recorded reset before its post-reset segment can be estimated. `info` prints the newest eligible estimate and the min–max of the newest four estimates, in whole dollars; unpriced models mark an estimate partial. The result reflects one account's observed model mix and is not a guaranteed plan allowance. A snapshot newer than the ledger waits for another ingest without hiding an older, caught-up estimate.
+
+`cswitch remove` retains billing settings; `--purge-usage` deletes them with ledger rows and limit history.
 
 Without configuration, attribution uses the nearest Git root. A private `~/.claude-switch/usage/config.json` can add project folders, workspace names, and aliases. This synthetic example uses only placeholder paths:
 
