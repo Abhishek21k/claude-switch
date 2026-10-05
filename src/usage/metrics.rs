@@ -428,7 +428,10 @@ pub fn capacity(
             if detected.to < start || detected.from >= resets_at {
                 continue;
             }
-            if let Some(event) = events.iter_mut().find(|event| overlaps(event, &detected)) {
+            if let Some(event) = events
+                .iter_mut()
+                .find(|event| !event.detected && overlaps(event, &detected))
+            {
                 event.from = event.from.max(detected.from);
                 event.to = event.to.min(detected.to);
                 event.detected = true;
@@ -884,6 +887,68 @@ mod reset_capacity_tests {
         assert_eq!(result.after_reset, Some(at("2030-01-03T12:00:00Z")));
         assert!((result.lower - 10.0 / 0.3).abs() < 0.001);
         assert!((result.upper - 15.0 / 0.3).abs() < 0.001);
+    }
+    #[test]
+    fn adjacent_detected_drops_remain_two_resets() {
+        // Known-bad: merging two detected brackets that share their middle snapshot.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 20.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-05T00:00:00Z",
+            vec![
+                bucket("2030-01-02T00:00:00Z", 1),
+                bucket("2030-01-03T00:00:00Z", 1),
+                bucket("2030-01-04T00:00:00Z", 1),
+            ],
+        );
+        let result = estimate(&rows, &usage, &[]).estimate.unwrap();
+        assert_eq!(result.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
+        assert_eq!(result.after_reset, Some(at("2030-01-03T00:00:00Z")));
+        assert_eq!(result.lower, 25.0);
+        assert_eq!(result.upper, 50.0);
+    }
+    #[test]
+    fn adjacent_long_drops_hint_at_first_bracket() {
+        // Known-bad: merging long detected brackets marks the result covered.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-09T00:00:00Z", 80.0, None),
+            row("2030-01-05T00:00:00Z", "2030-01-09T00:00:00Z", 50.0, None),
+            row("2030-01-08T00:00:00Z", "2030-01-09T00:00:00Z", 20.0, None),
+        ];
+        let report = estimate(&rows, &hourly("2030-01-08T00:00:00Z", vec![]), &[]);
+        assert_eq!(
+            report.hint,
+            Some((at("2030-01-02T00:00:00Z"), at("2030-01-05T00:00:00Z")))
+        );
+    }
+    #[test]
+    fn recorded_minute_absorbs_only_first_detected_drop() {
+        // Known-bad: one recorded event swallowing two adjacent detected brackets.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 20.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-05T00:00:00Z",
+            vec![
+                bucket("2030-01-02T00:00:00Z", 1),
+                bucket("2030-01-03T00:00:00Z", 1),
+                bucket("2030-01-04T00:00:00Z", 1),
+            ],
+        );
+        let reset = billing::LimitReset {
+            from: at("2030-01-02T12:00:00Z"),
+            to: at("2030-01-02T12:00:00Z"),
+        };
+        let result = estimate(&rows, &usage, &[reset]).estimate.unwrap();
+        assert_eq!(result.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
+        assert_eq!(result.after_reset, Some(at("2030-01-03T00:00:00Z")));
+        assert_eq!(result.lower, 25.0);
+        assert_eq!(result.upper, 50.0);
     }
     #[test]
     fn snapshot_strictly_inside_recorded_day_has_no_segment() {
