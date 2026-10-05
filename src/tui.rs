@@ -3436,6 +3436,7 @@ mod tests {
         assert_eq!(app.usage_cache.cells["api"], "$2.00");
         let frame = render_text(&mut app);
         assert!(frame.contains("$2.00"));
+        assert!(frame.contains("Effective:"));
         fs::write(app.usage_dir.join("billing.json"), b"{bad").unwrap();
         app.reload_usage_data();
         assert!(
