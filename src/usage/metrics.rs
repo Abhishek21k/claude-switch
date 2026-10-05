@@ -941,8 +941,8 @@ mod reset_capacity_tests {
             ],
         );
         let reset = billing::LimitReset {
-            from: at("2030-01-02T12:00:00Z"),
-            to: at("2030-01-02T12:00:00Z"),
+            from: at("2030-01-03T00:00:00Z"),
+            to: at("2030-01-03T00:00:00Z"),
         };
         let result = estimate(&rows, &usage, &[reset]).estimate.unwrap();
         assert_eq!(result.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
