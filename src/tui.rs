@@ -3811,4 +3811,15 @@ mod tests {
         assert_eq!(app.usage_cache.cells["plan"], "~$5.00");
         assert_eq!(app.poll_wait(), Duration::from_secs(30));
     }
+
+    #[test]
+    fn tick_advances_limits_clock_before_draw() {
+        // Known-bad: a pre-draw tick that leaves limits_now at its old value.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        let past = Utc::now() - chrono::Duration::days(1);
+        app.limits_now = past;
+        app.tick(Instant::now());
+        assert!(app.limits_now > past);
+    }
 }
