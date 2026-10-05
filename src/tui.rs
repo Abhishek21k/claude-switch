@@ -366,6 +366,20 @@ impl App {
         }
     }
 
+    fn poll_wait(&self) -> Duration {
+        if self.ingest_rx.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(30)
+        }
+    }
+
+    fn tick(&mut self, instant: Instant) {
+        self.limits_now = Utc::now();
+        self.poll_ingest();
+        self.refresh_limits_if_due(instant);
+    }
+
     fn refresh_limits_if_due(&mut self, instant: Instant) {
         let selected = self.selected_profile().map(|profile| profile.name.clone());
         let changed = selected != self.limits_selection;
@@ -545,17 +559,10 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
-            self.limits_now = Utc::now();
-            self.poll_ingest();
-            self.refresh_limits_if_due(Instant::now());
+            self.tick(Instant::now());
             terminal.draw(|f| self.render(f))?;
 
-            let wait = if self.ingest_rx.is_some() {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(30)
-            };
-            if event::poll(wait)?
+            if event::poll(self.poll_wait())?
                 && let Event::Key(key) = event::read()?
             {
                 if key.kind != KeyEventKind::Press {
@@ -2543,6 +2550,34 @@ mod tests {
         render_text_at(app, 120, 40)
     }
 
+    fn write_plan_hourly(app: &App, now: DateTime<Utc>) {
+        let profile_dir = app.manager.profile_dir("plan");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(profile_dir.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+        fs::create_dir_all(&app.usage_dir).unwrap();
+        fs::write(
+            app.usage_dir.join("hourly.json"),
+            serde_json::to_vec(&m::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![m::Bucket {
+                    profile: "plan".into(),
+                    hour: now - chrono::Duration::hours(1),
+                    model: "claude-opus-5".into(),
+                    speed: None,
+                    requests: 1,
+                    input: 1_000_000,
+                    output: 0,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 0,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn console_choice_routes_through_pending_action() {
         // Known-bad: [p] falling through to the subscription login.
@@ -3716,5 +3751,64 @@ mod tests {
             app.usage_panel_text("plan")
                 .contains("synthetic read error")
         );
+    }
+
+    #[test]
+    fn real_busy_store_keeps_cached_cells_and_marks_panel_busy() {
+        // Known-bad: start_background_ingest maps a skipped lock to Updated.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        write_plan_hourly(&app, Utc::now());
+        app.reload_usage_data();
+        let loaded_cells = app.usage_cache.cells.clone();
+        assert_eq!(loaded_cells["plan"], "~$5.00");
+        let other_store = usage::store(&app.manager, Some(app.usage_dir.clone())).unwrap();
+        let _lock = other_store.try_lock().unwrap().unwrap();
+        app.start_background_ingest();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.ingest_rx.is_some() && Instant::now() < deadline {
+            app.poll_ingest();
+            std::thread::yield_now();
+        }
+        assert!(app.ingest_rx.is_none(), "background ingest did not finish");
+        assert_eq!(app.usage_cache.cells, loaded_cells);
+        assert!(app.usage_panel_text("plan").contains("ledger busy"));
+    }
+
+    #[test]
+    fn disconnected_ingest_worker_shows_error_and_clears_receiver() {
+        // Known-bad: ignoring a worker channel disconnect.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        let (tx, rx) = mpsc::channel();
+        app.ingest_rx = Some(rx);
+        drop(tx);
+        app.poll_ingest();
+        assert!(app.ingest_rx.is_none());
+        assert!(
+            app.usage_panel_text("plan")
+                .contains("ingest error: background ingest stopped")
+        );
+    }
+
+    #[test]
+    fn tick_polls_finished_worker_and_poll_wait_tracks_pending_ingest() {
+        // Known-bads: waiting 30 seconds during ingest or omitting the pre-draw poll.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        assert_eq!(app.poll_wait(), Duration::from_secs(30));
+        let old_cell = app.usage_cache.cells["plan"].clone();
+        write_plan_hourly(&app, Utc::now());
+        let (tx, rx) = mpsc::channel();
+        app.ingest_rx = Some(rx);
+        assert_eq!(app.poll_wait(), Duration::from_millis(100));
+        std::thread::spawn(move || tx.send(IngestOutcome::Updated).unwrap())
+            .join()
+            .unwrap();
+        app.tick(Instant::now());
+        assert!(app.ingest_rx.is_none());
+        assert_ne!(app.usage_cache.cells["plan"], old_cell);
+        assert_eq!(app.usage_cache.cells["plan"], "~$5.00");
+        assert_eq!(app.poll_wait(), Duration::from_secs(30));
     }
 }
