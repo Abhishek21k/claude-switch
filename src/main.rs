@@ -529,7 +529,7 @@ fn main() -> Result<()> {
                     label,
                     clear,
                 }) => {
-                    require_billing_class(&manager, &profile, false)?;
+                    require_billing_class(&manager, &profile, false, "plans")?;
                     if clear {
                         if fee_usd.is_some() || label.is_some() {
                             anyhow::bail!("--clear takes no fee or label")
@@ -559,7 +559,7 @@ fn main() -> Result<()> {
                     model_prefix,
                     clear,
                 }) => {
-                    require_billing_class(&manager, &profile, true)?;
+                    require_billing_class(&manager, &profile, true, "rates")?;
                     let typed = [input, output, cache_write_5m, cache_write_1h, cache_read];
                     if clear {
                         if flat.is_some()
@@ -659,7 +659,12 @@ fn remove_profile_with_usage(
     manager.remove_profile(name)
 }
 
-fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) -> Result<()> {
+fn require_billing_class(
+    manager: &ProfileManager,
+    name: &str,
+    per_token: bool,
+    subject: &str,
+) -> Result<()> {
     let profile = manager.get_profile(name)?;
     if profile.tool != Tool::Claude {
         anyhow::bail!("{name} is not a Claude profile")
@@ -669,7 +674,9 @@ fn require_billing_class(manager: &ProfileManager, name: &str, per_token: bool) 
         anyhow::bail!("{name} is not a per-token profile; rates apply to per-token profiles")
     }
     if !per_token && mode != key::AuthMode::Subscription {
-        anyhow::bail!("{name} is not a subscription profile; plans apply to subscription profiles")
+        anyhow::bail!(
+            "{name} is not a subscription profile; {subject} apply to subscription profiles"
+        )
     }
     Ok(())
 }
@@ -688,7 +695,7 @@ fn reset_action(
     now: DateTime<Utc>,
     offset: FixedOffset,
 ) -> Result<String> {
-    require_billing_class(manager, profile, false)?;
+    require_billing_class(manager, profile, false, "limit resets")?;
     if matches!(command, ResetCommand::List) {
         let settings = usage::billing::read(&store.dir, now)?;
         let Some(entry) = settings.profiles.get(profile) else {
@@ -1998,6 +2005,10 @@ mod tests {
         let output = list_output(&manager, Utc::now()).unwrap();
         assert!(output.contains("o                    codex"), "{output}");
         assert!(output.contains("u                    unknown"), "{output}");
+        assert!(
+            !output.lines().any(|line| line.contains("unknown too")),
+            "{output}"
+        ); // Known-bad: truncated unknown tool label.
         assert!(output.lines().all(|line| line.chars().count() <= 120));
         let codex_row = output.lines().find(|line| line.starts_with("o ")).unwrap();
         assert!(codex_row.contains("—       —"), "{codex_row}");
@@ -2087,7 +2098,7 @@ mod billing_view_tests {
     }
     #[test]
     fn plan_views_union_live_snapshot_without_writing_any_usage_file() {
-        // Known-bads: omitting the live snapshot when history is absent, or creating limits.jsonl on a read path.
+        // Known-bads: omitting the live snapshot or its window_started_at, or writing limits.jsonl on a read path.
         let tmp = TempDir::new().unwrap();
         let manager =
             ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
@@ -2114,7 +2125,7 @@ mod billing_view_tests {
             "fetchedAtMs":Utc.with_ymd_and_hms(2030,1,5,0,0,0).unwrap().timestamp_millis(),
             "utilization":{"limits":[{"kind":"weekly_all","group":"weekly","percent":50,
                 "resets_at":"2030-01-08T00:00:00Z"}],
-                "seven_day_breakdown":{"window_started_at":"2030-01-01T00:00:00Z"}}}});
+                "seven_day_breakdown":{"window_started_at":"2030-01-02T00:00:00Z"}}}});
         fs::write(
             manager.profile_dir("p").join(".claude.json"),
             live.to_string(),
@@ -2125,18 +2136,32 @@ mod billing_view_tests {
         let hourly = usage::metrics::Hourly {
             version: 1,
             generated_at: Utc.with_ymd_and_hms(2030, 1, 6, 0, 0, 0).unwrap(),
-            rows: vec![usage::metrics::Bucket {
-                profile: "p".into(),
-                hour: Utc.with_ymd_and_hms(2030, 1, 2, 0, 0, 0).unwrap(),
-                model: "claude-opus-5".into(),
-                speed: None,
-                requests: 1,
-                input: 1_000_000,
-                output: 0,
-                cache_write_5m: 0,
-                cache_write_1h: 0,
-                cache_read: 0,
-            }],
+            rows: vec![
+                usage::metrics::Bucket {
+                    profile: "p".into(),
+                    hour: Utc.with_ymd_and_hms(2030, 1, 1, 23, 0, 0).unwrap(),
+                    model: "claude-opus-5".into(),
+                    speed: None,
+                    requests: 1,
+                    input: 1_000_000,
+                    output: 0,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 0,
+                },
+                usage::metrics::Bucket {
+                    profile: "p".into(),
+                    hour: Utc.with_ymd_and_hms(2030, 1, 2, 0, 0, 0).unwrap(),
+                    model: "claude-opus-5".into(),
+                    speed: None,
+                    requests: 1,
+                    input: 1_000_000,
+                    output: 0,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 0,
+                },
+            ],
         };
         fs::write(
             usage.join("hourly.json"),
@@ -2314,7 +2339,8 @@ mod billing_cli_tests {
             ("plan", Tool::Claude, r#"{"oauthAccount":{}}"#),
             ("keyed", Tool::Claude, r#"{"primaryApiKey":"synthetic"}"#),
             ("empty", Tool::Claude, "{}"),
-            ("codex", Tool::Codex, "{}"),
+            ("codex", Tool::Codex, r#"{"oauthAccount":{}}"#),
+            ("codex_key", Tool::Codex, r#"{"primaryApiKey":"synthetic"}"#),
         ] {
             registry.profiles.insert(
                 name.into(),
@@ -2334,16 +2360,29 @@ mod billing_cli_tests {
             serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
-        assert!(require_billing_class(&manager, "plan", false).is_ok());
-        assert!(require_billing_class(&manager, "keyed", true).is_ok());
-        assert!(require_billing_class(&manager, "plan", true).is_err());
-        assert!(require_billing_class(&manager, "keyed", false).is_err());
-        for name in ["empty", "codex"] {
-            assert!(require_billing_class(&manager, name, true).is_err());
-            assert!(require_billing_class(&manager, name, false).is_err());
+        assert!(require_billing_class(&manager, "plan", false, "plans").is_ok());
+        assert!(require_billing_class(&manager, "keyed", true, "rates").is_ok());
+        assert!(require_billing_class(&manager, "plan", true, "rates").is_err());
+        assert_eq!(
+            require_billing_class(&manager, "keyed", false, "plans")
+                .unwrap_err()
+                .to_string(),
+            "keyed is not a subscription profile; plans apply to subscription profiles"
+        );
+        for name in ["empty", "codex", "codex_key"] {
+            assert!(require_billing_class(&manager, name, true, "rates").is_err());
+            assert!(require_billing_class(&manager, name, false, "plans").is_err());
+        }
+        for name in ["codex", "codex_key"] {
+            assert_eq!(
+                require_billing_class(&manager, name, false, "plans")
+                    .unwrap_err()
+                    .to_string(),
+                format!("{name} is not a Claude profile")
+            );
         }
         let store = usage::store(&manager, None).unwrap();
-        assert!(
+        assert_eq!(
             reset_action(
                 &manager,
                 &store,
@@ -2352,7 +2391,9 @@ mod billing_cli_tests {
                 Utc::now(),
                 FixedOffset::east_opt(0).unwrap()
             )
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+            "keyed is not a subscription profile; limit resets apply to subscription profiles"
         );
     }
     #[test]
@@ -2494,6 +2535,58 @@ mod billing_cli_tests {
                 .len(),
             1
         );
+        // Known-bads: append order persisted unsorted, undo removed oldest, default kept seconds.
+        reset_action(
+            &manager,
+            &store,
+            "q",
+            ResetCommand::Record(Some("2030-01-10 10:00")),
+            now,
+            offset,
+        )
+        .unwrap();
+        reset_action(
+            &manager,
+            &store,
+            "q",
+            ResetCommand::Record(Some("2030-01-07 09:00")),
+            now,
+            offset,
+        )
+        .unwrap();
+        let q = &usage::billing::read(&store.dir, now).unwrap().profiles["q"].limit_resets;
+        assert_eq!(q.len(), 2);
+        assert!(q[0].from < q[1].from);
+        assert_eq!(
+            reset_action(&manager, &store, "q", ResetCommand::List, now, offset).unwrap(),
+            "1. 2030-01-07 09:00 to 2030-01-07 09:00\n2. 2030-01-10 10:00 to 2030-01-10 10:00\n"
+        );
+        reset_action(&manager, &store, "q", ResetCommand::Undo, now, offset).unwrap();
+        let q = &usage::billing::read(&store.dir, now).unwrap().profiles["q"].limit_resets;
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q[0].from,
+            DateTime::parse_from_rfc3339("2030-01-07T12:00:00Z")
+                .unwrap()
+                .to_utc()
+        );
+        let now_with_seconds = now + chrono::Duration::seconds(37);
+        reset_action(
+            &manager,
+            &store,
+            "q",
+            ResetCommand::Record(None),
+            now_with_seconds,
+            offset,
+        )
+        .unwrap();
+        let q = &usage::billing::read(&store.dir, now_with_seconds)
+            .unwrap()
+            .profiles["q"]
+            .limit_resets;
+        let default = q.last().unwrap();
+        assert_eq!(default.from, default.to);
+        assert_eq!(default.from.timestamp() % 60, 0);
         let lock = store.try_lock().unwrap().unwrap();
         assert!(
             reset_action(
@@ -2672,6 +2765,20 @@ mod billing_cli_tests {
             "{text}"
         );
         assert!(!text.contains("spent"), "{text}");
+        let empty = usage::metrics::Hourly {
+            rows: vec![],
+            ..hourly
+        };
+        std::fs::write(dir.join("hourly.json"), serde_json::to_vec(&empty).unwrap()).unwrap();
+        let no_tokens = usage_info(
+            dir,
+            "p",
+            &key::AuthMode::Subscription,
+            now,
+            FixedOffset::east_opt(0).unwrap(),
+            &Limits::NoSnapshot,
+        );
+        assert!(!no_tokens.contains("Effective:"), "{no_tokens}"); // Known-bad: fee ÷ zero tokens.
     }
     #[test]
     fn plan_capacity_line_shows_reset_range_and_waiting_reason() {
@@ -3031,6 +3138,16 @@ mod billing_cli_tests {
             text.contains("Effective: $0.135 per 1M tokens over 30 days (spend ÷ tokens)"),
             "{text}"
         );
+        std::fs::write(
+            tmp.path().join("billing.json"),
+            serde_json::json!({"version":1,"profiles":{"p":{"rate":{
+                "input":0.1,"output":0.2,"cache_write_5m":0.3,
+                "cache_write_1h":0.4,"cache_read":0.075}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let typed = render();
+        assert!(typed.contains("read $0.075"), "{typed}"); // Known-bad: money() rounds the rate to cents.
         hourly.rows.clear();
         std::fs::write(
             tmp.path().join("hourly.json"),

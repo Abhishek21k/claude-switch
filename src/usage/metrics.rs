@@ -1075,6 +1075,95 @@ mod reset_capacity_tests {
         )];
         assert_eq!(estimate(&over, &usage, &[]).estimate.unwrap().lower, 5.0);
     }
+    #[test]
+    fn old_recorded_reset_does_not_split_newer_window() {
+        // Known-bad: applying recorded resets to every weekly window.
+        let rows = [row(
+            "2030-01-07T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            50.0,
+            None,
+        )];
+        let usage = hourly(
+            "2030-01-07T12:00:00Z",
+            vec![bucket("2030-01-07T00:00:00Z", 1)],
+        );
+        let old = billing::LimitReset {
+            from: at("2029-12-30T00:00:00Z"),
+            to: at("2029-12-30T00:00:00Z"),
+        };
+        let plain = estimate(&rows, &usage, &[]).estimate.unwrap();
+        let with_old = estimate(&rows, &usage, &[old]).estimate.unwrap();
+        assert_eq!(with_old.after_reset, None);
+        assert_eq!((with_old.lower, with_old.upper), (plain.lower, plain.upper));
+    }
+    #[test]
+    fn old_window_long_drop_does_not_create_newest_hint() {
+        // Known-bad: a reset hint leaking from an older weekly window.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-09T00:00:00Z", 80.0, None),
+            row("2030-01-05T00:00:00Z", "2030-01-09T00:00:00Z", 30.0, None),
+            row("2030-01-12T00:00:00Z", "2030-01-16T00:00:00Z", 50.0, None),
+        ];
+        let report = estimate(&rows, &hourly("2030-01-13T00:00:00Z", vec![]), &[]);
+        assert!(report.hint.is_none());
+    }
+    #[test]
+    fn capacity_min_uses_low_end_of_a_range() {
+        // Known-bad: computing min from range high ends.
+        let mut rows = vec![row(
+            "2030-01-04T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            50.0,
+            None,
+        )];
+        let mut buckets = vec![
+            bucket("2030-01-03T13:00:00Z", 1),
+            bucket("2030-01-04T00:00:00Z", 1),
+        ];
+        let reset = billing::LimitReset {
+            from: at("2030-01-03T00:00:00Z"),
+            to: at("2030-01-04T00:00:00Z"),
+        };
+        for (fetched, resets_at, millions) in [
+            ("2030-01-11T00:00:00Z", "2030-01-15T00:00:00Z", 2),
+            ("2030-01-18T00:00:00Z", "2030-01-22T00:00:00Z", 3),
+            ("2030-01-25T00:00:00Z", "2030-01-29T00:00:00Z", 4),
+        ] {
+            rows.push(row(fetched, resets_at, 50.0, None));
+            buckets.push(bucket(fetched, millions));
+        }
+        let result = estimate(&rows, &hourly("2030-01-26T00:00:00Z", buckets), &[reset])
+            .estimate
+            .unwrap();
+        assert_eq!(result.min, 10.0);
+        assert_eq!(result.max, 40.0);
+    }
+    #[test]
+    fn one_point_drop_is_reset_but_half_point_is_not() {
+        // Known-bads: treating any decrease as a reset; skipping exactly one point.
+        let first = row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None);
+        let usage = hourly(
+            "2030-01-04T00:00:00Z",
+            vec![
+                bucket("2030-01-02T00:00:00Z", 1),
+                bucket("2030-01-03T00:00:00Z", 1),
+            ],
+        );
+        let half = [
+            first.clone(),
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 49.5, None),
+        ];
+        let exact = [
+            first,
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 49.0, None),
+        ];
+        let half = estimate(&half, &usage, &[]).estimate.unwrap();
+        assert_eq!(half.after_reset, None);
+        assert_eq!(half.lower, half.upper);
+        let exact = estimate(&exact, &usage, &[]).estimate.unwrap();
+        assert_eq!(exact.after_reset, Some(at("2030-01-02T00:00:00Z")));
+    }
 }
 
 #[cfg(test)]
@@ -1159,6 +1248,53 @@ mod persistence_tests {
         assert_eq!(second.rows[0].cache_write_1h, 80);
         assert_eq!(second.rows[0].cache_read, 100);
         assert_eq!(second.rows[0].speed.as_deref(), Some("fast"));
+    }
+    #[test]
+    fn hourly_rollup_keeps_fast_and_standard_requests_separate() {
+        // Known-bad: grouping without speed prices a fast request as standard.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        let project = profile.join("projects/demo");
+        fs::create_dir_all(&project).unwrap();
+        let record = |id: &str, speed: Option<&str>, input: u64| {
+            let mut row = serde_json::json!({"type":"assistant","timestamp":"2030-01-01T12:05:00Z",
+                "sessionId":"s","requestId":format!("req-{id}"),
+                "message":{"id":format!("msg-{id}"),"model":"claude-opus-5",
+                    "usage":{"input_tokens":input,"output_tokens":2}}});
+            if let Some(speed) = speed {
+                row["message"]["usage"]["speed"] = speed.into();
+            }
+            row.to_string()
+        };
+        fs::write(
+            project.join("a.jsonl"),
+            format!(
+                "{}\n{}\n",
+                record("fast", Some("fast"), 10),
+                record("standard", None, 20)
+            ),
+        )
+        .unwrap();
+        let store = Store::new(
+            tmp.path().join("usage"),
+            vec![Source {
+                profile: "p".into(),
+                directory: profile,
+            }],
+        );
+        store.ingest().unwrap();
+        let rows = read(&store.dir).unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        let fast = rows
+            .iter()
+            .find(|row| row.speed.as_deref() == Some("fast"))
+            .unwrap();
+        let standard = rows.iter().find(|row| row.speed.is_none()).unwrap();
+        assert_eq!((fast.requests, fast.input, fast.output), (1, 10, 2));
+        assert_eq!(
+            (standard.requests, standard.input, standard.output),
+            (1, 20, 2)
+        );
     }
     #[test]
     fn history_deduplicates_and_never_writes_claude_json() {

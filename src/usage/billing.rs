@@ -896,4 +896,34 @@ mod validation_tests {
             .is_err()
         );
     }
+    #[test]
+    fn limit_resets_are_strict_on_read() {
+        // Known-bads: admitting >48 h, reversed, unsorted or unknown-field reset brackets.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("billing.json");
+        let now = DateTime::parse_from_rfc3339("2030-01-10T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let reset = |from: &str, to: &str| serde_json::json!({"from":from,"to":to});
+        let cases = [
+            vec![reset("2030-01-01T00:00:00Z", "2030-01-03T00:01:00Z")],
+            vec![reset("2030-01-03T00:00:00Z", "2030-01-02T00:00:00Z")],
+            vec![
+                reset("2030-01-04T00:00:00Z", "2030-01-04T00:00:00Z"),
+                reset("2030-01-02T00:00:00Z", "2030-01-02T00:00:00Z"),
+            ],
+            vec![serde_json::json!({"from":"2030-01-02T00:00:00Z",
+                "to":"2030-01-02T00:00:00Z","extra":true})],
+        ];
+        for resets in cases {
+            fs::write(
+                &path,
+                serde_json::json!({"version":1,"profiles":{"p":{"limit_resets":resets}}})
+                    .to_string(),
+            )
+            .unwrap();
+            let error = read(tmp.path(), now).unwrap_err().to_string();
+            assert!(error.contains("billing.json"), "{error}");
+        }
+    }
 }
