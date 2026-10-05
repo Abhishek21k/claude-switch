@@ -541,6 +541,38 @@ mod stage_b_tests {
     }
 
     #[test]
+    fn agy_activity_uses_each_nested_marker_and_ignores_cache() {
+        // Known-bad: no Antigravity activity branch, Codex markers, or a missing agy marker.
+        for marker in ["log", "conversations", "brain"] {
+            let tmp = TempDir::new().unwrap();
+            let manager = manager(&tmp);
+            register(&manager, "g", Tool::Antigravity, "g@example.com");
+            let cli = manager
+                .profile_dir("g")
+                .join("home/.gemini/antigravity-cli");
+            let root = cli.join(marker);
+            let nested = root.join("year/month");
+            fs::create_dir_all(&nested).unwrap();
+            let entry = nested.join("entry");
+            fs::write(&entry, b"old").unwrap();
+            let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+            for path in [&cli, &root, &root.join("year"), &nested, &entry] {
+                fs::File::open(path).unwrap().set_modified(old).unwrap();
+            }
+            let cache = cli.join("cache");
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join("fresh"), b"ignored").unwrap();
+            assert_eq!(
+                manager.maybe_in_use("g"),
+                None,
+                "{marker} cache must not count"
+            );
+            fs::write(&entry, b"fresh marker").unwrap();
+            assert!(manager.maybe_in_use("g").is_some(), "{marker} must count");
+        }
+    }
+
+    #[test]
     fn codex_nested_session_rewrite_counts_as_recent_activity() {
         // Known-bad: checking only the sessions/ directory misses a rewrite several levels below it.
         let tmp = TempDir::new().unwrap();
