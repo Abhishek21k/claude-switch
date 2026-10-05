@@ -356,6 +356,54 @@ mod tests {
     }
 
     #[test]
+    fn recorded_link_replaced_by_file_stays_with_and_without_source() {
+        // Known-bad: a recorded name overrides a local copy, or removes it when source disappears.
+        for remove_source in [false, true] {
+            let (_temp, real, profile) = fixture();
+            link_farm(&real, &profile).unwrap();
+            let local = profile_home(&profile).join("note");
+            fs::remove_file(&local).unwrap();
+            fs::write(&local, b"profile-owned copy").unwrap();
+            if remove_source {
+                fs::remove_file(real.join("note")).unwrap();
+            }
+            link_farm(&real, &profile).unwrap();
+            assert_eq!(fs::read(&local).unwrap(), b"profile-owned copy");
+            assert!(
+                !fs::symlink_metadata(&local)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_link_repointed_elsewhere_is_not_removed() {
+        // Known-bad: any link at a recorded name counts as owned.
+        let (_temp, real, profile) = fixture();
+        link_farm(&real, &profile).unwrap();
+        let local = profile_home(&profile).join("note");
+        fs::remove_file(&local).unwrap();
+        let other = real.join("documents");
+        symlink(&other, &local).unwrap();
+        fs::remove_file(real.join("note")).unwrap();
+        link_farm(&real, &profile).unwrap();
+        assert_eq!(fs::read_link(&local).unwrap(), other);
+    }
+
+    #[test]
+    fn link_ownership_survives_an_unchanged_second_run() {
+        // Known-bad: retained entries omitted from the second link record.
+        let (_temp, real, profile) = fixture();
+        link_farm(&real, &profile).unwrap();
+        link_farm(&real, &profile).unwrap();
+        fs::remove_file(real.join("note")).unwrap();
+        link_farm(&real, &profile).unwrap();
+        assert!(fs::symlink_metadata(profile_home(&profile).join("note")).is_err());
+    }
+
+    #[test]
     fn damaged_link_record_is_rebuilt_without_deleting_old_links() {
         // Known-bad: serde_json::from_slice(&bytes)? blocks every launch on a damaged record.
         for damaged in [b"not json".as_slice(), b"{}".as_slice()] {
