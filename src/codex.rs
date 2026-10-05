@@ -11,16 +11,7 @@ pub struct Identity {
 pub fn identity_from_auth(bytes: &[u8]) -> Option<Identity> {
     let auth: Value = serde_json::from_slice(bytes).ok()?;
     let token = auth.get("tokens")?.get("id_token")?.as_str()?;
-    let mut parts = token.split('.');
-    let (Some(header), Some(payload), Some(signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    if header.is_empty() || payload.is_empty() || signature.is_empty() {
-        return None;
-    }
-    let claims: Value = serde_json::from_slice(&decode_base64url(payload)?).ok()?;
+    let claims = jwt_claims(token)?;
     let email = claims
         .get("email")
         .and_then(Value::as_str)
@@ -46,6 +37,19 @@ pub fn identity_from_auth(bytes: &[u8]) -> Option<Identity> {
         email: email.to_string(),
         plan_type,
     })
+}
+
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(&decode_base64url(payload)?).ok()
 }
 
 fn decode_base64url(input: &str) -> Option<Vec<u8>> {

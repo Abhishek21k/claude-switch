@@ -71,6 +71,9 @@ enum PendingAction {
     CodexLogin {
         name: String,
     },
+    AgyLogin {
+        name: String,
+    },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -644,6 +647,10 @@ impl App {
                 let result = self.manager.login_codex_profile(&name);
                 (name, result, None)
             }
+            PendingAction::AgyLogin { name } => {
+                let result = self.manager.login_agy_profile(&name);
+                (name, result, None)
+            }
         };
         let (select, message) = match result {
             Ok(result) => {
@@ -1182,6 +1189,9 @@ impl App {
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 self.pending = Some(PendingAction::CodexLogin { name });
             }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.pending = Some(PendingAction::AgyLogin { name });
+            }
             // Esc steps back to the name, not out of the flow — a typo in the
             // name should not cost the whole interaction.
             KeyCode::Esc | KeyCode::Backspace => self.mode = Mode::AddName,
@@ -1672,7 +1682,7 @@ impl App {
             Line::from(vec![
                 Span::styled("  Email        ", Style::default().fg(DIM)),
                 Span::styled(
-                    profile.email.clone().unwrap_or("unknown".into()),
+                    profile.email.clone().unwrap_or("—".into()),
                     Style::default().fg(TEXT),
                 ),
             ]),
@@ -1784,6 +1794,14 @@ impl App {
                     Style::default().fg(MUTED),
                 ),
             ]),
+        ]);
+        if profile.tool == Tool::Antigravity {
+            lines.push(Line::from(format!(
+                "  Home         {}",
+                crate::agy::profile_home(&profile_dir).display()
+            )));
+        }
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "  ─────────────────────────────────────────",
@@ -1792,37 +1810,7 @@ impl App {
             Line::from(""),
             Line::from(Span::styled("  Launch command", Style::default().fg(DIM))),
             Line::from(Span::styled(
-                if cfg!(target_os = "windows") {
-                    format!(
-                        "  $env:{}='{}'; {}",
-                        if profile.tool == Tool::Codex {
-                            "CODEX_HOME"
-                        } else {
-                            "CLAUDE_CONFIG_DIR"
-                        },
-                        profile_dir.display(),
-                        if profile.tool == Tool::Codex {
-                            "codex"
-                        } else {
-                            "claude"
-                        }
-                    )
-                } else {
-                    format!(
-                        "  {}='{}' {}",
-                        if profile.tool == Tool::Codex {
-                            "CODEX_HOME"
-                        } else {
-                            "CLAUDE_CONFIG_DIR"
-                        },
-                        profile_dir.display(),
-                        if profile.tool == Tool::Codex {
-                            "codex"
-                        } else {
-                            "claude"
-                        }
-                    )
-                },
+                launch_command_line(profile.tool.clone(), profile_dir),
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
         ]);
@@ -1889,7 +1877,7 @@ impl App {
             ("↑/↓  j/k", "Navigate profiles"),
             ("Enter", "Launch selected profile's tool"),
             ("/", "Search profiles by name or email"),
-            ("a", "Add account — choose Claude or Codex login"),
+            ("a", "Add account — choose Claude, Codex or Antigravity"),
             ("l", "Login — straight to a different account"),
             ("p", "Set API key for selected profile"),
             ("P", "Clear API key after confirmation"),
@@ -2020,7 +2008,7 @@ impl App {
 
     /// The step that makes the side effect explicit before it happens.
     fn render_add_choice_popup(&self, f: &mut Frame) {
-        let area = centered_rect(66, 17, f.area());
+        let area = centered_rect(66, 19, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -2080,6 +2068,13 @@ impl App {
                     Span::styled("  [o] ", Style::default().fg(ACCENT).bold()),
                     Span::styled(
                         "Log in to a Codex (ChatGPT) account",
+                        Style::default().fg(TEXT),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  [g] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        "Log in to an Antigravity (Google) account",
                         Style::default().fg(TEXT),
                     ),
                 ]),
@@ -2399,10 +2394,36 @@ impl App {
     }
 }
 
+fn launch_command_line(tool: Tool, profile_dir: std::path::PathBuf) -> String {
+    let Ok(spec) = crate::profile::launch_spec(tool, profile_dir) else {
+        return "  unavailable for unknown tool".into();
+    };
+    if cfg!(target_os = "windows") {
+        format!(
+            "  $env:{}='{}'; {}",
+            spec.env_key,
+            spec.env_value.display(),
+            spec.program
+        )
+    } else {
+        format!(
+            "  {}='{}' {}",
+            spec.env_key,
+            spec.env_value.display(),
+            spec.program
+        )
+    }
+}
+
 fn pending_login_message(name: &str, result: &LoginOutcome, method: Option<LoginMethod>) -> String {
     if result.email.is_none() {
         if result.tool == Tool::Codex {
             return format!("Codex login completed for profile '{name}' (email unavailable).");
+        }
+        if result.tool == Tool::Antigravity {
+            return format!(
+                "Antigravity login completed for profile '{name}' (email unavailable)."
+            );
         }
         if method == Some(LoginMethod::Console) {
             return format!("Console login completed for profile '{name}' (email unavailable).");
@@ -3259,6 +3280,69 @@ mod tests {
             app.pending,
             Some(PendingAction::CodexLogin { name: "new".into() })
         );
+    }
+
+    #[test]
+    fn antigravity_add_choice_routes_to_own_login() {
+        // Known-bad: [g] is displayed but does not queue the Antigravity backend.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        for key in ['g', 'G'] {
+            app.mode = Mode::AddChoice;
+            app.input_buffer = "new".into();
+            app.pending = None;
+            app.handle_add_choice(KeyCode::Char(key)).unwrap();
+            assert_eq!(
+                app.pending,
+                Some(PendingAction::AgyLogin { name: "new".into() })
+            );
+        }
+        app.mode = Mode::AddChoice;
+        let frame = render_text(&mut app);
+        assert!(frame.contains("[g]"), "{frame}");
+        assert!(frame.contains("Antigravity (Google)"), "{frame}");
+    }
+
+    #[test]
+    fn antigravity_detail_launch_uses_fake_home() {
+        // Known-bad: a Codex-or-else-Claude branch displays a Claude launch for agy.
+        let line = launch_command_line(Tool::Antigravity, "/synthetic/profile".into());
+        assert!(
+            line.contains("HOME='/synthetic/profile/home' agy"),
+            "{line}"
+        );
+        assert!(!line.contains("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn antigravity_refresh_is_refused_with_valid_claude_source() {
+        // Known-bad: a Codex-specific guard lets r replace an agy HOME with Claude data.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("g", Some("g@example.com"))]);
+        fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        fs::write(
+            tmp.path().join(".claude/settings.json"),
+            b"synthetic source",
+        )
+        .unwrap();
+        let marker = app.manager.profile_dir("g").join("settings.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"synthetic existing").unwrap();
+        app.profiles[0].tool = Tool::Antigravity;
+        app.mode = Mode::Normal;
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::Message("Refresh is Claude-only".into(), true)
+        );
+        app.mode = Mode::ConfirmRefresh;
+        app.handle_confirm_refresh(KeyCode::Char('y')).unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::Message("Refresh is Claude-only".into(), true)
+        );
+        assert_eq!(fs::read(marker).unwrap(), b"synthetic existing");
     }
 
     #[test]

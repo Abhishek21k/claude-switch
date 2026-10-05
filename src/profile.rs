@@ -1,3 +1,4 @@
+use crate::agy::{self, FarmHealth, TokenState};
 use crate::atomic;
 use crate::codex;
 use crate::key::{remove_key, strip_copied_helper};
@@ -102,7 +103,7 @@ mod stage_b_tests {
     #[test]
     fn unknown_tool_value_survives_unrelated_save_without_aliases() {
         // Known-bad: serde(other) rewrites an unknown tool as "unknown" on the next save.
-        for raw_tool in ["martian", "antigravity"] {
+        for raw_tool in ["martian", "venusian"] {
             let tmp = TempDir::new().unwrap();
             let manager = manager(&tmp);
             let registry = format!(
@@ -317,6 +318,14 @@ mod stage_b_tests {
                 .message("work"),
             "Codex login did not complete for profile 'work'. Nothing was registered."
         );
+        for auth_exists in [false, true] {
+            assert_eq!(
+                codex_login_verdict(false, false, auth_exists, None)
+                    .unwrap_err()
+                    .message("work"),
+                "Codex login did not complete for profile 'work'. Nothing was registered."
+            );
+        }
     }
 
     #[test]
@@ -542,6 +551,7 @@ pub enum Tool {
     #[default]
     Claude,
     Codex,
+    Antigravity,
     Unknown(String),
 }
 
@@ -550,6 +560,7 @@ impl Tool {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
             Self::Unknown(_) => "unknown tool",
         }
     }
@@ -558,6 +569,7 @@ impl Tool {
         match self {
             Self::Claude => Some("claude"),
             Self::Codex => Some("codex"),
+            Self::Antigravity => Some("agy"),
             Self::Unknown(_) => None,
         }
     }
@@ -568,6 +580,7 @@ impl Serialize for Tool {
         let value = match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
             Self::Unknown(value) => value,
         };
         serializer.serialize_str(value)
@@ -580,6 +593,7 @@ impl<'de> Deserialize<'de> for Tool {
         Ok(match value.as_str() {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
+            "antigravity" => Self::Antigravity,
             _ => Self::Unknown(value),
         })
     }
@@ -680,15 +694,16 @@ pub struct LaunchSpec {
 }
 
 pub fn launch_spec(tool: Tool, profile_dir: PathBuf) -> Result<LaunchSpec> {
-    let (program, env_key) = match tool {
-        Tool::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
-        Tool::Codex => ("codex", "CODEX_HOME"),
+    let (program, env_key, env_value) = match tool {
+        Tool::Claude => ("claude", "CLAUDE_CONFIG_DIR", profile_dir),
+        Tool::Codex => ("codex", "CODEX_HOME", profile_dir),
+        Tool::Antigravity => (agy::AGY_PROGRAM, "HOME", agy::profile_home(&profile_dir)),
         Tool::Unknown(_) => bail!("Profile has an unknown tool; cannot use or log in."),
     };
     Ok(LaunchSpec {
         program,
         env_key,
-        env_value: profile_dir,
+        env_value,
     })
 }
 
@@ -869,6 +884,13 @@ impl ProfileManager {
         self.profiles_dir.join(name)
     }
 
+    pub fn agy_farm_health(&self, name: &str) -> Result<FarmHealth> {
+        if self.get_profile(name)?.tool != Tool::Antigravity {
+            bail!("Profile is not an Antigravity profile.");
+        }
+        agy::farm_health(&agy::profile_home(&self.profile_dir(name)))
+    }
+
     pub fn sync_skills(&self, name: &str, opts: &SyncOptions) -> Result<SyncReport> {
         if self.get_profile(name)?.tool != Tool::Claude {
             bail!("Skills sync is Claude-only.");
@@ -902,15 +924,17 @@ impl ProfileManager {
         let markers = match tool {
             Tool::Claude => SESSION_ACTIVITY_MARKERS,
             Tool::Codex => CODEX_ACTIVITY_MARKERS,
+            Tool::Antigravity if agy::activity_root_is_local(&dir) => agy::AGY_ACTIVITY_MARKERS,
+            Tool::Antigravity => return None,
             Tool::Unknown(_) => return None,
         };
         markers
             .iter()
             .filter_map(|marker| {
-                if tool == Tool::Codex {
-                    newest_write_tree(&dir.join(marker))
-                } else {
+                if tool == Tool::Claude {
                     newest_write(&dir.join(marker))
+                } else {
+                    newest_write_tree(&dir.join(marker))
                 }
             })
             // A timestamp ahead of the clock means skew, not staleness. Round it
@@ -983,6 +1007,14 @@ impl ProfileManager {
             );
         }
         let mut warnings = Vec::new();
+        if profile.tool == Tool::Antigravity {
+            agy::ensure_supported(cfg!(unix))?;
+            let real_home = self
+                .base_dir
+                .parent()
+                .context("Profile base has no parent")?;
+            agy::link_farm(real_home, &profile_dir)?;
+        }
         if profile.tool == Tool::Claude {
             match self.sync_skills(
                 name,
@@ -1264,6 +1296,84 @@ impl ProfileManager {
         result
     }
 
+    pub fn login_agy_profile(&self, name: &str) -> Result<LoginOutcome> {
+        agy::ensure_supported(cfg!(unix))?;
+        if !safe_shell_name(name) {
+            bail!("Invalid profile name.");
+        }
+        self.ensure_target_tool(name, Tool::Antigravity)?;
+        let profile_dir = self.profile_dir(name);
+        let we_created_dir = match fs::symlink_metadata(&profile_dir) {
+            Ok(meta) if meta.is_dir() => false,
+            Ok(_) => bail!("Antigravity profile path is not a directory."),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        if !we_created_dir && profile_dir.read_dir()?.next().is_some() {
+            bail!(
+                "Profile '{name}' already exists and holds an account. Delete it first or pick a different name."
+            );
+        }
+        fs::create_dir_all(&profile_dir)?;
+        let result = (|| -> Result<LoginOutcome> {
+            let real_home = self
+                .base_dir
+                .parent()
+                .context("Profile base has no parent")?;
+            agy::link_farm(real_home, &profile_dir)?;
+            let home = agy::profile_home(&profile_dir);
+            agy::seed_gemini(real_home, &home)?;
+            println!("Sign in to Antigravity for profile '{name}', then exit agy.");
+            let login_ok = std::process::Command::new(agy::AGY_PROGRAM)
+                .env("HOME", &home)
+                .status()
+                .context("Failed to launch agy. Is it installed and in your PATH?")?
+                .success();
+            let token = if login_ok {
+                agy::token_state(&home)
+            } else {
+                TokenState::Missing
+            };
+            let models_ok = if login_ok && token == TokenState::NonEmpty {
+                std::process::Command::new(agy::AGY_PROGRAM)
+                    .args(agy::AGY_AUTH_CHECK_ARGS)
+                    .env("HOME", &home)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .context("Could not check Antigravity login status")?
+                    .success()
+            } else {
+                false
+            };
+            agy_login_verdict(login_ok, token, models_ok)
+                .map_err(|reason| anyhow::anyhow!(reason.message(name)))?;
+            let email = fs::read(home.join(agy::AGY_TOKEN_RELATIVE))
+                .ok()
+                .and_then(|bytes| agy::identity_from_token(&bytes));
+            let same_account_as = match email.as_deref() {
+                Some(email) => self.profiles_with_email(email, Tool::Antigravity)?,
+                None => Vec::new(),
+            };
+            self.upsert_profile(Profile {
+                name: name.to_string(),
+                tool: Tool::Antigravity,
+                email: email.clone(),
+                added: Utc::now(),
+                last_used: Some(Utc::now()),
+            })?;
+            Ok(LoginOutcome {
+                email,
+                same_account_as,
+                tool: Tool::Antigravity,
+            })
+        })();
+        if result.is_err() {
+            abort_login(&profile_dir, we_created_dir);
+        }
+        result
+    }
+
     fn seed_codex_profile_dir(&self, profile_dir: &Path) -> Result<bool> {
         seed_codex_from(&self.codex_home, profile_dir)
     }
@@ -1534,6 +1644,50 @@ fn codex_login_verdict(
     Ok(auth.and_then(codex::identity_from_auth))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgyLoginRefusal {
+    LoginFailed,
+    MissingToken,
+    EmptyToken,
+    ModelsFailed,
+}
+
+impl AgyLoginRefusal {
+    fn message(self, name: &str) -> String {
+        match self {
+            Self::LoginFailed => {
+                format!("Antigravity sign-in failed for profile '{name}'. Nothing was registered.")
+            }
+            Self::MissingToken => {
+                "Antigravity did not leave a login token. Nothing was registered.".into()
+            }
+            Self::EmptyToken => {
+                "Antigravity left an empty login token. Nothing was registered.".into()
+            }
+            Self::ModelsFailed => "Antigravity models check failed. Nothing was registered.".into(),
+        }
+    }
+}
+
+fn agy_login_verdict(
+    login_ok: bool,
+    token: TokenState,
+    models_ok: bool,
+) -> std::result::Result<(), AgyLoginRefusal> {
+    if !login_ok {
+        return Err(AgyLoginRefusal::LoginFailed);
+    }
+    match token {
+        TokenState::Missing => return Err(AgyLoginRefusal::MissingToken),
+        TokenState::Empty => return Err(AgyLoginRefusal::EmptyToken),
+        TokenState::NonEmpty => {}
+    }
+    if !models_ok {
+        return Err(AgyLoginRefusal::ModelsFailed);
+    }
+    Ok(())
+}
+
 const CODEX_SEED_ALLOWLIST: &[&str] = &["config.toml", "AGENTS.md", "agents", "rules", "skills"];
 
 fn codex_seed_message(source: &str, copied: &[&str]) -> String {
@@ -1715,13 +1869,16 @@ pub const SESSION_ACTIVE_WINDOW_SECS: u64 = 30 * 60;
 /// session rewriting an existing session file in place would look idle if the
 /// directory alone were consulted.
 fn newest_write(path: &Path) -> Option<SystemTime> {
-    let meta = fs::metadata(path).ok()?;
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
     let mut newest = meta.modified().ok();
     if meta.is_dir()
         && let Ok(entries) = fs::read_dir(path)
     {
         for entry in entries.flatten() {
-            if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+            if let Ok(t) = entry.path().symlink_metadata().and_then(|m| m.modified()) {
                 newest = Some(newest.map_or(t, |n| n.max(t)));
             }
         }
@@ -1792,7 +1949,7 @@ const IDENTITY_KEYS: &[&str] = &[
 ///
 /// `fs::copy` carries the source permission bits across, so `.credentials.json`
 /// keeps its `0600` mode rather than landing world-readable.
-fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Result<()> {
+pub(crate) fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -1828,7 +1985,7 @@ fn copy_dir_all_filtered(src: &Path, dst: &Path, skip_top_level: &[&str]) -> Res
 /// resolves against the *link's own* directory, and a profile lives somewhere
 /// else entirely — copied as-is it would silently point at nothing. So a
 /// relative target is resolved to an absolute one first.
-fn copy_symlink(link: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_symlink(link: &Path, dest: &Path) -> Result<()> {
     let raw = fs::read_link(link)?;
     let target = if raw.is_absolute() {
         raw
@@ -3375,5 +3532,210 @@ mod tests {
         );
         assert!(mgr.profile_dir("remove").join("settings.json").exists());
         assert!(mgr.profile_dir("refresh").join("settings.json").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stage_c_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn manager(temp: &TempDir) -> ProfileManager {
+        ProfileManager::with_base_dir(temp.path().join(".claude-switch")).unwrap()
+    }
+
+    fn register(manager: &ProfileManager, name: &str) {
+        let mut registry = manager.load_registry().unwrap();
+        registry.profiles.insert(
+            name.into(),
+            Profile {
+                name: name.into(),
+                tool: Tool::Antigravity,
+                email: None,
+                added: Utc::now(),
+                last_used: None,
+            },
+        );
+        manager.save_registry(&registry).unwrap();
+    }
+
+    #[test]
+    fn antigravity_registry_roundtrip_and_alias() {
+        // Known-bad: antigravity remains Unknown and loses its agy- alias on save.
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let raw = r#"{"profiles":{"g":{"name":"g","tool":"antigravity","email":"g@example.com","added":"2030-01-01T00:00:00Z","last_used":null}}}"#;
+        fs::write(&manager.registry_path, raw).unwrap();
+        assert_eq!(manager.get_profile("g").unwrap().tool, Tool::Antigravity);
+        manager
+            .save_registry(&manager.load_registry().unwrap())
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manager.registry_path).unwrap()).unwrap();
+        assert_eq!(saved["profiles"]["g"]["tool"], "antigravity");
+        let shell = manager
+            .generate_shell_aliases(&manager.list_profiles().unwrap())
+            .unwrap();
+        let powershell = manager
+            .generate_powershell_aliases(&manager.list_profiles().unwrap())
+            .unwrap();
+        assert!(shell.contains("agy-g="), "{shell}");
+        assert!(powershell.contains("function agy-g"), "{powershell}");
+    }
+
+    #[test]
+    fn agy_launch_spec_sets_only_fake_home() {
+        // Known-bad: a Codex-or-else-Claude branch launches agy with CLAUDE_CONFIG_DIR.
+        let dir = PathBuf::from("/synthetic/profile");
+        assert_eq!(
+            launch_spec(Tool::Antigravity, dir.clone()).unwrap(),
+            LaunchSpec {
+                program: agy::AGY_PROGRAM,
+                env_key: "HOME",
+                env_value: dir.join("home"),
+            }
+        );
+    }
+
+    #[test]
+    fn agy_login_command_failure_has_own_reason() {
+        // Known-bad: a failed sign-in is reported as a missing token or a models failure.
+        assert_eq!(
+            agy_login_verdict(false, TokenState::Missing, false)
+                .unwrap_err()
+                .message("g"),
+            "Antigravity sign-in failed for profile 'g'. Nothing was registered."
+        );
+    }
+
+    #[test]
+    fn agy_missing_token_refuses_registration() {
+        // Known-bad: trusting sign-in's exit code alone registers a profile with no token.
+        assert_eq!(
+            agy_login_verdict(true, TokenState::Missing, false)
+                .unwrap_err()
+                .message("g"),
+            "Antigravity did not leave a login token. Nothing was registered."
+        );
+    }
+
+    #[test]
+    fn agy_empty_token_refuses_registration() {
+        // Known-bad: mere presence of an empty token passes login verification.
+        assert_eq!(
+            agy_login_verdict(true, TokenState::Empty, false)
+                .unwrap_err()
+                .message("g"),
+            "Antigravity left an empty login token. Nothing was registered."
+        );
+    }
+
+    #[test]
+    fn agy_models_failure_refuses_registration() {
+        // Known-bad: a populated token is trusted even when agy models rejects it.
+        assert_eq!(
+            agy_login_verdict(true, TokenState::NonEmpty, false)
+                .unwrap_err()
+                .message("g"),
+            "Antigravity models check failed. Nothing was registered."
+        );
+    }
+
+    #[test]
+    fn agy_login_verdict_accepts_wired_success() {
+        // Known-bad: valid sign-in, token and models check still refuse registration.
+        assert_eq!(agy_login_verdict(true, TokenState::NonEmpty, true), Ok(()));
+    }
+
+    #[test]
+    fn agy_activity_walk_does_not_follow_farm_link() {
+        // Known-bad: metadata() follows a linked activity directory and reports outside writes.
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let profile = manager.profile_dir("g");
+        let cli = profile.join("home/.gemini/antigravity-cli");
+        fs::create_dir_all(&cli).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("fresh"), b"new write").unwrap();
+        symlink(&outside, cli.join("log")).unwrap();
+        register(&manager, "g");
+        assert_eq!(newest_write_tree(&cli.join("log")), None);
+        assert_eq!(manager.maybe_in_use("g"), None);
+        assert_eq!(fs::read(outside.join("fresh")).unwrap(), b"new write");
+    }
+
+    #[test]
+    fn agy_activity_refuses_linked_home_ancestor() {
+        // Known-bad: checking only the activity leaf walks through a linked HOME ancestor.
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let profile = manager.profile_dir("g");
+        fs::create_dir_all(&profile).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(outside.join(".gemini/antigravity-cli/log")).unwrap();
+        fs::write(
+            outside.join(".gemini/antigravity-cli/log/fresh"),
+            b"outside",
+        )
+        .unwrap();
+        symlink(&outside, profile.join("home")).unwrap();
+        register(&manager, "g");
+        assert_eq!(manager.maybe_in_use("g"), None);
+        assert!(manager.agy_farm_health("g").is_err());
+        assert_eq!(
+            fs::read(outside.join(".gemini/antigravity-cli/log/fresh")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[test]
+    fn agy_claude_only_guards_refuse_valid_claude_fixtures() {
+        // Known-bad: a Codex-only guard lets an agy profile use Claude key or skills paths.
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let profile = manager.profile_dir("g");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("settings.json"), br#"{"theme":"dark"}"#).unwrap();
+        fs::write(
+            profile.join(".claude.json"),
+            br#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join(".claude/skills")).unwrap();
+        fs::write(temp.path().join(".claude/skills/entry"), b"warm skill").unwrap();
+        register(&manager, "g");
+        assert_eq!(
+            crate::key::precheck_set_key(&manager, "g", false)
+                .unwrap_err()
+                .to_string(),
+            "API keys are Claude-only."
+        );
+        assert_eq!(
+            crate::key::clear_key(&manager, "g", Utc::now())
+                .err()
+                .unwrap()
+                .to_string(),
+            "API keys are Claude-only."
+        );
+        assert_eq!(
+            manager
+                .sync_skills(
+                    "g",
+                    &SyncOptions {
+                        dry_run: false,
+                        adopt: Vec::new(),
+                    }
+                )
+                .unwrap_err()
+                .to_string(),
+            "Skills sync is Claude-only."
+        );
+        assert!(!profile.join("skills").exists());
+        assert_eq!(
+            fs::read(profile.join("settings.json")).unwrap(),
+            br#"{"theme":"dark"}"#
+        );
     }
 }

@@ -1,3 +1,4 @@
+mod agy;
 mod atomic;
 mod codex;
 mod gateway;
@@ -21,8 +22,8 @@ use std::path::Path;
 #[derive(Parser)]
 #[command(
     name = "cswitch",
-    about = "Multi-account profile manager for Claude Code and Codex",
-    long_about = "Manage Claude Code and Codex accounts using isolated profile directories.",
+    about = "Multi-account profile manager for Claude Code, Codex and Antigravity",
+    long_about = "Manage Claude Code, Codex and Antigravity accounts using isolated profile directories.",
     version,
     after_help = "\
 Quick start:
@@ -76,7 +77,7 @@ enum Commands {
         /// Off by default: separate sessions per profile are usually the point.
         #[arg(long)]
         include_history: bool,
-        /// Tool to log in to; Codex always starts a new login and cannot copy an account
+        /// Tool to log in to; Codex and Antigravity always start a new login
         #[arg(long, value_enum, default_value_t = ToolChoice::Claude)]
         tool: ToolChoice,
     },
@@ -186,6 +187,8 @@ enum Commands {
 enum ToolChoice {
     Claude,
     Codex,
+    #[value(alias = "agy")]
+    Antigravity,
 }
 
 #[derive(Subcommand)]
@@ -344,16 +347,20 @@ fn main() -> Result<()> {
             force,
             include_history,
             tool,
-        }) => {
-            if tool == ToolChoice::Codex {
+        }) => match tool {
+            ToolChoice::Claude => handle_add(&manager, &name, force, include_history)?,
+            ToolChoice::Codex | ToolChoice::Antigravity => {
                 if force || include_history {
-                    anyhow::bail!("Codex login does not support --force or --include-history.");
+                    anyhow::bail!("This login does not support --force or --include-history.");
                 }
-                report_login(&name, &manager.login_codex_profile(&name)?);
-            } else {
-                handle_add(&manager, &name, force, include_history)?;
+                let outcome = match tool {
+                    ToolChoice::Codex => manager.login_codex_profile(&name)?,
+                    ToolChoice::Antigravity => manager.login_agy_profile(&name)?,
+                    ToolChoice::Claude => unreachable!(),
+                };
+                report_login(&name, &outcome);
             }
-        }
+        },
 
         Some(Commands::Login {
             name,
@@ -362,13 +369,18 @@ fn main() -> Result<()> {
             console,
             tool,
         }) => {
-            if tool == ToolChoice::Codex {
+            if tool != ToolChoice::Claude {
                 if console || email.is_some() || include_history {
                     anyhow::bail!(
-                        "Codex login does not support --console, --email or --include-history."
+                        "This login does not support --console, --email or --include-history."
                     );
                 }
-                report_login(&name, &manager.login_codex_profile(&name)?);
+                let outcome = match tool {
+                    ToolChoice::Codex => manager.login_codex_profile(&name)?,
+                    ToolChoice::Antigravity => manager.login_agy_profile(&name)?,
+                    ToolChoice::Claude => unreachable!(),
+                };
+                report_login(&name, &outcome);
                 return Ok(());
             }
             let method = if console {
@@ -748,7 +760,7 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
         "Name:      {}\nTool:      {}\nEmail:     {}\n",
         profile.name,
         profile.tool.label(),
-        profile.email.as_deref().unwrap_or("unknown")
+        profile.email.as_deref().unwrap_or("—")
     );
     if profile.tool == Tool::Claude {
         let claude = read_claude_json(&dir);
@@ -779,6 +791,26 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                 .and_then(|identity| identity.plan_type)
                 .unwrap_or_else(|| "—".into());
             output.push_str(&format!("Plan:      {plan}\n"));
+        } else if profile.tool == Tool::Antigravity {
+            output.push_str(&format!(
+                "Home:      {}\n",
+                agy::profile_home(&dir).display()
+            ));
+            match manager.agy_farm_health(name) {
+                Ok(health) => {
+                    output.push_str(&format!(
+                        "Farm:      {} links, {} dangling\nLocal:     {}\n",
+                        health.links,
+                        health.dangling,
+                        if health.local.is_empty() {
+                            "—".into()
+                        } else {
+                            health.local.join(", ")
+                        }
+                    ));
+                }
+                Err(_) => output.push_str("Farm:      unavailable\nLocal:     —\n"),
+            }
         }
         output.push_str("Plan limits: —\n");
     }
@@ -1408,6 +1440,11 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
             println!(
                 "  (or use a private window), then run: cswitch remove {name} && cswitch login {name} --tool codex"
             );
+        } else if outcome.tool == Tool::Antigravity {
+            println!(
+                "  To use a different Google account, choose it in Antigravity's sign-in flow"
+            );
+            println!("  after removing this profile: cswitch remove {name}");
         }
     }
 
@@ -1415,8 +1452,13 @@ fn report_login(name: &str, outcome: &LoginOutcome) {
 }
 
 fn login_confirmation(name: &str, outcome: &LoginOutcome) -> String {
-    if outcome.tool == Tool::Codex && outcome.email.is_none() {
-        format!("Codex login completed for profile '{name}' (email unavailable).")
+    if outcome.email.is_none() && outcome.tool != Tool::Claude {
+        let label = if outcome.tool == Tool::Codex {
+            "Codex"
+        } else {
+            "Antigravity"
+        };
+        format!("{label} login completed for profile '{name}' (email unavailable).")
     } else {
         format!(
             "Profile '{}' registered (account: {}).",
@@ -2016,6 +2058,90 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn antigravity_add_and_login_flags_parse() {
+        // Known-bad: --tool agy is accepted by clap but dispatched as Claude.
+        for value in ["antigravity", "agy"] {
+            assert!(matches!(
+                Cli::try_parse_from(["cswitch", "add", "g", "--tool", value])
+                    .unwrap()
+                    .command,
+                Some(Commands::Add {
+                    tool: ToolChoice::Antigravity,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                Cli::try_parse_from(["cswitch", "login", "g", "--tool", value])
+                    .unwrap()
+                    .command,
+                Some(Commands::Login {
+                    tool: ToolChoice::Antigravity,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_info_shows_home_and_farm_health() {
+        // Known-bad: info has only the profile directory and hides the fake HOME's local entries.
+        let temp = TempDir::new().unwrap();
+        let manager = ProfileManager::with_base_dir(temp.path().join(".claude-switch")).unwrap();
+        fs::write(temp.path().join("shared"), b"synthetic").unwrap();
+        let profile_dir = manager.profile_dir("g");
+        fs::create_dir_all(&profile_dir).unwrap();
+        agy::link_farm(temp.path(), &profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(".claude.json"),
+            br#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        fs::write(agy::profile_home(&profile_dir).join("local"), b"local").unwrap();
+        let registry = Registry {
+            profiles: [(
+                "g".into(),
+                Profile {
+                    name: "g".into(),
+                    tool: Tool::Antigravity,
+                    email: None,
+                    added: Utc::now(),
+                    last_used: None,
+                },
+            )]
+            .into(),
+        };
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let output = info_output(&manager, "g", Utc::now()).unwrap();
+        assert!(output.contains("Tool:      antigravity"), "{output}");
+        assert!(output.contains("Email:     —"), "{output}");
+        assert!(output.contains("Auth:      —"), "{output}");
+        assert!(!output.contains("Console (API billing)"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "Home:      {}",
+                agy::profile_home(&profile_dir).display()
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("Farm:      1 links, 0 dangling"),
+            "{output}"
+        );
+        assert!(output.contains("Local:     local"), "{output}");
+        assert_eq!(
+            require_billing_class(&manager, "g", true, "rates")
+                .unwrap_err()
+                .to_string(),
+            "g is not a Claude profile"
+        );
     }
 
     fn mixed_tool_manager(tmp: &TempDir) -> ProfileManager {

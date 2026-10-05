@@ -75,4 +75,42 @@ mod tests {
         assert!(sources.iter().any(|source| source.profile == "c"));
         assert!(!sources.iter().any(|source| source.profile == "o"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_farm_is_never_a_usage_source() {
+        // Known-bad: a Claude-only ledger guard is replaced by Codex-or-else-Claude and walks HOME links.
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let manager = ProfileManager::with_base_dir(temp.path().join(".claude-switch")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("session.jsonl"), b"synthetic outside content").unwrap();
+        let fake_home = manager.profile_dir("g").join("home");
+        fs::create_dir_all(&fake_home).unwrap();
+        symlink(&outside, fake_home.join("outside")).unwrap();
+        let mut registry = Registry::default();
+        registry.profiles.insert(
+            "g".into(),
+            Profile {
+                name: "g".into(),
+                tool: Tool::Antigravity,
+                email: Some("g@example.com".into()),
+                added: Utc::now(),
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let sources = store(&manager, None).unwrap().sources;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].profile, "default");
+        assert_eq!(
+            fs::read(outside.join("session.jsonl")).unwrap(),
+            b"synthetic outside content"
+        );
+    }
 }

@@ -60,6 +60,9 @@ cswitch login personal
 # Add a Codex (ChatGPT) account in its own home
 cswitch login coding --tool codex
 
+# Add an Antigravity (Google) account in its own HOME (Unix)
+cswitch login research --tool antigravity
+
 # Switch between them
 cswitch use work
 cswitch use personal
@@ -79,6 +82,8 @@ cswitch
 | `cswitch login <name> --console` | Create a profile through Anthropic Console (API billing) |
 | `cswitch login <name> --tool codex` | Log in to Codex with a new ChatGPT session |
 | `cswitch add <name> --tool codex` | Same Codex login, without a Copy option |
+| `cswitch login <name> --tool antigravity` | Log in through Antigravity's own sign-in (Unix) |
+| `cswitch add <name> --tool agy` | Same Antigravity login; `agy` is an alias for `antigravity` |
 | `cswitch key set <name> [--replace-helper]` | Read a hidden key, then optionally configure an Anthropic-compatible gateway |
 | `cswitch key clear <name>` | Remove the saved key and its managed gateway settings |
 | `cswitch gateway list` | Show saved gateway URLs and setting names, without values |
@@ -113,11 +118,17 @@ The helper overrides a Console login or subscription while present. `cswitch key
 
 ## Codex profiles
 
-Run `cswitch login <name> --tool codex` or `cswitch add <name> --tool codex`, or choose `[o]` in the TUI Add menu. Each Codex profile directory is its `CODEX_HOME`. `cswitch use <name>` launches Codex with that directory and forwards any arguments. Profile names share one namespace across Claude and Codex.
+Run `cswitch login <name> --tool codex` or `cswitch add <name> --tool codex`, or choose `[o]` in the TUI Add menu. Each Codex profile directory is its `CODEX_HOME`. `cswitch use <name>` launches Codex with that directory and forwards any arguments. Profile names share one namespace across all tools.
 
 Before login, cswitch copies only `config.toml`, `AGENTS.md`, `agents/`, `rules/` and `skills/` from `CODEX_HOME` (if set and non-empty) or `~/.codex`. It preserves links, but never copies `auth.json`, sessions, logs, sqlite state, secrets or daemon packages. The new login is verified by exit status; the status command's output is discarded because API-key mode can print part of a key. Account email and optional plan type are read offline from the new profile's `auth.json`.
 
 Codex profiles cannot be copied or refreshed from a Claude session. Claude API keys, gateways, skills sync, plan limits and `cswitch usage` apply only to Claude profiles. `cswitch list` shows a `TOOL` column, while `info` and TUI details show the tool and any Codex plan type.
+
+## Antigravity profiles
+
+On Unix, run `cswitch login <name> --tool antigravity` or `cswitch add <name> --tool agy`, or choose `[g]` in the TUI Add menu. Sign in through the launched `agy` session, then exit it. cswitch checks the new profile's token file and runs `agy models` before registering the profile. Each profile has its own `HOME` at `~/.claude-switch/profiles/<name>/home/`, so separate Google accounts can run in parallel.
+
+The profile HOME links each top-level entry of your real HOME except `.gemini` and `.claude-switch`. Its `.gemini` is a real, isolated directory. cswitch copies only warm Antigravity settings, MCP configuration and skills from your real `.gemini`; it never copies the source login token or Gemini CLI account files. `cswitch use <name>` updates the links and launches `agy` with the profile HOME. A file that Antigravity creates at the top of that HOME stays in the profile; cswitch leaves local entries alone. `cswitch info <name>` shows the HOME path, link health and local entries. Antigravity profiles are not supported on Windows in this stage.
 
 ## Plan limits
 
@@ -226,7 +237,7 @@ The profile list places each Claude profile's `30D $` value on its name line. Th
 | `↑/↓` or `j/k` | Navigate profiles |
 | `Enter` | Launch the selected profile's tool |
 | `/` | Search profiles by name or email |
-| `a` | Add account — enter a name, then choose Claude Copy/login or `[o]` Codex login |
+| `a` | Add account — enter a name, then choose Claude Copy/login, `[o]` Codex login or `[g]` Antigravity login |
 | `l` | Login — shortcut straight to a different account |
 | `p` | Enter a masked API key for a Claude profile |
 | `P` | Clear a Claude profile's API key after confirmation |
@@ -342,10 +353,11 @@ On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to 
 | Credential handling | Keychain | File-based | Credential Manager |
 | Shell aliases | bash/zsh | bash/zsh | PowerShell |
 | TUI | Yes | Yes | Yes |
+| Antigravity profiles | Yes | Yes | No |
 
 ## How profiles are stored
 
-Profiles live in `~/.claude-switch/profiles/<name>/`. Each profile is a Claude Code config directory with its own credentials and settings. When you run `cswitch use <name>`, it syncs shared skills, sets `CLAUDE_CONFIG_DIR` to that directory, and launches Claude.
+Profiles live in `~/.claude-switch/profiles/<name>/`. Claude profiles are Claude Code config directories; Codex profiles are `CODEX_HOME` directories; Antigravity profiles contain an isolated `home/`. `cswitch use <name>` launches the selected tool with its corresponding directory.
 
 Nothing in your original `~/.claude` is modified. Profiles are fully isolated from each other.
 
