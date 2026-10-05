@@ -44,16 +44,25 @@ pub enum TokenState {
     NonEmpty,
 }
 
-pub fn token_state(home: &Path) -> TokenState {
-    if !fs::symlink_metadata(home).is_ok_and(|meta| meta.is_dir()) {
-        return TokenState::Missing;
+fn real_parent_chain(root: &Path, relative: &Path) -> bool {
+    if !fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir()) {
+        return false;
     }
-    let gemini = home.join(".gemini");
-    let cli = gemini.join("antigravity-cli");
-    if ![&gemini, &cli]
-        .into_iter()
-        .all(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
-    {
+    let mut parent = relative.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        if !fs::symlink_metadata(root.join(path)).is_ok_and(|meta| meta.is_dir()) {
+            return false;
+        }
+        parent = path.parent();
+    }
+    true
+}
+
+pub fn token_state(home: &Path) -> TokenState {
+    if !real_parent_chain(home, Path::new(AGY_TOKEN_RELATIVE)) {
         return TokenState::Missing;
     }
     match fs::symlink_metadata(home.join(AGY_TOKEN_RELATIVE)) {
@@ -92,19 +101,7 @@ pub fn seed_gemini(real_home: &Path, profile_home: &Path) -> Result<()> {
     for relative in AGY_SEED_ALLOWLIST {
         let from = source.join(relative);
         // Refuse a linked parent: a seed must never walk out of the source tree.
-        let mut parent = from.parent();
-        let mut safe = true;
-        while let Some(path) = parent {
-            if path == source {
-                break;
-            }
-            if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
-                safe = false;
-                break;
-            }
-            parent = path.parent();
-        }
-        if !safe {
+        if !real_parent_chain(&source, Path::new(relative)) {
             continue;
         }
         let meta = match fs::symlink_metadata(&from) {
@@ -157,15 +154,9 @@ pub fn farm_health(home: &Path) -> Result<FarmHealth> {
 }
 
 pub fn activity_root_is_local(profile_dir: &Path) -> bool {
-    let home = profile_home(profile_dir);
-    [
-        profile_dir.to_path_buf(),
-        home.clone(),
-        home.join(".gemini"),
-        home.join(".gemini/antigravity-cli"),
-    ]
-    .into_iter()
-    .all(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+    AGY_ACTIVITY_MARKERS
+        .iter()
+        .all(|marker| real_parent_chain(profile_dir, Path::new(marker)))
 }
 
 #[cfg(unix)]
