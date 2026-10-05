@@ -513,6 +513,33 @@ mod stage_b_tests {
         assert!(!manager.profile_dir("o").join("skills").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agy_prepare_launch_relinks_and_updates_last_used() {
+        // Known-bad: prepare_launch stops calling link_farm.
+        let tmp = TempDir::new().unwrap();
+        let manager = ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
+        register(&manager, "g", Tool::Antigravity, "g@example.com");
+        fs::write(tmp.path().join("gone"), b"old").unwrap();
+        agy::link_farm(tmp.path(), &manager.profile_dir("g")).unwrap();
+        fs::remove_file(tmp.path().join("gone")).unwrap();
+        fs::write(tmp.path().join("new"), b"new").unwrap();
+
+        let prepared = manager.prepare_launch("g").unwrap();
+        assert_eq!(prepared.spec.program, "agy");
+        assert_eq!(prepared.spec.env_key, "HOME");
+        assert_eq!(
+            prepared.spec.env_value,
+            manager.profile_dir("g").join("home")
+        );
+        assert_eq!(
+            fs::read_link(prepared.spec.env_value.join("new")).unwrap(),
+            tmp.path().join("new")
+        );
+        assert!(fs::symlink_metadata(prepared.spec.env_value.join("gone")).is_err());
+        assert!(manager.get_profile("g").unwrap().last_used.is_some());
+    }
+
     #[test]
     fn codex_nested_session_rewrite_counts_as_recent_activity() {
         // Known-bad: checking only the sessions/ directory misses a rewrite several levels below it.
