@@ -93,7 +93,7 @@ cswitch
 | `cswitch sync --all [--dry-run] [--adopt <skill>]...` | Sync shared skills into every Claude profile |
 | `cswitch list` | List all saved profiles |
 | `cswitch info <name>` | Show details for a profile |
-| `cswitch remove <name> [--purge-usage]` | Delete a profile; keep its usage ledger unless explicitly purged |
+| `cswitch remove <name> [--purge-usage] [--force]` | Delete a profile; Antigravity local HOME entries require `--force`; keep usage unless explicitly purged |
 | `cswitch usage` | Ingest local transcripts and show a 7-day token and API-equivalent cost report |
 | `cswitch usage label <session> <project>` | Label a past session without reopening it |
 | `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
@@ -126,9 +126,11 @@ Codex profiles cannot be copied or refreshed from a Claude session. Claude API k
 
 ## Antigravity profiles
 
-On Unix, run `cswitch login <name> --tool antigravity` or `cswitch add <name> --tool agy`, or choose `[g]` in the TUI Add menu. Sign in through the launched `agy` session, then exit it. cswitch checks the new profile's token file and runs `agy models` before registering the profile. Each profile has its own `HOME` at `~/.claude-switch/profiles/<name>/home/`, so separate Google accounts can run in parallel.
+On Unix, run `cswitch login <name> --tool antigravity` or `cswitch add <name> --tool agy`, or choose `[g]` in the TUI Add menu. Sign in through the launched `agy` session, then exit it. cswitch checks the new profile's token file and runs `agy models` before registering the profile. This login needs `agy` to keep its sign-in in a file under the profile's `.gemini`, as measured on Linux under WSL. Each profile has its own `HOME` at `~/.claude-switch/profiles/<name>/home/`, so separate Google accounts can run in parallel.
 
-The profile HOME links each top-level entry of your real HOME except `.gemini` and `.claude-switch`. Its `.gemini` is a real, isolated directory. cswitch copies only warm Antigravity settings, MCP configuration and skills from your real `.gemini`; it never copies the source login token or Gemini CLI account files. `cswitch use <name>` updates the links and launches `agy` with the profile HOME. A file that Antigravity creates at the top of that HOME stays in the profile; cswitch leaves local entries alone. `cswitch info <name>` shows the HOME path, link health and local entries. Antigravity profiles are not supported on Windows in this stage.
+The profile HOME links each top-level entry of your real HOME except `.gemini` and `.claude-switch`. Its `.gemini` is a real, isolated directory. cswitch copies only warm Antigravity settings, MCP configuration and skills from your real `.gemini`; it never copies the source login token or Gemini CLI account files. `cswitch use <name>` updates the links and launches `agy` with the profile HOME. A file that Antigravity creates at the top of that HOME stays in the profile; cswitch leaves local entries alone. A program that rewrites a top-level file by renaming a new one over it replaces the link too. The profile then has its own copy, and the real file no longer changes with it. `cswitch info <name>` lists that copy under `Local:`.
+
+Local entries exist only in the profile, and removing the profile deletes them. `cswitch remove <name>` lists them and requires `--force`; the TUI lists them before you confirm deletion. Inside an Antigravity session, `~/.claude-switch` is not linked, so `cswitch` cannot see its profiles there. It says so and stops; run `cswitch` from a normal shell. Antigravity profiles are not supported on Windows in this stage.
 
 ## Plan limits
 
@@ -353,7 +355,7 @@ On Windows, `cswitch aliases` outputs PowerShell functions instead. Add them to 
 | Credential handling | Keychain | File-based | Credential Manager |
 | Shell aliases | bash/zsh | bash/zsh | PowerShell |
 | TUI | Yes | Yes | Yes |
-| Antigravity profiles | Yes | Yes | No |
+| Antigravity profiles | Untested | Yes | No |
 
 ## How profiles are stored
 
