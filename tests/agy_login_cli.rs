@@ -190,4 +190,60 @@ exit "$AGY_SIGNIN_EXIT"
         assert_eq!(calls.lines().count(), if case == "token" { 2 } else { 1 });
         assert_eq!(calls.contains("models|"), case == "token");
     }
+
+    // Known-bad: abort_login(profile_dir, false) leaves a token and farm in an
+    // unregistered directory, so a retry cannot proceed.
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    plant_home(&home);
+    let profile_dir = home.join(".claude-switch/profiles/g");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let call_log = temp.path().join("agy-calls");
+    let run = |models_exit: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cswitch"))
+            .args(["login", "g", "--tool", "agy"])
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", fake_dir.path().display()),
+            )
+            .env("AGY_TEST_LOG", &call_log)
+            .env("AGY_TEST_CASE", "token")
+            .env("AGY_TEST_TOKEN", OWN_TOKEN)
+            .env("AGY_SIGNIN_EXIT", "0")
+            .env("AGY_MODELS_EXIT", models_exit)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    let refused = run("1");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("models check failed"));
+    assert!(profile_dir.is_dir());
+    assert_eq!(fs::read_dir(&profile_dir).unwrap().count(), 0);
+    assert!(!home.join(".claude-switch/registry.json").exists());
+    assert_eq!(
+        fs::read(home.join("plain")).unwrap(),
+        b"plain planted bytes"
+    );
+    assert_eq!(
+        fs::read(home.join("folder/entry")).unwrap(),
+        b"nested planted bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+        PLANTED_TOKEN
+    );
+    let accepted = run("0");
+    assert!(accepted.status.success(), "{accepted:?}");
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".claude-switch/registry.json")).unwrap())
+            .unwrap();
+    assert_eq!(registry["profiles"]["g"]["tool"], "antigravity");
+    assert_eq!(registry["profiles"]["g"]["email"], "o@example.com");
+    assert!(call_log.exists());
+    assert_eq!(fs::read_to_string(&call_log).unwrap().lines().count(), 4);
 }

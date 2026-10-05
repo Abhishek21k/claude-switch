@@ -1367,7 +1367,11 @@ impl ProfileManager {
             })
         })();
         if result.is_err() {
-            abort_login(&profile_dir, we_created_dir);
+            if we_created_dir {
+                abort_login(&profile_dir, true);
+            } else {
+                agy::cleanup_staged_home(&profile_dir);
+            }
         }
         result
     }

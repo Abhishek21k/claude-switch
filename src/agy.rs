@@ -48,6 +48,21 @@ pub fn profile_home(profile_dir: &Path) -> PathBuf {
     profile_dir.join("home")
 }
 
+/// Clean only the entries a login staged in an already-existing empty profile.
+pub fn cleanup_staged_home(profile_dir: &Path) {
+    let home = profile_home(profile_dir);
+    match fs::symlink_metadata(&home) {
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir_all(&home);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(&home);
+        }
+        Err(_) => {}
+    }
+    let _ = fs::remove_file(profile_dir.join(FARM_MANIFEST));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenState {
     Missing,
