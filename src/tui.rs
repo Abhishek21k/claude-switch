@@ -1,12 +1,15 @@
 use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, Offset, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
+        Wrap,
+    },
 };
 
 use crate::gateway::{self, GatewayInput};
@@ -15,8 +18,10 @@ use crate::limits::{Limits, Window, parse_limits, read_claude_json};
 use crate::profile::{
     LoginMethod, LoginOutcome, Profile, ProfileManager, Tool, describe_age, detect_current_account,
 };
+use crate::usage::{self, metrics as m};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -109,17 +114,103 @@ pub struct App {
     limits_selection: Option<String>,
     last_limits_refresh: Option<Instant>,
     limits_now: DateTime<Utc>,
+    usage_dir: PathBuf,
+    usage_cache: UsageCache,
+    ingest_rx: Option<Receiver<IngestOutcome>>,
+    ingest_status: Option<IngestStatus>,
 }
 
 type AccountProbe = fn() -> Option<String>;
+
+struct UsageCache {
+    hourly: Option<m::Hourly>,
+    settings: crate::UsageSettings,
+    history: Vec<m::LimitRow>,
+    cells: HashMap<String, String>,
+}
+
+impl UsageCache {
+    fn load(
+        manager: &ProfileManager,
+        profiles: &[Profile],
+        dir: &Path,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let hourly = m::read(dir);
+        let settings = m::load_settings(dir, now);
+        let history = m::history(dir);
+        let cells = profiles
+            .iter()
+            .map(|profile| {
+                let cell = if profile.tool == Tool::Claude {
+                    let auth = key::read_auth_mode(
+                        manager,
+                        &profile.name,
+                        read_claude_json(&manager.profile_dir(&profile.name)),
+                    );
+                    crate::usage_30d_cell(
+                        &profile.name,
+                        &auth,
+                        hourly.as_ref(),
+                        &settings,
+                        now,
+                        Local::now().offset().fix(),
+                    )
+                } else {
+                    "—".into()
+                };
+                (profile.name.clone(), cell)
+            })
+            .collect();
+        Self {
+            hourly,
+            settings,
+            history,
+            cells,
+        }
+    }
+}
+
+enum IngestOutcome {
+    Updated,
+    Busy,
+    Failed(String),
+}
+
+enum IngestStatus {
+    Busy,
+    Failed(String),
+}
 
 fn live_account_email() -> Option<String> {
     detect_current_account().and_then(|a| a.email)
 }
 
+fn profile_name_line(name: &str, cell: &str, area_width: u16) -> Line<'static> {
+    // Two border cells and two highlight-symbol cells are reserved on every row.
+    let available = area_width.saturating_sub(4) as usize;
+    if available == 0 {
+        return Line::from("");
+    }
+    let cell_width = cell.chars().count().min(available.saturating_sub(2));
+    let cell: String = cell.chars().take(cell_width).collect();
+    let name_budget = available.saturating_sub(cell_width + 2);
+    let name: String = name.chars().take(name_budget).collect();
+    let padding = available.saturating_sub(1 + name.chars().count() + cell_width);
+    Line::from(vec![
+        Span::styled(
+            format!(" {name}{}", " ".repeat(padding)),
+            Style::default().fg(TEXT).bold(),
+        ),
+        Span::styled(cell, Style::default().fg(ACCENT)),
+    ])
+}
+
 impl App {
     pub fn new(manager: ProfileManager) -> Result<Self> {
         let profiles = manager.list_profiles()?;
+        let usage_dir = crate::usage_directory(&manager);
+        let usage_cache = UsageCache::load(&manager, &profiles, &usage_dir, Utc::now());
         let filtered_indices: Vec<usize> = (0..profiles.len()).collect();
         let mut list_state = ListState::default();
         if !profiles.is_empty() {
@@ -162,6 +253,10 @@ impl App {
             limits_selection: None,
             last_limits_refresh: None,
             limits_now: Utc::now(),
+            usage_dir,
+            usage_cache,
+            ingest_rx: None,
+            ingest_status: None,
         })
     }
 
@@ -174,6 +269,7 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         self.profiles = self.manager.list_profiles()?;
+        self.reload_usage_data();
         self.apply_filter();
         if self.filtered_indices.is_empty() {
             self.list_state.select(None);
@@ -184,6 +280,56 @@ impl App {
         }
         self.last_limits_refresh = None;
         Ok(())
+    }
+
+    fn reload_usage_data(&mut self) {
+        self.usage_cache =
+            UsageCache::load(&self.manager, &self.profiles, &self.usage_dir, Utc::now());
+    }
+
+    fn start_background_ingest(&mut self) {
+        match usage::store(&self.manager, Some(self.usage_dir.clone())) {
+            Ok(store) => self.start_ingest_with(move || match store.ingest() {
+                Ok(report) if report.skipped_lock => IngestOutcome::Busy,
+                Ok(_) => IngestOutcome::Updated,
+                Err(error) => IngestOutcome::Failed(error.to_string()),
+            }),
+            Err(error) => self.ingest_status = Some(IngestStatus::Failed(error.to_string())),
+        }
+    }
+
+    fn start_ingest_with<F>(&mut self, ingest: F)
+    where
+        F: FnOnce() -> IngestOutcome + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        // The worker only touches the usage store and this channel, never the terminal.
+        std::thread::spawn(move || {
+            let _ = tx.send(ingest());
+        });
+        self.ingest_rx = Some(rx);
+        self.ingest_status = None;
+    }
+
+    fn poll_ingest(&mut self) {
+        let Some(rx) = &self.ingest_rx else { return };
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                IngestOutcome::Failed("background ingest stopped".into())
+            }
+        };
+        self.ingest_rx = None;
+        match outcome {
+            IngestOutcome::Updated => {
+                self.reload_usage_data();
+                self.last_limits_refresh = None;
+                self.ingest_status = None;
+            }
+            IngestOutcome::Busy => self.ingest_status = Some(IngestStatus::Busy),
+            IngestOutcome::Failed(error) => self.ingest_status = Some(IngestStatus::Failed(error)),
+        }
     }
 
     fn refresh_limits_if_due(&mut self, instant: Instant) {
@@ -223,6 +369,19 @@ impl App {
                     .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
                     .unwrap_or(Limits::Unreadable),
             );
+            if let Some(auth) = self.auth_modes.get(name) {
+                self.usage_cache.cells.insert(
+                    name.clone(),
+                    crate::usage_30d_cell(
+                        name,
+                        auth,
+                        self.usage_cache.hourly.as_ref(),
+                        &self.usage_cache.settings,
+                        self.limits_now,
+                        Local::now().offset().fix(),
+                    ),
+                );
+            }
             self.last_limits_refresh = Some(instant);
         }
         self.limits_selection = selected;
@@ -271,6 +430,36 @@ impl App {
             .and_then(|&i| self.profiles.get(i))
     }
 
+    fn usage_panel_text(&self, name: &str) -> String {
+        let auth = self.auth_modes.get(name).unwrap_or(&AuthMode::NotLoggedIn);
+        let limits = self.limits.get(name).unwrap_or(&Limits::NoSnapshot);
+        let mut text = crate::usage_info_cached(
+            crate::UsageInfoData {
+                hourly: self.usage_cache.hourly.as_ref(),
+                settings: &self.usage_cache.settings,
+                history: &self.usage_cache.history,
+            },
+            name,
+            auth,
+            self.limits_now,
+            Local::now().offset().fix(),
+            limits,
+        );
+        match &self.ingest_status {
+            Some(IngestStatus::Busy) if text.starts_with("Usage (ledger as of ") => {
+                text = text.replacen("):\n", "; ledger busy):\n", 1);
+            }
+            Some(IngestStatus::Busy) => {
+                text = format!("Usage (ledger busy):\n{text}");
+            }
+            Some(IngestStatus::Failed(error)) => {
+                text = format!("Usage (ingest error: {error}):\n{text}");
+            }
+            None => {}
+        }
+        text
+    }
+
     /// How recently a Claude session wrote to the selected profile, if that was
     /// recent enough that another terminal may still have it open.
     fn selected_session_age(&self) -> Option<u64> {
@@ -314,6 +503,7 @@ impl App {
     pub fn run(mut self) -> Result<()> {
         let mut terminal = ratatui::init();
         terminal.clear()?;
+        self.start_background_ingest();
         let result = self.event_loop(&mut terminal);
         ratatui::restore();
         result
@@ -322,10 +512,16 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.limits_now = Utc::now();
+            self.poll_ingest();
             self.refresh_limits_if_due(Instant::now());
             terminal.draw(|f| self.render(f))?;
 
-            if event::poll(Duration::from_secs(30))?
+            let wait = if self.ingest_rx.is_some() {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(30)
+            };
+            if event::poll(wait)?
                 && let Event::Key(key) = event::read()?
             {
                 if key.kind != KeyEventKind::Press {
@@ -1305,17 +1501,20 @@ impl App {
             format!(" {}/{} ", count, total)
         };
 
-        let count_area = Rect {
-            x: area.x + area.width.saturating_sub(label.len() as u16 + 2),
-            y: area.y + 1,
-            width: label.len() as u16 + 1,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(label, Style::default().fg(DIM)))
-                .alignment(Alignment::Right),
-            count_area,
-        );
+        let count_width = (label.len() as u16 + 1).min(area.width.saturating_sub(1));
+        if count_width > 0 {
+            let count_area = Rect {
+                x: area.x + area.width.saturating_sub(count_width + 1),
+                y: area.y + 1,
+                width: count_width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(label, Style::default().fg(DIM)))
+                    .alignment(Alignment::Right),
+                count_area,
+            );
+        }
     }
 
     fn render_profile_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1358,11 +1557,13 @@ impl App {
             .map(|&i| {
                 let p = &self.profiles[i];
                 let email = p.email.as_deref().unwrap_or("no email");
+                let cell = self
+                    .usage_cache
+                    .cells
+                    .get(&p.name)
+                    .map_or("—", String::as_str);
                 ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(" ", Style::default()),
-                        Span::styled(p.name.clone(), Style::default().fg(TEXT).bold()),
-                    ]),
+                    profile_name_line(&p.name, cell, area.width),
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
                         Span::styled(
@@ -1382,7 +1583,8 @@ impl App {
                     .fg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("▶ ");
+            .highlight_symbol("▶ ")
+            .highlight_spacing(HighlightSpacing::Always);
 
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
@@ -1524,6 +1726,13 @@ impl App {
                     "  Plan limits  no data: no cached snapshot yet",
                     Style::default().fg(MUTED),
                 ))),
+            }
+            lines.push(Line::from(""));
+            for line in self.usage_panel_text(&profile.name).lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(TEXT),
+                )));
             }
         }
         lines.extend([
@@ -2284,8 +2493,8 @@ mod tests {
         app
     }
 
-    fn render_text(app: &mut App) -> String {
-        let backend = TestBackend::new(120, 40);
+    fn render_text_at(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         terminal
@@ -2295,6 +2504,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn render_text(app: &mut App) -> String {
+        render_text_at(app, 120, 40)
     }
 
     #[test]
@@ -3147,5 +3360,212 @@ mod tests {
         assert!(display.contains("Plan limits  —"));
         assert!(display.contains("CODEX_HOME"));
         assert!(!display.contains("no data: no cached snapshot"));
+    }
+
+    #[test]
+    fn usage_panel_reuses_info_lines_for_plan_and_per_token_profiles() {
+        // Known-bad: a TUI-only formatter diverging from info's fee, spend, Effective or capacity lines.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("plan", Some("plan@example.com")),
+                ("api", Some("api@example.com")),
+            ],
+        );
+        for (name, auth) in [
+            ("plan", r#"{"oauthAccount":{}}"#),
+            ("api", r#"{"primaryApiKey":"synthetic"}"#),
+        ] {
+            let dir = app.manager.profile_dir(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".claude.json"), auth).unwrap();
+        }
+        let now = Utc::now();
+        let bucket = |name: &str, model: &str| m::Bucket {
+            profile: name.into(),
+            hour: now - chrono::Duration::hours(1),
+            model: model.into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        fs::create_dir_all(&app.usage_dir).unwrap();
+        fs::write(
+            app.usage_dir.join("hourly.json"),
+            serde_json::to_vec(&m::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![bucket("plan", "claude-opus-5"), bucket("api", "acme/model")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            app.usage_dir.join("billing.json"),
+            serde_json::json!({"version":1,"profiles":{
+                "plan":{"plan":{"label":"Pro","fee_usd":20.0}},
+                "api":{"rate":{"flat":2.0}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        app.limits_now = now;
+        app.reload_usage_data();
+        app.select_by_name("plan");
+        app.refresh_limits_if_due(Instant::now());
+        let plan = app.usage_panel_text("plan");
+        assert!(plan.contains("$5.00 list price"), "{plan}");
+        assert!(plan.contains("Plan:      Pro · $20.00/mo"), "{plan}");
+        assert!(plan.contains("Effective: $20.00 per 1M tokens"), "{plan}");
+        assert!(plan.contains("Capacity:  not enough data yet"), "{plan}");
+        assert_eq!(app.usage_cache.cells["plan"], "~$5.00");
+        app.select_by_name("api");
+        app.refresh_limits_if_due(Instant::now());
+        let api = app.usage_panel_text("api");
+        assert!(api.contains("$2.00 spent · $* list price"), "{api}");
+        assert!(
+            api.contains("Rate:      $2.00 per 1M tokens, flat"),
+            "{api}"
+        );
+        assert!(api.contains("Effective: $2.00 per 1M tokens"), "{api}");
+        assert_eq!(app.usage_cache.cells["api"], "$2.00");
+        let frame = render_text(&mut app);
+        assert!(frame.contains("$2.00"));
+        fs::write(app.usage_dir.join("billing.json"), b"{bad").unwrap();
+        app.reload_usage_data();
+        assert!(
+            app.usage_panel_text("api")
+                .contains("usage settings unreadable: billing.json")
+        );
+    }
+
+    #[test]
+    fn list_usage_cell_is_right_aligned_and_tiny_frames_do_not_panic() {
+        // Known-bads: appending the cell immediately after the name or underflow below 20 columns.
+        let row = profile_name_line("plan", "~$5.00", 18);
+        let text = row
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text.chars().count(), 14);
+        assert!(text.ends_with("~$5.00"), "{text}");
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        app.usage_cache.cells.insert("plan".into(), "~$5.00".into());
+        let mut terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..50).map(|x| buffer[(x, 4)].symbol()).collect::<Vec<_>>();
+        let money = row.iter().position(|symbol| *symbol == "~").unwrap();
+        assert_eq!(&row[money..money + 6], ["~", "$", "5", ".", "0", "0"]);
+        assert_eq!(row[money + 6], "│");
+        for width in 1..20 {
+            let _ = render_text_at(&mut app, width, 20);
+        }
+    }
+
+    #[test]
+    fn drawing_does_not_wait_for_background_ingest() {
+        // Known-bad: running a slow ingest synchronously on the draw path.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        app.start_ingest_with(move || {
+            release_rx.recv().unwrap();
+            IngestOutcome::Updated
+        });
+        let (draw_tx, draw_rx) = mpsc::channel();
+        let drawing = std::thread::spawn(move || {
+            let _ = render_text(&mut app);
+            draw_tx.send(app).unwrap();
+        });
+        let early = draw_rx.recv_timeout(Duration::from_secs(1));
+        let drew_before_ingest = early.is_ok();
+        release_tx.send(()).unwrap();
+        let mut app = match early {
+            Ok(app) => app,
+            Err(_) => draw_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        };
+        drawing.join().unwrap();
+        assert!(drew_before_ingest);
+        assert!(app.ingest_rx.is_some());
+        // A completed worker is handled on the next event-loop pass, not by drawing.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.ingest_rx.is_some() && Instant::now() < deadline {
+            app.poll_ingest();
+            std::thread::yield_now();
+        }
+        assert!(app.ingest_rx.is_none());
+    }
+
+    #[test]
+    fn ingest_completion_reloads_usage_and_busy_or_error_stays_in_panel() {
+        // Known-bads: stale rollup/history after ingest, a busy lock clearing data, or errors aborting the UI.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        let old_cell = app.usage_cache.cells["plan"].clone();
+        app.auth_modes.insert("plan".into(), AuthMode::Subscription);
+        let now = Utc::now();
+        fs::create_dir_all(&app.usage_dir).unwrap();
+        fs::write(
+            app.usage_dir.join("hourly.json"),
+            serde_json::to_vec(&m::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![m::Bucket {
+                    profile: "plan".into(),
+                    hour: now - chrono::Duration::hours(1),
+                    model: "claude-opus-5".into(),
+                    speed: None,
+                    requests: 1,
+                    input: 1_000_000,
+                    output: 0,
+                    cache_write_5m: 0,
+                    cache_write_1h: 0,
+                    cache_read: 0,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            app.usage_dir.join("limits.jsonl"),
+            serde_json::json!({
+                "profile":"plan","fetched_at":now.to_rfc3339(),
+                "weekly":{"percent":50,"resets_at":(now+chrono::Duration::days(2)).to_rfc3339()}
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.ingest_rx = Some(rx);
+        tx.send(IngestOutcome::Updated).unwrap();
+        app.poll_ingest();
+        assert_ne!(app.usage_cache.cells["plan"], old_cell);
+        assert_eq!(app.usage_cache.history.len(), 1);
+        assert!(app.usage_panel_text("plan").contains("weekly limit ≈ $10"));
+        let loaded = app.usage_cache.cells["plan"].clone();
+        let (tx, rx) = mpsc::channel();
+        app.ingest_rx = Some(rx);
+        tx.send(IngestOutcome::Busy).unwrap();
+        app.poll_ingest();
+        assert_eq!(app.usage_cache.cells["plan"], loaded);
+        assert!(app.usage_panel_text("plan").contains("ledger busy"));
+        let (tx, rx) = mpsc::channel();
+        app.ingest_rx = Some(rx);
+        tx.send(IngestOutcome::Failed("synthetic read error".into()))
+            .unwrap();
+        app.poll_ingest();
+        assert!(
+            app.usage_panel_text("plan")
+                .contains("synthetic read error")
+        );
     }
 }

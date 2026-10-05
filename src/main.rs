@@ -810,10 +810,48 @@ fn usage_info(
     limits: &Limits,
 ) -> String {
     use usage::metrics as m;
-    let Some(hourly) = m::read(dir) else {
+    let hourly = m::read(dir);
+    if hourly.is_none() {
+        return "Usage:     no ledger yet — run `cswitch usage`\n".into();
+    }
+    let settings = m::load_settings(dir, now);
+    let history = m::history(dir);
+    usage_info_cached(
+        UsageInfoData {
+            hourly: hourly.as_ref(),
+            settings: &settings,
+            history: &history,
+        },
+        name,
+        auth,
+        now,
+        offset,
+        limits,
+    )
+}
+
+type UsageSettings =
+    std::result::Result<(usage::rates::Rates, usage::billing::Billing), (&'static str, String)>;
+
+struct UsageInfoData<'a> {
+    hourly: Option<&'a usage::metrics::Hourly>,
+    settings: &'a UsageSettings,
+    history: &'a [usage::metrics::LimitRow],
+}
+
+fn usage_info_cached(
+    data: UsageInfoData<'_>,
+    name: &str,
+    auth: &key::AuthMode,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    limits: &Limits,
+) -> String {
+    use usage::metrics as m;
+    let Some(hourly) = data.hourly else {
         return "Usage:     no ledger yet — run `cswitch usage`\n".into();
     };
-    let (rates, billing) = match m::load_settings(dir, now) {
+    let (rates, billing) = match data.settings {
         Ok(settings) => settings,
         Err((file, reason)) => {
             return format!("Usage:     usage settings unreadable: {file} — {reason}\n");
@@ -821,7 +859,7 @@ fn usage_info(
     };
     let per_token = auth.api_billed();
     let entry = billing.profiles.get(name);
-    let sums = m::windows(&hourly.rows, name, now, offset, &rates, entry, per_token);
+    let sums = m::windows(&hourly.rows, name, now, offset, rates, entry, per_token);
     let age = profile::describe_age((now - hourly.generated_at).num_seconds().max(0) as u64);
     let mut out = format!("Usage (ledger as of {age}):\n");
     for (label, value) in ["Today", "7 days", "30 days"].iter().zip(sums.iter()) {
@@ -904,7 +942,7 @@ fn usage_info(
                 "Plan:      not set — cswitch usage plan {name} <fee> --label <text>\n"
             ));
         }
-        let mut history = m::history(dir);
+        let mut history = data.history.to_vec();
         if let Limits::Snapshot(snapshot) = limits
             && let Some(weekly) = snapshot
                 .weekly()
@@ -926,8 +964,8 @@ fn usage_info(
         let report = m::capacity(
             name,
             &history,
-            &hourly,
-            &rates,
+            hourly,
+            rates,
             entry.map_or(&[][..], |entry| entry.limit_resets.as_slice()),
         );
         if let Some(c) = report.estimate {
@@ -964,6 +1002,33 @@ fn usage_info(
         }
     }
     out
+}
+
+fn usage_30d_cell(
+    name: &str,
+    auth: &key::AuthMode,
+    hourly: Option<&usage::metrics::Hourly>,
+    settings: &UsageSettings,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> String {
+    let (Some(hourly), Ok((rates, billing))) = (hourly, settings) else {
+        return "—".into();
+    };
+    let values = usage::metrics::windows(
+        &hourly.rows,
+        name,
+        now,
+        offset,
+        rates,
+        billing.profiles.get(name),
+        auth.api_billed(),
+    );
+    if auth.api_billed() {
+        values[2].spend_cell()
+    } else {
+        values[2].list_cell()
+    }
 }
 
 fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
@@ -1024,25 +1089,14 @@ fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
                     Limits::Unreadable => ("—".into(), "—".into(), "unreadable".into()),
                 }
             };
-            let cell = if let (Some(hourly), Ok((rates, billing))) = (&hourly, &settings) {
-                let entry = billing.profiles.get(&p.name);
-                let value = m::windows(
-                    &hourly.rows,
-                    &p.name,
-                    now,
-                    Local::now().offset().fix(),
-                    rates,
-                    entry,
-                    auth.api_billed(),
-                );
-                if auth.api_billed() {
-                    value[2].spend_cell()
-                } else {
-                    value[2].list_cell()
-                }
-            } else {
-                "—".into()
-            };
+            let cell = usage_30d_cell(
+                &p.name,
+                &auth,
+                hourly.as_ref(),
+                &settings,
+                now,
+                Local::now().offset().fix(),
+            );
             saw_usage |= cell != "—";
             (session, weekly, age, cell)
         };
