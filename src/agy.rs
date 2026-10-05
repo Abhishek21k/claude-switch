@@ -420,6 +420,46 @@ mod tests {
     }
 
     #[test]
+    fn farm_refuses_linked_home_and_gemini_without_touching_targets() {
+        // Known-bad: is_dir follows either linked destination directory.
+        for linked_home in [true, false] {
+            let (temp, real, profile) = fixture();
+            let target = temp.path().join("outside");
+            fs::create_dir(&target).unwrap();
+            let home = profile_home(&profile);
+            if linked_home {
+                symlink(&target, &home).unwrap();
+            } else {
+                fs::create_dir(&home).unwrap();
+                symlink(&target, home.join(".gemini")).unwrap();
+            }
+            assert!(link_farm(&real, &profile).is_err());
+            assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+            assert!(!profile.join(FARM_MANIFEST).exists());
+        }
+    }
+
+    #[test]
+    fn linked_gemini_seed_source_copies_nothing() {
+        // Known-bad: metadata follows the real HOME's linked .gemini source.
+        let (temp, real, profile) = fixture();
+        let source = real.join(".gemini");
+        fs::remove_dir(&source).unwrap();
+        let outside = temp.path().join("outside-gemini");
+        fs::create_dir_all(outside.join("skills/warm")).unwrap();
+        fs::write(outside.join("skills/warm/entry"), b"must stay outside").unwrap();
+        symlink(&outside, &source).unwrap();
+        let home = profile_home(&profile);
+        fs::create_dir(&home).unwrap();
+        seed_gemini(&real, &home).unwrap();
+        assert_eq!(fs::read_dir(home.join(".gemini")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(outside.join("skills/warm/entry")).unwrap(),
+            b"must stay outside"
+        );
+    }
+
+    #[test]
     fn blank_email_claim_is_unavailable() {
         // Known-bad: dropping the empty-email filter reports an empty address.
         assert_eq!(
