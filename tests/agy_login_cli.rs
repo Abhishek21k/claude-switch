@@ -18,6 +18,8 @@ fn plant_home(home: &Path) {
     let gemini = home.join(".gemini/antigravity-cli");
     fs::create_dir_all(&gemini).unwrap();
     fs::write(gemini.join("antigravity-oauth-token"), PLANTED_TOKEN).unwrap();
+    fs::create_dir_all(home.join(".gemini/skills/warm")).unwrap();
+    fs::write(home.join(".gemini/skills/warm/entry"), b"warm skill").unwrap();
 }
 
 #[test]
@@ -157,6 +159,17 @@ exit "$AGY_SIGNIN_EXIT"
             } else {
                 assert!(registry["profiles"]["g"]["email"].is_null());
             }
+            assert_eq!(
+                fs::read(profile_dir.join("home/.gemini/skills/warm/entry")).unwrap(),
+                b"warm skill"
+            );
+            assert_eq!(
+                fs::read_to_string(
+                    profile_dir.join("home/.gemini/antigravity-cli/antigravity-oauth-token")
+                )
+                .unwrap(),
+                token
+            );
         } else {
             assert!(
                 !profile_dir.exists(),
@@ -246,4 +259,109 @@ exit "$AGY_SIGNIN_EXIT"
     assert_eq!(registry["profiles"]["g"]["email"], "o@example.com");
     assert!(call_log.exists());
     assert_eq!(fs::read_to_string(&call_log).unwrap().lines().count(), 4);
+}
+
+#[test]
+fn registered_agy_login_is_refused_before_fake_runs() {
+    // Known-bad: removing the non-empty profile check starts agy over an account.
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let fake = tmp.path().join("agy");
+    let calls = tmp.path().join("calls");
+    fs::write(
+        &fake,
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$AGY_TEST_LOG"
+if [ "$1" = models ]; then exit 0; fi
+mkdir -p "$HOME/.gemini/antigravity-cli"
+printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+"##,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake, perms).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_cswitch"))
+            .args(["login", "g", "--tool", "agy"])
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+            .env("AGY_TEST_LOG", &calls)
+            .env("AGY_TEST_TOKEN", OWN_TOKEN)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    let registry = home.join(".claude-switch/registry.json");
+    let token =
+        home.join(".claude-switch/profiles/g/home/.gemini/antigravity-cli/antigravity-oauth-token");
+    let before_registry = fs::read(&registry).unwrap();
+    let before_token = fs::read(&token).unwrap();
+    let before_calls = fs::read(&calls).unwrap();
+    let refused = run();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already exists and holds an account")
+    );
+    assert_eq!(fs::read(&registry).unwrap(), before_registry);
+    assert_eq!(fs::read(&token).unwrap(), before_token);
+    assert_eq!(fs::read(&calls).unwrap(), before_calls);
+}
+
+#[test]
+fn invalid_agy_name_and_flags_never_start_fake() {
+    // Known-bad: name or incompatible-flag guard omitted from main or login.
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let fake = tmp.path().join("agy");
+    let calls = tmp.path().join("calls");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf called >> \"$AGY_TEST_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake, perms).unwrap();
+    for (args, message) in [
+        (
+            vec!["login", "../g", "--tool", "agy"],
+            "Invalid profile name.",
+        ),
+        (
+            vec!["add", "g", "--tool", "agy", "--force"],
+            "does not support --force or --include-history",
+        ),
+        (
+            vec!["add", "g", "--tool", "agy", "--include-history"],
+            "does not support --force or --include-history",
+        ),
+        (
+            vec!["login", "g", "--tool", "agy", "--console"],
+            "does not support --console, --email or --include-history",
+        ),
+        (
+            vec!["login", "g", "--tool", "agy", "--email", "a@example.com"],
+            "does not support --console, --email or --include-history",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cswitch"))
+            .args(&args)
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", tmp.path().display()))
+            .env("AGY_TEST_LOG", &calls)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{args:?}: {output:?}"
+        );
+        assert!(!calls.exists(), "fake was started for {args:?}");
+        assert!(!home.join(".claude-switch/g").exists());
+    }
 }
