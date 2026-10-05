@@ -1023,11 +1023,19 @@ mod reset_capacity_tests {
             70.0,
             None,
         )];
-        assert!(
-            estimate(&rows, &hourly("2030-01-07T00:00:00Z", vec![]), &[reset])
-                .estimate
-                .is_none()
+        // The first two buckets are before the snapshot, on either side of the
+        // bracket's first possible instant. The last is after the reset day.
+        let usage = hourly(
+            "2030-01-07T00:00:00Z",
+            vec![
+                bucket("2030-01-03T00:00:00Z", 1),
+                bucket("2030-01-04T06:00:00Z", 1),
+                bucket("2030-01-05T06:00:00Z", 1),
+            ],
         );
+        let report = estimate(&rows, &usage, &[reset]);
+        assert!(report.estimate.is_none());
+        assert_eq!(report.reason, "no snapshot ≥ 20%");
     }
     #[test]
     fn breakdown_start_wins_and_hour_before_it_is_excluded() {
