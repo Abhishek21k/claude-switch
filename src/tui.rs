@@ -206,6 +206,40 @@ fn profile_name_line(name: &str, cell: &str, area_width: u16) -> Line<'static> {
     ])
 }
 
+fn wrap_usage_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut cursor = 0;
+    let mut wrapped = Vec::new();
+    loop {
+        let indent = (if wrapped.is_empty() { 2 } else { 13 }).min(width - 1);
+        let end = (cursor + width - indent).min(chars.len());
+        let split = if end == chars.len() {
+            end
+        } else {
+            chars[cursor..end]
+                .iter()
+                .rposition(|ch| ch.is_whitespace())
+                .map(|at| cursor + at)
+                .filter(|at| *at > cursor)
+                .unwrap_or(end)
+        };
+        let mut rendered = " ".repeat(indent);
+        rendered.extend(&chars[cursor..split]);
+        wrapped.push(rendered);
+        cursor = split;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        if cursor == chars.len() {
+            break;
+        }
+    }
+    wrapped
+}
+
 impl App {
     pub fn new(manager: ProfileManager) -> Result<Self> {
         let profiles = manager.list_profiles()?;
@@ -1729,10 +1763,9 @@ impl App {
             }
             lines.push(Line::from(""));
             for line in self.usage_panel_text(&profile.name).lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(TEXT),
-                )));
+                for wrapped in wrap_usage_line(line, inner.width as usize) {
+                    lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+                }
             }
         }
         lines.extend([
@@ -3442,6 +3475,117 @@ mod tests {
         assert!(
             app.usage_panel_text("api")
                 .contains("usage settings unreadable: billing.json")
+        );
+    }
+
+    #[test]
+    fn capacity_wraps_under_value_column_in_sixty_column_panel() {
+        // Known-bad: Paragraph wraps a long usage line at the panel's left edge.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
+        let now = Utc::now();
+        app.limits_now = now;
+        app.auth_modes.insert("plan".into(), AuthMode::Subscription);
+        app.usage_cache.hourly = Some(m::Hourly {
+            version: 1,
+            generated_at: now,
+            rows: vec![m::Bucket {
+                profile: "plan".into(),
+                hour: now - chrono::Duration::hours(1),
+                model: "claude-opus-5".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        });
+        app.usage_cache.settings = Ok((
+            usage::rates::seed(),
+            serde_json::from_value(serde_json::json!({
+                "version":1,"profiles":{"plan":{"plan":{"label":"Pro","fee_usd":20.0}}}
+            }))
+            .unwrap(),
+        ));
+        app.usage_cache.history = vec![m::LimitRow {
+            profile: "plan".into(),
+            fetched_at: now - chrono::Duration::hours(1),
+            weekly: m::Weekly {
+                percent: 50.0,
+                resets_at: now + chrono::Duration::days(2),
+                window_started_at: None,
+            },
+        }];
+        app.select_by_name("plan");
+        let capacity = app
+            .usage_panel_text("plan")
+            .lines()
+            .find(|line| line.starts_with("Capacity:"))
+            .unwrap()
+            .to_string();
+        let wrapped = wrap_usage_line(&capacity, 60);
+        assert!(wrapped.len() >= 2, "{wrapped:?}");
+        for line in &wrapped {
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
+        for line in wrapped.iter().skip(1) {
+            assert!(line.starts_with("             "), "{line:?}");
+            assert_ne!(line.chars().nth(13), Some(' '), "{line:?}");
+        }
+        for width in 1..=20 {
+            assert!(
+                wrap_usage_line(&capacity, width)
+                    .iter()
+                    .all(|line| line.chars().count() <= width)
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(103, 60)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(Rect::new(0, 3, 103, 54));
+        assert_eq!(columns[1].width - 2, 60);
+        let inner_x = columns[1].x + 1;
+        let buffer = terminal.backend().buffer();
+        let rows = (0..60)
+            .map(|y| {
+                (0..60)
+                    .map(|dx| buffer[(inner_x + dx, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let start = rows
+            .iter()
+            .position(|line| line.contains("Capacity:"))
+            .unwrap();
+        let rendered = rows[start..]
+            .iter()
+            .take_while(|line| !line.trim().is_empty())
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            wrapped.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rendered.join(" ").split_whitespace().collect::<Vec<_>>(),
+            capacity.split_whitespace().collect::<Vec<_>>()
+        );
+        let usage_start = rows
+            .iter()
+            .position(|line| line.contains("Usage ("))
+            .unwrap();
+        println!(
+            "PANEL_USAGE_BLOCK_BEGIN\n{}\nPANEL_USAGE_BLOCK_END",
+            rows[usage_start..start + rendered.len()]
+                .iter()
+                .map(|line| line.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
