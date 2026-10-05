@@ -3490,8 +3490,8 @@ mod tests {
             draw_tx.send(app).unwrap();
         });
         let early = draw_rx.recv_timeout(Duration::from_secs(1));
-        let drew_before_ingest = early.is_ok()
-            && !ingest_finished.load(std::sync::atomic::Ordering::SeqCst);
+        let drew_before_ingest =
+            early.is_ok() && !ingest_finished.load(std::sync::atomic::Ordering::SeqCst);
         let _ = release_tx.send(());
         let mut app = match early {
             Ok(app) => app,

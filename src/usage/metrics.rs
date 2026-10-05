@@ -398,6 +398,7 @@ pub fn capacity(
     let mut estimates = Vec::<(f64, f64, bool, LimitRow, Option<DateTime<Utc>>)>::new();
     let mut hint = None;
     let mut waiting = false;
+    let mut no_usage = false;
     for (resets_at, mut rows) in windows {
         rows.sort_by_key(|row| row.fetched_at);
         let start = rows
@@ -509,6 +510,10 @@ pub fn capacity(
             };
             let lower = value(reset.map_or(start, |event| event.to));
             let upper = reset.map_or_else(|| lower.clone(), |event| value(event.from));
+            if upper.value == 0.0 {
+                no_usage = true;
+                continue;
+            }
             estimates.push((
                 lower.value / (u / 100.0),
                 upper.value / (u / 100.0),
@@ -537,6 +542,8 @@ pub fn capacity(
         estimate,
         reason: if waiting {
             "waiting for an ingest"
+        } else if no_usage {
+            "no usage recorded in the window"
         } else {
             "no snapshot ≥ 20%"
         },
@@ -806,6 +813,57 @@ mod reset_capacity_tests {
         resets: &[billing::LimitReset],
     ) -> CapacityReport {
         capacity("p", rows, usage, &rates::seed(), resets)
+    }
+    #[test]
+    fn caught_up_snapshot_without_usage_has_no_capacity_estimate() {
+        // Known-bad: treating an unseen ledger window as a $0 allowance.
+        let rows = [row(
+            "2030-01-03T00:00:00Z",
+            "2030-01-08T00:00:00Z",
+            50.0,
+            None,
+        )];
+        let usage = hourly("2030-01-04T00:00:00Z", vec![]);
+        let report = estimate(&rows, &usage, &[]);
+        assert!(report.estimate.is_none());
+        assert_eq!(report.reason, "no usage recorded in the window");
+
+        let newer = row("2030-01-05T00:00:00Z", "2030-01-08T00:00:00Z", 60.0, None);
+        let report = estimate(&[rows[0].clone(), newer], &usage, &[]);
+        assert!(report.estimate.is_none());
+        assert_eq!(report.reason, "waiting for an ingest");
+    }
+    #[test]
+    fn older_capacity_survives_empty_newest_window() {
+        // Known-bad: adding a $0 estimate to the recent min/max range.
+        let rows = [
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None),
+            row("2030-01-11T00:00:00Z", "2030-01-15T00:00:00Z", 50.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-12T00:00:00Z",
+            vec![bucket("2030-01-03T00:00:00Z", 1)],
+        );
+        let capacity = estimate(&rows, &usage, &[]).estimate.unwrap();
+        assert_eq!(capacity.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
+        assert_eq!((capacity.lower, capacity.upper), (10.0, 10.0));
+        assert_eq!((capacity.min, capacity.max), (10.0, 10.0));
+    }
+    #[test]
+    fn newest_reset_range_keeps_zero_low_end_when_high_end_has_usage() {
+        // Known-bad: dropping a reset range just because its lower end is zero.
+        let rows = [
+            row("2030-01-02T00:00:00Z", "2030-01-08T00:00:00Z", 80.0, None),
+            row("2030-01-03T00:00:00Z", "2030-01-08T00:00:00Z", 50.0, None),
+            row("2030-01-04T00:00:00Z", "2030-01-08T00:00:00Z", 20.0, None),
+        ];
+        let usage = hourly(
+            "2030-01-05T00:00:00Z",
+            vec![bucket("2030-01-03T00:00:00Z", 1)],
+        );
+        let capacity = estimate(&rows, &usage, &[]).estimate.unwrap();
+        assert_eq!(capacity.snapshot.fetched_at, at("2030-01-04T00:00:00Z"));
+        assert_eq!((capacity.lower, capacity.upper), (0.0, 25.0));
     }
     #[test]
     fn recorded_date_reset_splits_a_week_into_a_lower_range() {
