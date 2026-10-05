@@ -393,6 +393,42 @@ mod tests {
     }
 
     #[test]
+    fn token_state_refuses_links_and_distinguishes_empty_tokens() {
+        // Known-bad: metadata follows a linked token or antigravity-cli parent.
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let cli = home.join(".gemini/antigravity-cli");
+        fs::create_dir_all(&cli).unwrap();
+        let token = cli.join("antigravity-oauth-token");
+        assert_eq!(token_state(&home), TokenState::Missing);
+        fs::write(&token, b"").unwrap();
+        assert_eq!(token_state(&home), TokenState::Empty);
+        fs::write(&token, b"synthetic").unwrap();
+        assert_eq!(token_state(&home), TokenState::NonEmpty);
+        fs::remove_file(&token).unwrap();
+        let outside = temp.path().join("outside-token");
+        fs::write(&outside, b"synthetic").unwrap();
+        symlink(&outside, &token).unwrap();
+        assert_eq!(token_state(&home), TokenState::Missing);
+        fs::remove_file(&token).unwrap();
+        fs::remove_dir(&cli).unwrap();
+        let outside_cli = temp.path().join("outside-cli");
+        fs::create_dir(&outside_cli).unwrap();
+        fs::write(outside_cli.join("antigravity-oauth-token"), b"synthetic").unwrap();
+        symlink(&outside_cli, &cli).unwrap();
+        assert_eq!(token_state(&home), TokenState::Missing);
+    }
+
+    #[test]
+    fn blank_email_claim_is_unavailable() {
+        // Known-bad: dropping the empty-email filter reports an empty address.
+        assert_eq!(
+            identity_from_token(br#"{"id_token":"h.eyJlbWFpbCI6IiJ9.s"}"#),
+            None
+        );
+    }
+
+    #[test]
     fn link_ownership_survives_an_unchanged_second_run() {
         // Known-bad: retained entries omitted from the second link record.
         let (_temp, real, profile) = fixture();
