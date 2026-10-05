@@ -222,11 +222,24 @@ where
         bail!("usage store busy; try again")
     };
     let mut billing = read(&store.dir, now)?;
+    let before = serde_json::to_value(&billing)?;
     change(&mut billing)?;
+    remove_empty_profiles(&mut billing);
     billing.validate(now)?;
+    write_if_changed(&store.dir, before, &billing)
+}
+fn remove_empty_profiles(billing: &mut Billing) {
+    billing.profiles.retain(|_, entry| {
+        entry.plan.is_some() || entry.rate.is_some() || !entry.limit_resets.is_empty()
+    });
+}
+fn write_if_changed(dir: &Path, before: serde_json::Value, billing: &Billing) -> Result<()> {
+    if serde_json::to_value(billing)? == before {
+        return Ok(());
+    }
     atomic::write_private(
-        &store.dir.join("billing.json"),
-        &serde_json::to_vec_pretty(&billing)?,
+        &dir.join("billing.json"),
+        &serde_json::to_vec_pretty(billing)?,
     )
 }
 pub fn purge(store: &Store, profile: &str) -> Result<()> {
@@ -236,30 +249,33 @@ pub fn purge(store: &Store, profile: &str) -> Result<()> {
     };
     // Known-bad: purging ledger rows before refusing a malformed billing.json.
     let mut billing = read(&store.dir, now)?;
+    let before = serde_json::to_value(&billing)?;
     let history_path = store.dir.join("limits.jsonl");
     let retained = if history_path.exists() {
-        let raw = fs::read_to_string(&history_path)?;
-        let mut kept = String::new();
-        for line in raw.lines() {
-            let row: super::metrics::LimitRow = serde_json::from_str(line)?;
-            if row.profile != profile {
-                kept.push_str(line);
-                kept.push('\n');
+        let raw =
+            fs::read(&history_path).map_err(|error| anyhow::anyhow!("limits.jsonl: {error}"))?;
+        let mut kept = Vec::with_capacity(raw.len());
+        for line in raw.split_inclusive(|byte| *byte == b'\n') {
+            let belongs_to_profile = serde_json::from_slice::<super::metrics::LimitRow>(line)
+                .is_ok_and(|row| row.profile == profile);
+            if !belongs_to_profile {
+                kept.extend_from_slice(line);
             }
         }
-        Some(kept)
+        Some((raw, kept))
     } else {
         None
     };
     store.purge_profile_locked(profile)?;
-    if let Some(retained) = retained {
-        atomic::write(&history_path, retained.as_bytes())?;
+    if let Some((raw, retained)) = retained
+        && raw != retained
+    {
+        atomic::write(&history_path, &retained)
+            .map_err(|error| anyhow::anyhow!("limits.jsonl: {error}"))?;
     }
     billing.profiles.remove(profile);
-    atomic::write_private(
-        &store.dir.join("billing.json"),
-        &serde_json::to_vec_pretty(&billing)?,
-    )
+    remove_empty_profiles(&mut billing);
+    write_if_changed(&store.dir, before, &billing)
 }
 
 pub fn price_tokens(
@@ -495,7 +511,16 @@ mod tests {
             version: 1,
             profiles: BTreeMap::from([
                 ("p".into(), ProfileBilling::default()),
-                ("q".into(), ProfileBilling::default()),
+                (
+                    "q".into(),
+                    ProfileBilling {
+                        plan: Some(Plan {
+                            label: "Q".into(),
+                            fee_usd: 1.0,
+                        }),
+                        ..Default::default()
+                    },
+                ),
             ]),
         };
         fs::write(
@@ -536,6 +561,118 @@ mod tests {
                 0o600
             );
         }
+    }
+    #[test]
+    fn purge_keeps_unparseable_history_bytes_and_other_profiles_in_order() {
+        // Known-bads: a torn line aborting purge, or silently dropping that line.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().to_path_buf(), vec![]);
+        let row = |profile| {
+            serde_json::json!({"profile":profile,"fetched_at":"2030-01-03T00:00:00Z",
+                "weekly":{"percent":50,"resets_at":"2030-01-08T00:00:00Z"}})
+            .to_string()
+        };
+        let path = tmp.path().join("limits.jsonl");
+        let torn = b"{torn\r\n\xff";
+        let mut raw = format!("{}\n", row("p")).into_bytes();
+        raw.extend_from_slice(torn);
+        raw.extend_from_slice(format!("\n{}\r\n", row("q")).as_bytes());
+        fs::write(&path, raw).unwrap();
+        purge(&store, "p").unwrap();
+        let mut expected = torn.to_vec();
+        expected.extend_from_slice(format!("\n{}\r\n", row("q")).as_bytes());
+        assert_eq!(fs::read(&path).unwrap(), expected);
+    }
+    #[test]
+    fn empty_billing_edits_and_unrelated_purge_do_not_write_settings() {
+        // Known-bad: unconditional billing.json writes, including empty profile entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().to_path_buf(), vec![]);
+        let path = tmp.path().join("billing.json");
+        let now = DateTime::parse_from_rfc3339("2030-01-08T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        for clear in [0, 1, 2] {
+            edit(&store, now, |billing| {
+                let entry = billing.profiles.entry("p".into()).or_default();
+                match clear {
+                    0 => {
+                        entry.limit_resets.pop();
+                    }
+                    1 => entry.plan = None,
+                    _ => entry.rate = None,
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(!path.exists(), "no-op {clear} created billing.json");
+        }
+        purge(&store, "p").unwrap();
+        assert!(!path.exists(), "unrelated purge created billing.json");
+
+        let make_plan = |label: &str| ProfileBilling {
+            plan: Some(Plan {
+                label: label.into(),
+                fee_usd: 1.0,
+            }),
+            ..Default::default()
+        };
+        edit(&store, now, |billing| {
+            billing.profiles.insert("p".into(), make_plan("P"));
+            billing.profiles.insert("q".into(), make_plan("Q"));
+            Ok(())
+        })
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        edit(&store, now, |billing| {
+            billing.profiles.get_mut("p").unwrap().rate = None;
+            Ok(())
+        })
+        .unwrap();
+        purge(&store, "absent").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+        edit(&store, now, |billing| {
+            billing.profiles.get_mut("p").unwrap().plan = None;
+            Ok(())
+        })
+        .unwrap();
+        let after = read(tmp.path(), now).unwrap();
+        assert!(!after.profiles.contains_key("p"));
+        assert_eq!(after.profiles["q"].plan.as_ref().unwrap().label, "Q");
+        edit(&store, now, |billing| {
+            billing.profiles.insert(
+                "r".into(),
+                ProfileBilling {
+                    rate: Some(Rate {
+                        model_prefixes: vec![],
+                        price: RatePrice::Flat { flat: 1.0 },
+                    }),
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        edit(&store, now, |billing| {
+            billing.profiles.get_mut("r").unwrap().rate = None;
+            Ok(())
+        })
+        .unwrap();
+        let after_rate = read(tmp.path(), now).unwrap();
+        assert!(!after_rate.profiles.contains_key("r"));
+        assert!(after_rate.profiles.contains_key("q"));
     }
     #[test]
     fn flat_rate_prices_all_five_kinds_without_list_multipliers() {
@@ -680,12 +817,30 @@ mod tests {
             .unwrap()
             .to_utc();
         edit(&store, today, |b| {
-            b.profiles.insert("a".into(), ProfileBilling::default());
+            b.profiles.insert(
+                "a".into(),
+                ProfileBilling {
+                    plan: Some(Plan {
+                        label: "A".into(),
+                        fee_usd: 1.0,
+                    }),
+                    ..Default::default()
+                },
+            );
             Ok(())
         })
         .unwrap();
         edit(&store, today, |b| {
-            b.profiles.insert("b".into(), ProfileBilling::default());
+            b.profiles.insert(
+                "b".into(),
+                ProfileBilling {
+                    plan: Some(Plan {
+                        label: "B".into(),
+                        fee_usd: 1.0,
+                    }),
+                    ..Default::default()
+                },
+            );
             Ok(())
         })
         .unwrap();

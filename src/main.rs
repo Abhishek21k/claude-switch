@@ -2392,10 +2392,22 @@ mod billing_cli_tests {
         )
         .unwrap();
         let store = usage::store(&manager, None).unwrap();
+        assert_eq!(
+            reset_action(&manager, &store, "p", ResetCommand::Undo, now, offset).unwrap(),
+            "No resets recorded for p.\n"
+        );
+        assert!(!store.dir.join("billing.json").exists());
         usage::billing::edit(&store, now, |billing| {
-            billing
-                .profiles
-                .insert("q".into(), usage::billing::ProfileBilling::default());
+            billing.profiles.insert(
+                "q".into(),
+                usage::billing::ProfileBilling {
+                    plan: Some(usage::billing::Plan {
+                        label: "Q".into(),
+                        fee_usd: 1.0,
+                    }),
+                    ..Default::default()
+                },
+            );
             Ok(())
         })
         .unwrap();
