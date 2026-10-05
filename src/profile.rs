@@ -66,6 +66,20 @@ mod stage_b_tests {
     }
 
     #[test]
+    fn antigravity_profile_home_is_detected_by_path_components() {
+        // Known-bad: no guard, or a suffix-only check that matches an ordinary HOME.
+        let detect = antigravity_profile_home_name;
+        assert_eq!(
+            detect(Path::new("/tmp/user/.claude-switch/profiles/g/home")),
+            Some("g".into())
+        );
+        assert_eq!(detect(Path::new("/tmp/user")), None);
+        assert_eq!(detect(Path::new("/tmp/home")), None);
+        assert_eq!(detect(Path::new("/tmp/profiles/g/home")), None);
+        assert_eq!(detect(Path::new("/tmp/.claude-switch/other/g/home")), None);
+    }
+
+    #[test]
     fn unknown_tool_loads_and_refuses_use_and_login() {
         // Known-bad: a strict enum fails the whole registry instead of isolating the unknown profile.
         let tmp = TempDir::new().unwrap();
@@ -714,9 +728,34 @@ fn codex_source_home(home: &Path, configured: Option<&std::ffi::OsStr>) -> PathB
         .unwrap_or_else(|| home.join(".codex"))
 }
 
+/// Detect a HOME supplied by an Antigravity profile launch.
+pub fn antigravity_profile_home_name(home: &Path) -> Option<String> {
+    use std::ffi::OsStr;
+    let parts: Vec<_> = home.components().collect();
+    let [prefix @ .., profiles, name, last] = parts.as_slice() else {
+        return None;
+    };
+    if profiles.as_os_str() != OsStr::new("profiles") || last.as_os_str() != OsStr::new("home") {
+        return None;
+    }
+    if !prefix
+        .iter()
+        .any(|part| part.as_os_str() == OsStr::new(".claude-switch"))
+    {
+        return None;
+    }
+    let name = name.as_os_str().to_str()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 impl ProfileManager {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
+        if let Some(name) = antigravity_profile_home_name(&home) {
+            bail!(
+                "cswitch is running inside the Antigravity profile '{name}'. Run it from a normal shell."
+            );
+        }
         let mut manager = Self::with_base_dir(home.join(".claude-switch"))?;
         let configured = std::env::var_os("CODEX_HOME");
         manager.codex_home = codex_source_home(&home, configured.as_deref());
