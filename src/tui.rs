@@ -3367,6 +3367,44 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_login_message_and_detail_show_missing_email_and_home() {
+        // Known-bad: agy login falls through to generic wording, or detail omits HOME or uses unknown.
+        let outcome = LoginOutcome {
+            email: None,
+            same_account_as: Vec::new(),
+            tool: Tool::Antigravity,
+        };
+        assert_eq!(
+            pending_login_message("g", &outcome, None),
+            "Antigravity login completed for profile 'g' (email unavailable)."
+        );
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("g", None)]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("g").unwrap().tool = Tool::Antigravity;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.refresh().unwrap();
+        let display = render_text(&mut app);
+        assert!(display.contains("Email        —"), "{display}");
+        assert!(display.contains("Home         "), "{display}");
+        assert!(
+            display.contains(
+                &app.manager
+                    .profile_dir("g")
+                    .join("home")
+                    .display()
+                    .to_string()
+            ),
+            "{display}"
+        );
+        assert!(!display.contains("Email        unknown"));
+    }
+
+    #[test]
     fn antigravity_refresh_is_refused_with_valid_claude_source() {
         // Known-bad: a Codex-specific guard lets r replace an agy HOME with Claude data.
         let tmp = TempDir::new().unwrap();
