@@ -864,7 +864,7 @@ fn usage_info(
                 "Rate:      not set — cswitch usage rate {name} --flat <usd>\n"
             ));
         }
-        if sums[2].tokens > 0 {
+        if sums[2].tokens > 0 && sums[2].spend_priced > 0 {
             let rate = sums[2].spend * 1_000_000.0 / sums[2].tokens as f64;
             let star = if sums[2].spend_unpriced > 0 { "*" } else { "" };
             out.push_str(&format!(
@@ -925,14 +925,12 @@ fn usage_info(
         );
         if let Some(c) = report.estimate {
             let star = if c.partial { "*" } else { "" };
-            let amount = if c.after_reset.is_some() {
-                format!(
-                    "{}–{}",
-                    m::capacity_money(c.lower),
-                    m::capacity_money(c.upper)
-                )
+            let lower = m::capacity_money(c.lower);
+            let upper = m::capacity_money(c.upper);
+            let amount = if c.after_reset.is_some() && lower != upper {
+                format!("{lower}–{upper}")
             } else {
-                m::capacity_money(c.lower)
+                lower
             };
             let reset = c
                 .after_reset
@@ -2302,6 +2300,8 @@ mod billing_view_tests {
 #[cfg(test)]
 mod billing_cli_tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
     #[test]
     fn class_guards_refuse_every_wrong_profile_type() {
         // Known-bad: removing a plan, rate, reset, missing-auth or Codex class guard.
@@ -2815,6 +2815,144 @@ mod billing_cli_tests {
             &Limits::NoSnapshot,
         );
         assert!(hinted.contains("Reset:     detected between 12-30 21:00 and 01-04 21:00 — record it with cswitch usage reset p --at <YYYY-MM-DD>"),"{hinted}");
+    }
+    #[test]
+    fn equal_reset_capacity_ends_print_once_but_date_bracket_prints_range() {
+        // Known-bad: minute-form reset renders $150–$150; date bracket loses its range.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let now = at("2030-01-07T12:00:00Z");
+        let bucket = |s: &str| usage::metrics::Bucket {
+            profile: "p".into(),
+            hour: at(s),
+            model: "claude-opus-5".into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        fs::write(
+            dir.join("hourly.json"),
+            serde_json::to_vec(&usage::metrics::Hourly {
+                version: 1,
+                generated_at: now,
+                rows: vec![
+                    bucket("2030-01-04T13:00:00Z"),
+                    bucket("2030-01-06T00:00:00Z"),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("limits.jsonl"),
+            serde_json::json!({"profile":"p","fetched_at":"2030-01-06T00:00:00Z",
+                "weekly":{"percent":50,"resets_at":"2030-01-08T00:00:00Z"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let render = |reset| {
+            fs::write(
+                dir.join("billing.json"),
+                serde_json::to_vec(&usage::billing::Billing {
+                    version: 1,
+                    profiles: std::collections::BTreeMap::from([(
+                        "p".into(),
+                        usage::billing::ProfileBilling {
+                            limit_resets: vec![reset],
+                            ..Default::default()
+                        },
+                    )]),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            usage_info(
+                dir,
+                "p",
+                &key::AuthMode::Subscription,
+                now,
+                FixedOffset::east_opt(0).unwrap(),
+                &Limits::NoSnapshot,
+            )
+        };
+        let minute = at("2030-01-04T12:00:00Z");
+        let point = render(usage::billing::LimitReset {
+            from: minute,
+            to: minute,
+        });
+        assert!(
+            point.contains("weekly limit ≈ $20 of list-price usage"),
+            "{point}"
+        );
+        assert!(point.contains("after the reset on 01-04"), "{point}");
+        assert!(!point.contains("weekly limit ≈ $20–$20"), "{point}");
+        let range = render(usage::billing::LimitReset {
+            from: at("2030-01-04T00:00:00Z"),
+            to: at("2030-01-05T00:00:00Z"),
+        });
+        assert!(
+            range.contains("weekly limit ≈ $10–$20 of list-price usage"),
+            "{range}"
+        );
+    }
+    #[test]
+    fn effective_rate_needs_priced_spend_and_marks_partial_spend() {
+        // Known-bads: $0.00* when all tokens are unpriced; dropping * for mixed spend.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let now = DateTime::parse_from_rfc3339("2030-01-08T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let bucket = |model: &str| usage::metrics::Bucket {
+            profile: "p".into(),
+            hour: now - chrono::Duration::hours(1),
+            model: model.into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        };
+        fs::write(
+            dir.join("billing.json"),
+            serde_json::json!({"version":1,"profiles":{"p":{"rate":{"model_prefixes":["acme/priced"],"flat":1.0}}}}).to_string(),
+        )
+        .unwrap();
+        let render = |rows| {
+            fs::write(
+                dir.join("hourly.json"),
+                serde_json::to_vec(&usage::metrics::Hourly {
+                    version: 1,
+                    generated_at: now,
+                    rows,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            usage_info(
+                dir,
+                "p",
+                &key::AuthMode::ApiKey(None),
+                now,
+                FixedOffset::east_opt(0).unwrap(),
+                &Limits::NoSnapshot,
+            )
+        };
+        let unpriced = render(vec![bucket("acme/unknown")]);
+        assert!(!unpriced.contains("Effective:"), "{unpriced}");
+        let mixed = render(vec![bucket("acme/unknown"), bucket("acme/priced")]);
+        assert!(
+            mixed.contains("Effective: $0.50* per 1M tokens over 30 days"),
+            "{mixed}"
+        );
     }
     #[test]
     fn effective_spend_and_rate_line_keep_subdollar_precision() {
