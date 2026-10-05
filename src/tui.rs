@@ -3477,8 +3477,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("plan", Some("plan@example.com"))]);
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let ingest_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_finished = std::sync::Arc::clone(&ingest_finished);
         app.start_ingest_with(move || {
-            release_rx.recv().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            worker_finished.store(true, std::sync::atomic::Ordering::SeqCst);
             IngestOutcome::Updated
         });
         let (draw_tx, draw_rx) = mpsc::channel();
@@ -3487,8 +3490,9 @@ mod tests {
             draw_tx.send(app).unwrap();
         });
         let early = draw_rx.recv_timeout(Duration::from_secs(1));
-        let drew_before_ingest = early.is_ok();
-        release_tx.send(()).unwrap();
+        let drew_before_ingest = early.is_ok()
+            && !ingest_finished.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = release_tx.send(());
         let mut app = match early {
             Ok(app) => app,
             Err(_) => draw_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
