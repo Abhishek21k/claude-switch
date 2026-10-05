@@ -202,6 +202,8 @@ Nested Git repositories take priority over folder globs. Explicit labels and `/r
 
 Run `cswitch` with no arguments to open the TUI.
 
+The profile list places each Claude profile's `30D $` value on its name line. The detail panel shows the same usage, rate or plan, effective-rate, and capacity lines as `cswitch info`, below the plan limits. The TUI ingests transcript usage in the background when it opens and refreshes the display when ingestion finishes. A busy ledger or ingest error appears in the panel; billing settings remain CLI commands.
+
 ```
 ┌─ ◆ claude-switch  profile manager ──────── 3 profiles ┐
 ┌─ Profiles ────────┐┌─ Details ─────────────────────────┐
