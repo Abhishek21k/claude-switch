@@ -725,6 +725,7 @@ mod agy_remove_tests {
 
     #[test]
     fn agy_remove_refuses_local_before_purging_usage_and_force_removes() {
+        // Known-bad: no local-entry check, or a check after the usage purge.
         let (tmp, manager) = setup(Tool::Antigravity);
         let home = manager.profile_dir("g").join("home");
         fs::write(home.join("local-note"), b"keep exactly").unwrap();
@@ -757,6 +758,7 @@ mod agy_remove_tests {
 
     #[test]
     fn agy_remove_accepts_links_and_gemini_without_force() {
+        // Known-bad: .gemini or farm links counted as local entries.
         let (tmp, manager) = setup(Tool::Antigravity);
         let real_entry = tmp.path().join("real-entry");
         fs::write(&real_entry, b"real intact").unwrap();
@@ -768,6 +770,7 @@ mod agy_remove_tests {
 
     #[test]
     fn remove_force_is_optional_for_existing_tools() {
+        // Known-bad: applying the Antigravity local-entry guard to Claude or Codex.
         for tool in [Tool::Claude, Tool::Codex] {
             let (_tmp, manager) = setup(tool);
             fs::write(
@@ -782,6 +785,7 @@ mod agy_remove_tests {
 
     #[test]
     fn local_summary_is_sorted_and_bounded() {
+        // Known-bad: raw unsorted names or an unbounded refusal message.
         let entries = (0..12)
             .rev()
             .map(|n| format!("entry-{n:02}"))

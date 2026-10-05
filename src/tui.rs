@@ -3262,6 +3262,7 @@ mod tests {
 
     #[test]
     fn agy_delete_dialog_names_local_entries_and_confirmation_removes() {
+        // Known-bad: the delete dialog hides profile-only entries before y deletes them.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("g", None)]);
         let mut registry = app.manager.load_registry().unwrap();
