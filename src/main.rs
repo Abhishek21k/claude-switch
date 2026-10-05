@@ -1596,7 +1596,9 @@ fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
         io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        if io::stdin().read_line(&mut input)? == 0 {
+            anyhow::bail!("No answer on standard input. Nothing was changed.");
+        }
 
         if let Some(c) = input.trim().chars().next() {
             let c = c.to_ascii_lowercase();
