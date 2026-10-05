@@ -2265,6 +2265,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn antigravity_list_row_ignores_claude_limit_cache() {
+        // Known-bad: only Codex skips the Claude list path.
+        let temp = TempDir::new().unwrap();
+        let manager = ProfileManager::with_base_dir(temp.path().join(".claude-switch")).unwrap();
+        let mut registry = Registry::default();
+        registry.profiles.insert(
+            "g".into(),
+            Profile {
+                name: "g".into(),
+                tool: Tool::Antigravity,
+                email: None,
+                added: Utc::now(),
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("g")).unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-01-07T13:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cache = serde_json::json!({
+            "oauthAccount": {"accountUuid":"00000000-0000-4000-8000-000000000001"},
+            "cachedUsageUtilization": {
+                "accountUuid":"00000000-0000-4000-8000-000000000001",
+                "fetchedAtMs":now.timestamp_millis(),
+                "utilization":{"limits":[
+                    {"kind":"session","group":"session","percent":12,"severity":"normal","resets_at":"2030-01-07T15:00:00Z"},
+                    {"kind":"weekly_all","group":"weekly","percent":88,"severity":"normal","resets_at":"2030-01-10T20:00:00Z"}
+                ]}
+            }
+        });
+        fs::write(
+            manager.profile_dir("g").join(".claude.json"),
+            cache.to_string(),
+        )
+        .unwrap();
+        let output = list_output(&manager, now).unwrap();
+        assert!(output.lines().all(|line| line.chars().count() <= 120));
+        let row = output.lines().find(|line| line.starts_with("g ")).unwrap();
+        let cells: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(cells[1], "antigravity");
+        assert_eq!(&cells[3..7], &["—", "—", "—", "—"]);
+    }
+
     fn mixed_tool_manager(tmp: &TempDir) -> ProfileManager {
         let manager =
             ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join(".claude"))
