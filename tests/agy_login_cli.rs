@@ -38,7 +38,7 @@ case "$AGY_TEST_CASE" in
     token) printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ;;
     empty) : > "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ;;
 esac
-exit 0
+exit "$AGY_SIGNIN_EXIT"
 "#,
     )
     .unwrap();
@@ -46,10 +46,11 @@ exit 0
     perms.set_mode(0o755);
     fs::set_permissions(&script, perms).unwrap();
 
-    for (case, token, models_exit, succeeds, expected_message) in [
+    for (case, token, signin_exit, models_exit, succeeds, expected_message) in [
         (
             "token",
             OWN_TOKEN,
+            "0",
             "0",
             true,
             "Profile 'g' registered (account: o@example.com).",
@@ -58,6 +59,7 @@ exit 0
             "none",
             OWN_TOKEN,
             "0",
+            "0",
             false,
             "Antigravity did not leave a login token.",
         ),
@@ -65,12 +67,14 @@ exit 0
             "empty",
             OWN_TOKEN,
             "0",
+            "0",
             false,
             "Antigravity left an empty login token.",
         ),
         (
             "token",
             OWN_TOKEN,
+            "0",
             "1",
             false,
             "Antigravity models check failed.",
@@ -79,8 +83,27 @@ exit 0
             "token",
             NO_EMAIL_TOKEN,
             "0",
+            "0",
             true,
             "Antigravity login completed for profile 'g' (email unavailable).",
+        ),
+        // Known-bad: rejecting sign-in exit 1 even after a good token and models check.
+        (
+            "token",
+            OWN_TOKEN,
+            "1",
+            "0",
+            true,
+            "Profile 'g' registered (account: o@example.com).",
+        ),
+        // Known-bad: exit 1 masks the precise missing-token refusal.
+        (
+            "none",
+            OWN_TOKEN,
+            "1",
+            "0",
+            false,
+            "Antigravity did not leave a login token.",
         ),
     ] {
         let temp = TempDir::new().unwrap();
@@ -103,6 +126,7 @@ exit 0
             .env("AGY_TEST_LOG", &call_log)
             .env("AGY_TEST_CASE", case)
             .env("AGY_TEST_TOKEN", token)
+            .env("AGY_SIGNIN_EXIT", signin_exit)
             .env("AGY_MODELS_EXIT", models_exit)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

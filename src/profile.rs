@@ -1324,17 +1324,12 @@ impl ProfileManager {
             let home = agy::profile_home(&profile_dir);
             agy::seed_gemini(real_home, &home)?;
             println!("Sign in to Antigravity for profile '{name}', then exit agy.");
-            let login_ok = std::process::Command::new(agy::AGY_PROGRAM)
+            std::process::Command::new(agy::AGY_PROGRAM)
                 .env("HOME", &home)
                 .status()
-                .context("Failed to launch agy. Is it installed and in your PATH?")?
-                .success();
-            let token = if login_ok {
-                agy::token_state(&home)
-            } else {
-                TokenState::Missing
-            };
-            let models_ok = if login_ok && token == TokenState::NonEmpty {
+                .context("Failed to launch agy. Is it installed and in your PATH?")?;
+            let token = agy::token_state(&home);
+            let models_ok = if token == TokenState::NonEmpty {
                 std::process::Command::new(agy::AGY_PROGRAM)
                     .args(agy::AGY_AUTH_CHECK_ARGS)
                     .env("HOME", &home)
@@ -1346,8 +1341,8 @@ impl ProfileManager {
             } else {
                 false
             };
-            agy_login_verdict(login_ok, token, models_ok)
-                .map_err(|reason| anyhow::anyhow!(reason.message(name)))?;
+            agy_login_verdict(token, models_ok)
+                .map_err(|reason| anyhow::anyhow!(reason.message()))?;
             let email = fs::read(home.join(agy::AGY_TOKEN_RELATIVE))
                 .ok()
                 .and_then(|bytes| agy::identity_from_token(&bytes));
@@ -1646,37 +1641,27 @@ fn codex_login_verdict(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgyLoginRefusal {
-    LoginFailed,
     MissingToken,
     EmptyToken,
     ModelsFailed,
 }
 
 impl AgyLoginRefusal {
-    fn message(self, name: &str) -> String {
+    fn message(self) -> &'static str {
         match self {
-            Self::LoginFailed => {
-                format!("Antigravity sign-in failed for profile '{name}'. Nothing was registered.")
-            }
             Self::MissingToken => {
-                "Antigravity did not leave a login token. Nothing was registered.".into()
+                "Antigravity did not leave a login token. Nothing was registered."
             }
-            Self::EmptyToken => {
-                "Antigravity left an empty login token. Nothing was registered.".into()
-            }
-            Self::ModelsFailed => "Antigravity models check failed. Nothing was registered.".into(),
+            Self::EmptyToken => "Antigravity left an empty login token. Nothing was registered.",
+            Self::ModelsFailed => "Antigravity models check failed. Nothing was registered.",
         }
     }
 }
 
 fn agy_login_verdict(
-    login_ok: bool,
     token: TokenState,
     models_ok: bool,
 ) -> std::result::Result<(), AgyLoginRefusal> {
-    if !login_ok {
-        return Err(AgyLoginRefusal::LoginFailed);
-    }
     match token {
         TokenState::Missing => return Err(AgyLoginRefusal::MissingToken),
         TokenState::Empty => return Err(AgyLoginRefusal::EmptyToken),
@@ -3599,23 +3584,12 @@ mod stage_c_tests {
     }
 
     #[test]
-    fn agy_login_command_failure_has_own_reason() {
-        // Known-bad: a failed sign-in is reported as a missing token or a models failure.
-        assert_eq!(
-            agy_login_verdict(false, TokenState::Missing, false)
-                .unwrap_err()
-                .message("g"),
-            "Antigravity sign-in failed for profile 'g'. Nothing was registered."
-        );
-    }
-
-    #[test]
     fn agy_missing_token_refuses_registration() {
         // Known-bad: trusting sign-in's exit code alone registers a profile with no token.
         assert_eq!(
-            agy_login_verdict(true, TokenState::Missing, false)
+            agy_login_verdict(TokenState::Missing, false)
                 .unwrap_err()
-                .message("g"),
+                .message(),
             "Antigravity did not leave a login token. Nothing was registered."
         );
     }
@@ -3624,9 +3598,9 @@ mod stage_c_tests {
     fn agy_empty_token_refuses_registration() {
         // Known-bad: mere presence of an empty token passes login verification.
         assert_eq!(
-            agy_login_verdict(true, TokenState::Empty, false)
+            agy_login_verdict(TokenState::Empty, false)
                 .unwrap_err()
-                .message("g"),
+                .message(),
             "Antigravity left an empty login token. Nothing was registered."
         );
     }
@@ -3635,9 +3609,9 @@ mod stage_c_tests {
     fn agy_models_failure_refuses_registration() {
         // Known-bad: a populated token is trusted even when agy models rejects it.
         assert_eq!(
-            agy_login_verdict(true, TokenState::NonEmpty, false)
+            agy_login_verdict(TokenState::NonEmpty, false)
                 .unwrap_err()
-                .message("g"),
+                .message(),
             "Antigravity models check failed. Nothing was registered."
         );
     }
@@ -3645,7 +3619,7 @@ mod stage_c_tests {
     #[test]
     fn agy_login_verdict_accepts_wired_success() {
         // Known-bad: valid sign-in, token and models check still refuse registration.
-        assert_eq!(agy_login_verdict(true, TokenState::NonEmpty, true), Ok(()));
+        assert_eq!(agy_login_verdict(TokenState::NonEmpty, true), Ok(()));
     }
 
     #[test]
