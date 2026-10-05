@@ -101,6 +101,9 @@ pub struct App {
     /// opens, because profiles run concurrently and the one being overwritten
     /// may be open in another terminal.
     selected_in_use: Option<u64>,
+    /// Top-level files that exist only in an Antigravity profile HOME.
+    /// Captured when the delete dialog opens.
+    selected_local_entries: Vec<String>,
     /// Whether the selected profile holds conversation content that a refresh
     /// would destroy. Resolved alongside `selected_in_use`, for the same
     /// reason: the confirmation should name every consequence, not just the
@@ -280,6 +283,7 @@ impl App {
             claude_dir_found,
             current_account: None,
             selected_in_use: None,
+            selected_local_entries: Vec::new(),
             selected_has_history: false,
             selected_has_key: false,
             pending: None,
@@ -826,6 +830,12 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete => {
                 if self.selected_profile().is_some() {
                     self.selected_in_use = self.selected_session_age();
+                    self.selected_local_entries = self
+                        .selected_profile()
+                        .filter(|profile| profile.tool == Tool::Antigravity)
+                        .and_then(|profile| self.manager.agy_farm_health(&profile.name).ok())
+                        .map(|health| health.local)
+                        .unwrap_or_default();
                     self.mode = Mode::ConfirmDelete;
                 }
             }
@@ -1955,6 +1965,21 @@ impl App {
             )));
             lines.push(Line::from(Span::styled(
                 "  Deleting pulls the config out from under that terminal.",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        if !self.selected_local_entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Local HOME entries: {}",
+                    crate::agy::local_summary(&self.selected_local_entries, 5)
+                ),
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  They exist only in this profile and will be deleted.",
                 Style::default().fg(DANGER),
             )));
             lines.push(Line::from(""));
@@ -3233,6 +3258,33 @@ mod tests {
 
         assert_eq!(app.mode, Mode::ConfirmDelete);
         assert!(app.selected_in_use.is_some());
+    }
+
+    #[test]
+    fn agy_delete_dialog_names_local_entries_and_confirmation_removes() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("g", None)]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("g").unwrap().tool = Tool::Antigravity;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.refresh().unwrap();
+        let home = app.manager.profile_dir("g").join("home");
+        fs::create_dir_all(home.join(".gemini")).unwrap();
+        fs::write(home.join("my-local-note"), b"local").unwrap();
+
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        let text = render_text(&mut app);
+        assert!(text.contains("my-local-note"), "{text}");
+        assert!(text.contains("exist only in this profile"), "{text}");
+        app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
+        assert!(app.manager.get_profile("g").is_err());
+        assert!(!home.exists());
     }
 
     #[test]

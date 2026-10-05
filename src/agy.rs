@@ -179,6 +179,25 @@ pub fn farm_health(home: &Path) -> Result<FarmHealth> {
     Ok(health)
 }
 
+pub fn local_summary(entries: &[String], limit: usize) -> String {
+    let mut names: Vec<String> = entries
+        .iter()
+        .map(|name| name.replace(['\r', '\n'], " "))
+        .collect();
+    names.sort();
+    let shown = names
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > limit {
+        format!("{shown}, and {} more", names.len() - limit)
+    } else {
+        shown
+    }
+}
+
 pub fn activity_root_is_local(profile_dir: &Path) -> bool {
     AGY_ACTIVITY_MARKERS
         .iter()

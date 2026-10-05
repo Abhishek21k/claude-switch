@@ -121,6 +121,9 @@ enum Commands {
         /// Also delete this profile's token ledger rows, billing settings and limit history
         #[arg(long)]
         purge_usage: bool,
+        /// Confirm deletion of local files in an Antigravity profile's HOME
+        #[arg(long)]
+        force: bool,
     },
 
     /// Launch the selected profile's tool
@@ -459,9 +462,13 @@ fn main() -> Result<()> {
             ),
         },
 
-        Some(Commands::Remove { name, purge_usage }) => {
+        Some(Commands::Remove {
+            name,
+            purge_usage,
+            force,
+        }) => {
             let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
-            match remove_profile_with_usage(&manager, &name, purge_usage, directory) {
+            match remove_profile_with_usage(&manager, &name, purge_usage, force, directory) {
                 Ok(_) => println!("Profile '{}' removed.", name),
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -661,14 +668,128 @@ fn remove_profile_with_usage(
     manager: &ProfileManager,
     name: &str,
     purge_usage: bool,
+    force: bool,
     directory: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    let profile = manager.get_profile(name)?;
+    if profile.tool == Tool::Antigravity && !force {
+        let local = manager
+            .agy_farm_health(name)
+            .map(|health| health.local)
+            .unwrap_or_default();
+        if !local.is_empty() {
+            anyhow::bail!(
+                "Profile '{name}' has local HOME entries: {}. Removing the profile deletes them. Run: cswitch remove {name} --force",
+                agy::local_summary(&local, 10)
+            );
+        }
+    }
     if purge_usage {
-        manager.get_profile(name)?;
         let store = usage::store(manager, directory)?;
         usage::billing::purge(&store, name)?;
     }
     manager.remove_profile(name)
+}
+
+#[cfg(all(test, unix))]
+mod agy_remove_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn setup(tool: Tool) -> (TempDir, ProfileManager) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager =
+            ProfileManager::with_paths(tmp.path().join("switch"), tmp.path().join("real/.claude"))
+                .unwrap();
+        let mut registry = manager.load_registry().unwrap();
+        registry.profiles.insert(
+            "g".into(),
+            profile::Profile {
+                name: "g".into(),
+                tool,
+                email: None,
+                added: Utc::now(),
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir("g").join("home/.gemini")).unwrap();
+        (tmp, manager)
+    }
+
+    #[test]
+    fn agy_remove_refuses_local_before_purging_usage_and_force_removes() {
+        let (tmp, manager) = setup(Tool::Antigravity);
+        let home = manager.profile_dir("g").join("home");
+        fs::write(home.join("local-note"), b"keep exactly").unwrap();
+        let usage = tmp.path().join("usage");
+        fs::create_dir(&usage).unwrap();
+        let usage_path = usage.join("billing.json");
+        fs::write(&usage_path, b"{bad").unwrap();
+        let registry_path = manager.base_dir.join("registry.json");
+        let registry_before = fs::read(&registry_path).unwrap();
+        let error = remove_profile_with_usage(&manager, "g", true, false, Some(usage))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("local-note") && error.contains("cswitch remove g --force"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(fs::read(&usage_path).unwrap(), b"{bad");
+        assert_eq!(fs::read(home.join("local-note")).unwrap(), b"keep exactly");
+        assert!(manager.profile_dir("g").exists());
+
+        let real_entry = tmp.path().join("real-entry");
+        fs::write(&real_entry, b"real intact").unwrap();
+        symlink(&real_entry, home.join("linked")).unwrap();
+        remove_profile_with_usage(&manager, "g", false, true, None).unwrap();
+        assert!(!manager.profile_dir("g").exists());
+        assert!(manager.get_profile("g").is_err());
+        assert_eq!(fs::read(real_entry).unwrap(), b"real intact");
+    }
+
+    #[test]
+    fn agy_remove_accepts_links_and_gemini_without_force() {
+        let (tmp, manager) = setup(Tool::Antigravity);
+        let real_entry = tmp.path().join("real-entry");
+        fs::write(&real_entry, b"real intact").unwrap();
+        symlink(&real_entry, manager.profile_dir("g").join("home/linked")).unwrap();
+        remove_profile_with_usage(&manager, "g", false, false, None).unwrap();
+        assert_eq!(fs::read(real_entry).unwrap(), b"real intact");
+        assert!(manager.get_profile("g").is_err());
+    }
+
+    #[test]
+    fn remove_force_is_optional_for_existing_tools() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            let (_tmp, manager) = setup(tool);
+            fs::write(
+                manager.profile_dir("g").join("home/local-note"),
+                b"only here",
+            )
+            .unwrap();
+            remove_profile_with_usage(&manager, "g", false, false, None).unwrap();
+            assert!(manager.get_profile("g").is_err());
+        }
+    }
+
+    #[test]
+    fn local_summary_is_sorted_and_bounded() {
+        let entries = (0..12)
+            .rev()
+            .map(|n| format!("entry-{n:02}"))
+            .collect::<Vec<_>>();
+        let summary = agy::local_summary(&entries, 10);
+        assert!(summary.starts_with("entry-00, entry-01"));
+        assert!(summary.ends_with("entry-09, and 2 more"));
+    }
 }
 
 fn require_billing_class(
@@ -2838,7 +2959,7 @@ mod billing_cli_tests {
         std::fs::write(usage.join("limits.jsonl"), &history).unwrap();
         std::fs::write(usage.join("billing.json"), b"{bad").unwrap();
         assert!(
-            remove_profile_with_usage(&manager, "p", true, None)
+            remove_profile_with_usage(&manager, "p", true, false, None)
                 .unwrap_err()
                 .to_string()
                 .contains("billing.json")
@@ -2854,7 +2975,7 @@ mod billing_cli_tests {
             r#"{"version":1,"profiles":{"p":{},"q":{}}}"#,
         )
         .unwrap();
-        remove_profile_with_usage(&manager, "p", true, None).unwrap();
+        remove_profile_with_usage(&manager, "p", true, false, None).unwrap();
         assert!(manager.get_profile("p").is_err());
         assert!(manager.get_profile("q").is_ok());
         assert_eq!(
