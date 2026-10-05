@@ -920,8 +920,9 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
             match manager.agy_farm_health(name) {
                 Ok(health) => {
                     output.push_str(&format!(
-                        "Farm:      {} links, {} dangling\nLocal:     {}\n",
+                        "Farm:      {} {}, {} dangling\nLocal:     {}\n",
                         health.links,
+                        if health.links == 1 { "link" } else { "links" },
                         health.dangling,
                         if health.local.is_empty() {
                             "—".into()
@@ -2252,10 +2253,7 @@ mod tests {
             )),
             "{output}"
         );
-        assert!(
-            output.contains("Farm:      1 links, 0 dangling"),
-            "{output}"
-        );
+        assert!(output.contains("Farm:      1 link, 0 dangling"), "{output}");
         assert!(output.contains("Local:     local"), "{output}");
         assert_eq!(
             require_billing_class(&manager, "g", true, "rates")

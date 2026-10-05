@@ -1424,6 +1424,21 @@ impl ProfileManager {
             agy::link_farm(real_home, &profile_dir)?;
             let home = agy::profile_home(&profile_dir);
             agy::seed_gemini(real_home, &home)?;
+            let copied: Vec<&str> = agy::AGY_SEED_ALLOWLIST
+                .iter()
+                .copied()
+                .filter(|relative| {
+                    fs::symlink_metadata(home.join(".gemini").join(relative)).is_ok()
+                })
+                .collect();
+            if copied.is_empty() {
+                println!("Antigravity seed from ~/.gemini: nothing to copy.");
+            } else {
+                println!(
+                    "Antigravity seed from ~/.gemini: copied {}.",
+                    copied.join(", ")
+                );
+            }
             println!("Sign in to Antigravity for profile '{name}', then exit agy.");
             std::process::Command::new(agy::AGY_PROGRAM)
                 .env("HOME", &home)

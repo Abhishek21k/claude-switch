@@ -112,6 +112,9 @@ exit "$AGY_SIGNIN_EXIT"
         let home = temp.path().join("home");
         fs::create_dir(&home).unwrap();
         plant_home(&home);
+        if token == NO_EMAIL_TOKEN {
+            fs::remove_dir_all(home.join(".gemini/skills")).unwrap();
+        }
         let call_log = temp.path().join("agy-calls");
         let args = if succeeds && token == OWN_TOKEN {
             ["add", "g", "--tool", "agy"]
@@ -142,6 +145,17 @@ exit "$AGY_SIGNIN_EXIT"
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(message.contains(expected_message), "case {case}: {message}");
+        if token == NO_EMAIL_TOKEN {
+            assert!(
+                message.contains("Antigravity seed from ~/.gemini: nothing to copy."),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.contains("Antigravity seed from ~/.gemini: copied skills."),
+                "{message}"
+            );
+        }
 
         let base = home.join(".claude-switch");
         let profile_dir = base.join("profiles/g");
@@ -159,10 +173,12 @@ exit "$AGY_SIGNIN_EXIT"
             } else {
                 assert!(registry["profiles"]["g"]["email"].is_null());
             }
-            assert_eq!(
-                fs::read(profile_dir.join("home/.gemini/skills/warm/entry")).unwrap(),
-                b"warm skill"
-            );
+            if token != NO_EMAIL_TOKEN {
+                assert_eq!(
+                    fs::read(profile_dir.join("home/.gemini/skills/warm/entry")).unwrap(),
+                    b"warm skill"
+                );
+            }
             assert_eq!(
                 fs::read_to_string(
                     profile_dir.join("home/.gemini/antigravity-cli/antigravity-oauth-token")
