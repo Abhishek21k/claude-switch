@@ -510,7 +510,16 @@ mod tests {
         let valid = Billing {
             version: 1,
             profiles: BTreeMap::from([
-                ("p".into(), ProfileBilling::default()),
+                (
+                    "p".into(),
+                    ProfileBilling {
+                        plan: Some(Plan {
+                            label: "P".into(),
+                            fee_usd: 1.0,
+                        }),
+                        ..Default::default()
+                    },
+                ),
                 (
                     "q".into(),
                     ProfileBilling {
@@ -582,6 +591,74 @@ mod tests {
         let mut expected = torn.to_vec();
         expected.extend_from_slice(format!("\n{}\r\n", row("q")).as_bytes());
         assert_eq!(fs::read(&path).unwrap(), expected);
+    }
+    #[test]
+    fn purge_without_matching_history_keeps_history_bytes_and_mtime() {
+        // Known-bad: rewriting unchanged limits.jsonl during an unrelated purge.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().to_path_buf(), vec![]);
+        let path = tmp.path().join("limits.jsonl");
+        let original = b"{\"profile\":\"q\",\"fetched_at\":\"2030-01-03T00:00:00Z\",\"weekly\":{\"percent\":50,\"resets_at\":\"2030-01-08T00:00:00Z\"}}\r\n";
+        fs::write(&path, original).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        purge(&store, "p").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+    }
+    #[test]
+    fn unreadable_history_names_file_and_preserves_ledger_and_billing() {
+        // Known-bad: an unnamed limits.jsonl read error, or purging before that error.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        let project = profile.join("projects/demo");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("a.jsonl"),
+            serde_json::json!({
+                "type":"assistant","timestamp":"2030-01-01T12:05:00Z","sessionId":"s",
+                "requestId":"r","message":{"id":"m","model":"claude-opus-5",
+                    "usage":{"input_tokens":10}}
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let store = Store::new(
+            tmp.path().join("usage"),
+            vec![Source {
+                profile: "p".into(),
+                directory: profile,
+            }],
+        );
+        store.ingest().unwrap();
+        let ledger_before = serde_json::to_vec(&store.load().unwrap().requests).unwrap();
+        let billing_path = store.dir.join("billing.json");
+        fs::write(
+            &billing_path,
+            serde_json::json!({"version":1,"profiles":{"p":{
+            "plan":{"label":"P","fee_usd":1.0}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let billing_before = fs::read(&billing_path).unwrap();
+        fs::create_dir(store.dir.join("limits.jsonl")).unwrap();
+        let error = purge(&store, "p").unwrap_err().to_string();
+        assert!(error.contains("limits.jsonl"), "{error}");
+        assert_eq!(
+            serde_json::to_vec(&store.load().unwrap().requests).unwrap(),
+            ledger_before
+        );
+        assert_eq!(fs::read(&billing_path).unwrap(), billing_before);
     }
     #[test]
     fn empty_billing_edits_and_unrelated_purge_do_not_write_settings() {
