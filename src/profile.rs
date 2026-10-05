@@ -1013,7 +1013,10 @@ impl ProfileManager {
                 .base_dir
                 .parent()
                 .context("Profile base has no parent")?;
-            agy::link_farm(real_home, &profile_dir)?;
+            let report = agy::link_farm(real_home, &profile_dir)?;
+            if let Some(warning) = agy::link_farm_warning(&report) {
+                warnings.push(warning.to_string());
+            }
         }
         if profile.tool == Tool::Claude {
             match self.sync_skills(

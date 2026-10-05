@@ -26,6 +26,17 @@ pub const AGY_ACTIVITY_MARKERS: &[&str] = &[
 
 const FARM_MANIFEST: &str = "agy-links.json";
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LinkFarmReport {
+    pub unreadable_record: bool,
+}
+
+pub fn link_farm_warning(report: &LinkFarmReport) -> Option<&'static str> {
+    report.unreadable_record.then_some(
+        "could not read agy-links.json; old dangling links were kept and the record was rebuilt",
+    )
+}
+
 pub fn ensure_supported(unix: bool) -> Result<()> {
     if !unix {
         bail!("Antigravity profiles are supported on Unix only.");
@@ -160,7 +171,7 @@ pub fn activity_root_is_local(profile_dir: &Path) -> bool {
 }
 
 #[cfg(unix)]
-pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<()> {
+pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<LinkFarmReport> {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
@@ -183,10 +194,25 @@ pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let manifest = profile_dir.join(FARM_MANIFEST);
-    let mut created: Vec<Vec<u8>> = match fs::read(&manifest) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
+    let (mut created, report): (Vec<Vec<u8>>, LinkFarmReport) = match fs::read(&manifest) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(names) => (names, LinkFarmReport::default()),
+            Err(_) => (
+                Vec::new(),
+                LinkFarmReport {
+                    unreadable_record: true,
+                },
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (Vec::new(), LinkFarmReport::default())
+        }
+        Err(_) => (
+            Vec::new(),
+            LinkFarmReport {
+                unreadable_record: true,
+            },
+        ),
     };
     let mut retained = Vec::new();
     for raw_name in created.drain(..) {
@@ -229,11 +255,11 @@ pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<()> {
         created.push(name.as_bytes().to_vec());
     }
     atomic::write(&manifest, &serde_json::to_vec(&created)?)?;
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(not(unix))]
-pub fn link_farm(_real_home: &Path, _profile_dir: &Path) -> Result<()> {
+pub fn link_farm(_real_home: &Path, _profile_dir: &Path) -> Result<LinkFarmReport> {
     ensure_supported(false)
 }
 
@@ -293,6 +319,33 @@ mod tests {
         assert!(fs::symlink_metadata(home.join("foreign")).is_ok());
         assert_eq!(fs::read_link(home.join("new")).unwrap(), real.join("new"));
         assert_eq!(farm_health(&home).unwrap().dangling, 1);
+    }
+
+    #[test]
+    fn damaged_link_record_is_rebuilt_without_deleting_old_links() {
+        // Known-bad: serde_json::from_slice(&bytes)? blocks every launch on a damaged record.
+        for damaged in [b"not json".as_slice(), b"{}".as_slice()] {
+            let (_temp, real, profile) = fixture();
+            assert_eq!(
+                link_farm(&real, &profile).unwrap(),
+                LinkFarmReport::default()
+            );
+            let home = profile_home(&profile);
+            fs::remove_file(real.join("note")).unwrap();
+            fs::write(home.join("local"), b"local bytes").unwrap();
+            fs::write(real.join("new"), b"new bytes").unwrap();
+            fs::write(profile.join(FARM_MANIFEST), damaged).unwrap();
+
+            let report = link_farm(&real, &profile).unwrap();
+            assert!(report.unreadable_record);
+            assert!(link_farm_warning(&report).unwrap().contains(FARM_MANIFEST));
+            assert_eq!(fs::read_link(home.join("note")).unwrap(), real.join("note"));
+            assert_eq!(fs::read(home.join("local")).unwrap(), b"local bytes");
+            assert_eq!(fs::read_link(home.join("new")).unwrap(), real.join("new"));
+            let names: Vec<Vec<u8>> =
+                serde_json::from_slice(&fs::read(profile.join(FARM_MANIFEST)).unwrap()).unwrap();
+            assert!(!names.is_empty());
+        }
     }
 
     #[test]
