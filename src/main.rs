@@ -769,6 +769,28 @@ mod agy_remove_tests {
     }
 
     #[test]
+    fn agy_remove_accepts_missing_or_linked_home_without_force() {
+        // Known-bad: propagating farm_health errors blocks removal of an unreadable farm.
+        for linked in [false, true] {
+            let (tmp, manager) = setup(Tool::Antigravity);
+            let home = manager.profile_dir("g").join("home");
+            fs::remove_dir_all(&home).unwrap();
+            let outside = tmp.path().join("outside");
+            if linked {
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("keep"), b"outside intact").unwrap();
+                symlink(&outside, &home).unwrap();
+            }
+            remove_profile_with_usage(&manager, "g", false, false, None).unwrap();
+            assert!(manager.get_profile("g").is_err());
+            assert!(!manager.profile_dir("g").exists());
+            if linked {
+                assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside intact");
+            }
+        }
+    }
+
+    #[test]
     fn remove_force_is_optional_for_existing_tools() {
         // Known-bad: applying the Antigravity local-entry guard to Claude or Codex.
         for tool in [Tool::Claude, Tool::Codex] {
