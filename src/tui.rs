@@ -3408,6 +3408,11 @@ mod tests {
                 );
             }
             assert!(text.contains("and 3 more"), "{width}x{height}: {text}");
+            // Known-bad: dropping the first loss-warning line hides where local files live.
+            assert!(
+                text.contains("They exist only in this profile"),
+                "{width}x{height}: {text}"
+            );
             assert!(
                 text.contains("will be deleted."),
                 "{width}x{height}: {text}"

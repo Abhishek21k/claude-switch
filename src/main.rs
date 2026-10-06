@@ -2331,6 +2331,20 @@ mod tests {
             "{two_links}"
         );
         assert!(output.contains("Local:     local"), "{output}");
+        // Known-bad: reusing remove's ten-entry limit truncates info's Local line.
+        let mut expected_local = vec!["local".to_string()];
+        for n in 1..=11 {
+            let name = format!("local-{n:02}");
+            fs::write(agy::profile_home(&profile_dir).join(&name), b"synthetic").unwrap();
+            expected_local.push(name);
+        }
+        let all_local = info_output(&manager, "g", Utc::now()).unwrap();
+        let local_line = all_local
+            .lines()
+            .find_map(|line| line.strip_prefix("Local:     "))
+            .unwrap();
+        assert_eq!(local_line.split(", ").collect::<Vec<_>>(), expected_local);
+        assert!(!local_line.contains("more"), "{all_local}");
         assert_eq!(
             require_billing_class(&manager, "g", true, "rates")
                 .unwrap_err()
