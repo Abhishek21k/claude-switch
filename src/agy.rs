@@ -3,7 +3,7 @@
 use crate::atomic;
 use crate::codex::jwt_claims;
 use crate::profile::{copy_dir_all_filtered, copy_symlink};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -182,7 +182,7 @@ pub fn farm_health(home: &Path) -> Result<FarmHealth> {
 pub fn local_summary(entries: &[String], limit: usize) -> String {
     let mut names: Vec<String> = entries
         .iter()
-        .map(|name| name.replace(['\r', '\n'], " "))
+        .map(|name| sanitize_local_name(name))
         .collect();
     names.sort();
     let shown = names
@@ -196,6 +196,12 @@ pub fn local_summary(entries: &[String], limit: usize) -> String {
     } else {
         shown
     }
+}
+
+pub fn sanitize_local_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 pub fn activity_root_is_local(profile_dir: &Path) -> bool {
@@ -288,7 +294,8 @@ pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<LinkFarmReport>
         symlink(entry.path(), &destination)?;
         created.push(name.as_bytes().to_vec());
     }
-    atomic::write(&manifest, &serde_json::to_vec(&created)?)?;
+    atomic::write(&manifest, &serde_json::to_vec(&created)?)
+        .with_context(|| format!("Could not write {}", manifest.display()))?;
     Ok(report)
 }
 

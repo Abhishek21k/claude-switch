@@ -3392,6 +3392,29 @@ mod tests {
     }
 
     #[test]
+    fn agy_delete_dialog_sanitizes_local_name_controls() {
+        // Known-bad: a local filename injects a newline, tab or escape into the dialog.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("g", None)]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("g").unwrap().tool = Tool::Antigravity;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.refresh().unwrap();
+        let home = app.manager.profile_dir("g").join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("line\nwith\ttab\x1besc"), b"local").unwrap();
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+        let text = render_text_at(&mut app, 80, 24);
+        assert!(text.contains("line with tab esc"), "{text:?}");
+        assert!(!text.contains('\x1b') && !text.contains('\t'), "{text:?}");
+    }
+
+    #[test]
     fn an_untouched_profile_carries_no_in_use_warning() {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("business", Some(STUB_EMAIL))]);

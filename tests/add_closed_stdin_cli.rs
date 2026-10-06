@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -9,6 +11,7 @@ fn add_with_closed_stdin_cancels_instead_of_looping() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cswitch"))
         .args(["add", "zz"])
         .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
         .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

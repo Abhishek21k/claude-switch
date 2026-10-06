@@ -442,6 +442,18 @@ printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth
         fs::read(home.join("plain")).unwrap(),
         b"plain planted bytes"
     );
+    // Known-bad: a directory at the link-record path reports only OS error 21.
+    let record = profile.join("agy-links.json");
+    fs::remove_file(&record).unwrap();
+    fs::create_dir(&record).unwrap();
+    let calls_before = fs::read(&calls).unwrap();
+    let refused = run(&["use", "g"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agy-links.json"),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(&calls).unwrap(), calls_before);
 }
 
 #[test]

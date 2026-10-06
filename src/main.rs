@@ -837,6 +837,26 @@ mod agy_remove_tests {
         assert!(!message.contains("local-10") && !message.contains("local-11"));
         assert!(manager.profile_dir("g").exists());
     }
+
+    #[test]
+    fn local_control_characters_are_sanitized_in_remove_and_info() {
+        // Known-bad: newline, tab or escape in a local filename reaches terminal output.
+        let (_tmp, manager) = setup(Tool::Antigravity);
+        let name = "line\nwith\ttab\x1besc";
+        fs::write(manager.profile_dir("g").join("home").join(name), b"local").unwrap();
+        let refusal = remove_profile_with_usage(&manager, "g", false, false, None)
+            .unwrap_err()
+            .to_string();
+        let info = info_output(&manager, "g", Utc::now()).unwrap();
+        for output in [refusal, info] {
+            assert!(output.contains("line with tab esc"), "{output:?}");
+            assert!(!output.contains("line\nwith"), "{output:?}");
+            assert!(
+                !output.contains('\t') && !output.contains('\x1b'),
+                "{output:?}"
+            );
+        }
+    }
 }
 
 fn require_billing_class(
@@ -974,7 +994,7 @@ fn info_output(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Resu
                         if health.local.is_empty() {
                             "—".into()
                         } else {
-                            health.local.join(", ")
+                            agy::local_summary(&health.local, health.local.len())
                         }
                     ));
                 }
