@@ -230,7 +230,10 @@ exit "$AGY_SIGNIN_EXIT"
             PLANTED_TOKEN
         );
         if token != NO_EMAIL_TOKEN {
-            assert_eq!(fs::read(home.join(".gemini/config/.migrated")).unwrap(), b"");
+            assert_eq!(
+                fs::read(home.join(".gemini/config/.migrated")).unwrap(),
+                b""
+            );
             assert_eq!(
                 fs::read(home.join(".gemini/config/skills/s/SKILL.md")).unwrap(),
                 b"synthetic config skill"
