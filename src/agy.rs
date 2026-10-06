@@ -294,7 +294,12 @@ pub fn link_farm(real_home: &Path, profile_dir: &Path) -> Result<LinkFarmReport>
 
 #[cfg(not(unix))]
 pub fn link_farm(_real_home: &Path, _profile_dir: &Path) -> Result<LinkFarmReport> {
-    ensure_supported(false)
+    unsupported_link_farm()
+}
+
+#[cfg_attr(unix, allow(dead_code))]
+fn unsupported_link_farm() -> Result<LinkFarmReport> {
+    bail!("Antigravity profiles are supported on Unix only.")
 }
 
 #[cfg(all(test, unix))]
@@ -678,6 +683,15 @@ mod tests {
         // Known-bad: trying to create an Antigravity farm with Windows copy fallback.
         assert_eq!(
             ensure_supported(false).unwrap_err().to_string(),
+            "Antigravity profiles are supported on Unix only."
+        );
+    }
+
+    #[test]
+    fn non_unix_link_farm_helper_has_report_result_and_refuses() {
+        // Known-bad: the non-Unix farm body returns Result<()> and fails to compile.
+        assert_eq!(
+            unsupported_link_farm().unwrap_err().to_string(),
             "Antigravity profiles are supported on Unix only."
         );
     }
