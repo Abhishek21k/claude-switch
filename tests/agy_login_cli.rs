@@ -430,7 +430,10 @@ printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth
         serde_json::from_slice(&fs::read(profile.join("agy-links.json")).unwrap()).unwrap();
     assert!(!rebuilt.is_empty());
     let fake_home = profile.join("home");
-    assert_eq!(fs::read_link(fake_home.join("new-real")).unwrap(), home.join("new-real"));
+    assert_eq!(
+        fs::read_link(fake_home.join("new-real")).unwrap(),
+        home.join("new-real")
+    );
     assert_eq!(
         fs::read_to_string(&calls).unwrap().lines().last().unwrap(),
         format!("|{}", fake_home.display())
@@ -438,5 +441,44 @@ printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth
     assert_eq!(
         fs::read(home.join("plain")).unwrap(),
         b"plain planted bytes"
+    );
+}
+
+#[test]
+fn missing_agy_executable_refuses_before_token_verification() {
+    // Known-bad: ignoring the spawn error reports a missing token instead of a missing program.
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    plant_home(&home);
+    let output = Command::new(env!("CARGO_BIN_EXE_cswitch"))
+        .args(["login", "g", "--tool", "agy"])
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Failed to launch agy"),
+        "{output:?}"
+    );
+    assert!(!home.join(".claude-switch/registry.json").exists());
+    assert!(!home.join(".claude-switch/profiles/g").exists());
+    assert_eq!(
+        fs::read(home.join("plain")).unwrap(),
+        b"plain planted bytes"
+    );
+    assert_eq!(
+        fs::read(home.join("folder/entry")).unwrap(),
+        b"nested planted bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+        PLANTED_TOKEN
+    );
+    assert_eq!(
+        fs::read(home.join(".gemini/skills/warm/entry")).unwrap(),
+        b"warm skill"
     );
 }
