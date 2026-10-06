@@ -1934,6 +1934,10 @@ impl App {
             .selected_profile()
             .map(|p| p.name.as_str())
             .unwrap_or("?");
+        let popup_width = f.area().width * 80 / 100;
+        let profile_name_width = (popup_width as usize)
+            .saturating_sub(2 + "  Delete profile ".len() + "? This cannot be undone.".len());
+        let name = ellipsize_dialog_name(name, profile_name_width);
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1949,22 +1953,32 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Delete profile ", Style::default().fg(TEXT)),
-                Span::styled(name.to_string(), Style::default().fg(DANGER).bold()),
+                Span::styled(name, Style::default().fg(DANGER).bold()),
                 Span::styled("? This cannot be undone.", Style::default().fg(TEXT)),
             ]),
             Line::from(""),
         ];
 
         if let Some(secs) = self.selected_in_use {
+            let tool = self
+                .selected_profile()
+                .map(|profile| profile.tool.label())
+                .unwrap_or("unknown tool");
+            let article = if tool == "antigravity" { "an" } else { "a" };
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  In use? Written {} by a Claude session.",
-                    describe_age(secs)
-                ),
+                format!("  In use? Written {}", describe_age(secs)),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
-                "  Deleting pulls the config out from under that terminal.",
+                format!("  by {article} {tool} session."),
+                Style::default().fg(DANGER).bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Deleting pulls the config out from under",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  that terminal.",
                 Style::default().fg(DANGER),
             )));
             lines.push(Line::from(""));
@@ -1972,14 +1986,32 @@ impl App {
 
         if !self.selected_local_entries.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  Local HOME entries: {}",
-                    crate::agy::local_summary(&self.selected_local_entries, 5)
-                ),
+                "  Local HOME entries:",
                 Style::default().fg(DANGER).bold(),
             )));
+            let mut names = self.selected_local_entries.clone();
+            names.sort();
+            let max_name_chars = popup_width.saturating_sub(6) as usize;
+            for name in names.iter().take(5) {
+                let name = crate::agy::local_summary(std::slice::from_ref(name), 1);
+                let shown = ellipsize_dialog_name(&name, max_name_chars);
+                lines.push(Line::from(Span::styled(
+                    format!("  • {shown}"),
+                    Style::default().fg(DANGER),
+                )));
+            }
+            if names.len() > 5 {
+                lines.push(Line::from(Span::styled(
+                    format!("  and {} more", names.len() - 5),
+                    Style::default().fg(DANGER),
+                )));
+            }
             lines.push(Line::from(Span::styled(
-                "  They exist only in this profile and will be deleted.",
+                "  They exist only in this profile",
+                Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  and will be deleted.",
                 Style::default().fg(DANGER),
             )));
             lines.push(Line::from(""));
@@ -1993,7 +2025,7 @@ impl App {
             Span::styled(" cancel", Style::default().fg(DIM)),
         ]));
 
-        let area = centered_rect(56, lines.len() as u16 + 2, f.area());
+        let area = centered_rect(80, lines.len() as u16 + 2, f.area());
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
@@ -2515,6 +2547,16 @@ fn limit_line(window: &Window, now: DateTime<Utc>) -> Line<'static> {
         ),
         Style::default().fg(color),
     ))
+}
+
+fn ellipsize_dialog_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    format!("{}…", name.chars().take(max_chars - 1).collect::<String>())
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -3261,8 +3303,8 @@ mod tests {
     }
 
     #[test]
-    fn agy_delete_dialog_names_local_entries_and_confirmation_removes() {
-        // Known-bad: the delete dialog hides profile-only entries before y deletes them.
+    fn agy_delete_dialog_lists_local_entries_at_both_sizes_and_confirmation_removes() {
+        // Known-bad: the single unwrapped line clips names, count and loss warning at 80 columns.
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("g", None)]);
         let mut registry = app.manager.load_registry().unwrap();
@@ -3275,17 +3317,78 @@ mod tests {
         app.refresh().unwrap();
         let home = app.manager.profile_dir("g").join("home");
         fs::create_dir_all(home.join(".gemini")).unwrap();
-        fs::write(home.join("my-local-note"), b"local").unwrap();
+        for name in [
+            ".claude.json",
+            ".gitconfig",
+            ".lesshst",
+            ".npmrc",
+            ".python_history",
+            ".viminfo",
+            ".wget-hsts",
+            ".zsh_history",
+        ] {
+            fs::write(home.join(name), b"local").unwrap();
+        }
+        let log = home.join(".gemini/antigravity-cli/log");
+        fs::create_dir_all(&log).unwrap();
+        fs::write(log.join("entry"), b"synthetic activity").unwrap();
 
         app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
             .unwrap();
         assert_eq!(app.mode, Mode::ConfirmDelete);
-        let text = render_text(&mut app);
-        assert!(text.contains("my-local-note"), "{text}");
-        assert!(text.contains("exist only in this profile"), "{text}");
+        for (width, height) in [(120, 40), (80, 24)] {
+            let text = render_text_at(&mut app, width, height);
+            for name in [
+                ".claude.json",
+                ".gitconfig",
+                ".lesshst",
+                ".npmrc",
+                ".python_history",
+            ] {
+                assert!(
+                    text.contains(name),
+                    "{width}x{height}: missing {name}: {text}"
+                );
+            }
+            assert!(text.contains("and 3 more"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("will be deleted."),
+                "{width}x{height}: {text}"
+            );
+            assert!(
+                text.contains("by an antigravity session."),
+                "{width}x{height}: {text}"
+            );
+            assert!(text.contains("that terminal."), "{width}x{height}: {text}");
+            assert!(!text.contains(".viminfo"), "{width}x{height}: {text}");
+        }
         app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
         assert!(app.manager.get_profile("g").is_err());
         assert!(!home.exists());
+    }
+
+    #[test]
+    fn agy_delete_dialog_marks_one_overlong_local_name_with_ellipsis() {
+        // Known-bad: a name longer than the popup line disappears without an ellipsis.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("g", None)]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("g").unwrap().tool = Tool::Antigravity;
+        fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.refresh().unwrap();
+        let home = app.manager.profile_dir("g").join("home");
+        fs::create_dir_all(&home).unwrap();
+        let name = "a".repeat(100);
+        fs::write(home.join(&name), b"local").unwrap();
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+        let text = render_text_at(&mut app, 80, 24);
+        assert!(text.contains(&format!("{}…", "a".repeat(57))), "{text}");
+        assert!(!text.contains(&name), "{text}");
     }
 
     #[test]
