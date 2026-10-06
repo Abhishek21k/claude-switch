@@ -381,3 +381,62 @@ fn invalid_agy_name_and_flags_never_start_fake() {
         assert!(!home.join(".claude-switch/g").exists());
     }
 }
+
+#[test]
+fn damaged_link_record_warning_reaches_use_and_fake_agy() {
+    // Known-bad: prepare_launch drops link_farm_warning before cswitch use starts agy.
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    plant_home(&home);
+    let fake = temp.path().join("agy");
+    let calls = temp.path().join("calls");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+printf '%s|%s\n' "$*" "$HOME" >> "$AGY_TEST_LOG"
+if [ "$1" = models ]; then exit 0; fi
+mkdir -p "$HOME/.gemini/antigravity-cli"
+printf '%s' "$AGY_TEST_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake, perms).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cswitch"))
+            .args(args)
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("AGY_TEST_LOG", &calls)
+            .env("AGY_TEST_TOKEN", OWN_TOKEN)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let login = run(&["login", "g", "--tool", "agy"]);
+    assert!(login.status.success(), "{login:?}");
+    let profile = home.join(".claude-switch/profiles/g");
+    fs::write(profile.join("agy-links.json"), b"not json").unwrap();
+    fs::write(home.join("new-real"), b"new synthetic entry").unwrap();
+    let use_output = run(&["use", "g"]);
+    assert!(use_output.status.success(), "{use_output:?}");
+    assert!(
+        String::from_utf8_lossy(&use_output.stderr).contains("agy-links.json"),
+        "{use_output:?}"
+    );
+    let rebuilt: Vec<Vec<u8>> =
+        serde_json::from_slice(&fs::read(profile.join("agy-links.json")).unwrap()).unwrap();
+    assert!(!rebuilt.is_empty());
+    let fake_home = profile.join("home");
+    assert_eq!(fs::read_link(fake_home.join("new-real")).unwrap(), home.join("new-real"));
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap().lines().last().unwrap(),
+        format!("|{}", fake_home.display())
+    );
+    assert_eq!(
+        fs::read(home.join("plain")).unwrap(),
+        b"plain planted bytes"
+    );
+}
