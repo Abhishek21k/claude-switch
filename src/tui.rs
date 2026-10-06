@@ -3337,6 +3337,29 @@ mod tests {
     }
 
     #[test]
+    fn delete_dialog_keeps_long_profile_name_and_warning_inside_box() {
+        // Known-bad: passing the full name through clips the warning at 80 columns.
+        let name = "abcdefghijklmnopqrstuvwxyz1234";
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[(name, None)]);
+        app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+
+        let narrow = render_text_at(&mut app, 80, 24);
+        assert!(
+            narrow.contains("abcdefghijklmnopqrst…? This cannot be undone."),
+            "{narrow}"
+        );
+
+        let wide = render_text_at(&mut app, 120, 40);
+        assert!(
+            wide.contains(&format!("{name}? This cannot be undone.")),
+            "{wide}"
+        );
+    }
+
+    #[test]
     fn agy_delete_dialog_lists_local_entries_at_both_sizes_and_confirmation_removes() {
         // Known-bad: the single unwrapped line clips names, count and loss warning at 80 columns.
         let tmp = TempDir::new().unwrap();
