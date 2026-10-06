@@ -13,6 +13,8 @@ pub const AGY_AUTH_CHECK_ARGS: &[&str] = &["models"];
 pub const AGY_TOKEN_RELATIVE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 pub const AGY_SEED_ALLOWLIST: &[&str] = &[
     "config/mcp_config.json",
+    "config/skills",
+    "config/.migrated",
     "antigravity-cli/settings.json",
     "antigravity-cli/mcp_config.json",
     "antigravity-cli/skills",
@@ -552,9 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn seed_copies_only_five_warm_paths() {
-        // Known-bad: copying antigravity-oauth-token imports the source account.
-        let (_temp, real, profile) = fixture();
+    fn seed_copies_only_seven_warm_paths() {
+        // Known-bads: copying the whole config directory imports private state;
+        // omitting config/skills or config/.migrated loses skills or triggers migration;
+        // copying antigravity-oauth-token imports the source account.
+        let (temp, real, profile) = fixture();
         let source = real.join(".gemini");
         for name in [
             "antigravity",
@@ -576,8 +580,20 @@ mod tests {
             fs::write(source.join(name), b"excluded synthetic state").unwrap();
         }
         fs::write(source.join("config/mcp_config.json"), b"warm config").unwrap();
-        fs::write(source.join("config/.migrated"), b"excluded").unwrap();
+        fs::write(source.join("config/.migrated"), b"").unwrap();
+        fs::create_dir_all(source.join("config/skills/nested")).unwrap();
+        fs::write(source.join("config/skills/nested/entry"), b"config skill").unwrap();
+        let outside = temp.path().join("outside-skills");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("entry"), b"outside bytes").unwrap();
+        symlink(&outside, source.join("config/skills/external")).unwrap();
+        fs::write(source.join("config/config.json"), b"private settings").unwrap();
         fs::create_dir_all(source.join("config/projects")).unwrap();
+        fs::write(
+            source.join("config/projects/default-cli-project.json"),
+            b"private project",
+        )
+        .unwrap();
         fs::write(source.join("skills/warm"), b"warm skill").unwrap();
         fs::create_dir_all(source.join("antigravity-cli/skills")).unwrap();
         for name in ["settings.json", "mcp_config.json"] {
@@ -639,14 +655,58 @@ mod tests {
             .collect();
         cli.sort();
         assert_eq!(cli, ["mcp_config.json", "settings.json", "skills"]);
+        let mut config: Vec<_> = fs::read_dir(seeded.join("config"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        config.sort();
+        assert_eq!(config, [".migrated", "mcp_config.json", "skills"]);
         assert_eq!(
             fs::read(seeded.join("config/mcp_config.json")).unwrap(),
             b"warm config"
         );
+        let marker = fs::symlink_metadata(seeded.join("config/.migrated")).unwrap();
+        assert!(marker.is_file());
+        assert_eq!(marker.len(), 0);
+        assert_eq!(
+            fs::read(seeded.join("config/skills/nested/entry")).unwrap(),
+            b"config skill"
+        );
+        assert!(
+            fs::symlink_metadata(seeded.join("config/skills/external"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(outside.join("entry")).unwrap(), b"outside bytes");
         assert_eq!(fs::read(seeded.join("skills/warm")).unwrap(), b"warm skill");
+        assert!(fs::symlink_metadata(seeded.join("config/config.json")).is_err());
+        assert!(fs::symlink_metadata(seeded.join("config/projects")).is_err());
         assert!(fs::symlink_metadata(home.join(AGY_TOKEN_RELATIVE)).is_err());
         assert!(fs::symlink_metadata(seeded.join("oauth_creds.json")).is_err());
         assert!(fs::symlink_metadata(seeded.join("google_accounts.json")).is_err());
+    }
+
+    #[test]
+    fn seed_does_not_invent_migration_marker() {
+        // Known-bad: creating .migrated even when the source has no marker skips agy's migration.
+        let (_temp, real, profile) = fixture();
+        let source = real.join(".gemini/config");
+        fs::create_dir_all(source.join("skills")).unwrap();
+        fs::write(source.join("mcp_config.json"), b"warm config").unwrap();
+        fs::write(source.join("skills/entry"), b"warm skill").unwrap();
+        link_farm(&real, &profile).unwrap();
+        let seeded = profile_home(&profile).join(".gemini/config");
+        seed_gemini(&real, &profile_home(&profile)).unwrap();
+        assert_eq!(
+            fs::read(seeded.join("mcp_config.json")).unwrap(),
+            b"warm config"
+        );
+        assert_eq!(
+            fs::read(seeded.join("skills/entry")).unwrap(),
+            b"warm skill"
+        );
+        assert!(fs::symlink_metadata(seeded.join(".migrated")).is_err());
     }
 
     #[test]
