@@ -3303,6 +3303,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_dialog_names_the_selected_tool_in_use() {
+        // Known-bad: the warning always says "antigravity" for every profile.
+        for (tool, expected) in [
+            (Tool::Claude, "by a claude session."),
+            (Tool::Codex, "by a codex session."),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut app = make_app(&tmp, &[("profile", Some(STUB_EMAIL))]);
+            let mut registry = app.manager.load_registry().unwrap();
+            registry.profiles.get_mut("profile").unwrap().tool = tool.clone();
+            fs::write(
+                app.manager.base_dir.join("registry.json"),
+                serde_json::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+            app.refresh().unwrap();
+            if tool == Tool::Claude {
+                mark_live(&app, "profile");
+            } else {
+                let sessions = app.manager.profile_dir("profile").join("sessions");
+                fs::create_dir_all(&sessions).unwrap();
+                fs::write(sessions.join("entry"), b"synthetic activity").unwrap();
+            }
+
+            app.handle_normal_key(KeyCode::Char('d'), KeyModifiers::NONE)
+                .unwrap();
+            assert_eq!(app.mode, Mode::ConfirmDelete);
+            assert!(app.selected_in_use.is_some());
+            let text = render_text_at(&mut app, 120, 40);
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+
+    #[test]
     fn agy_delete_dialog_lists_local_entries_at_both_sizes_and_confirmation_removes() {
         // Known-bad: the single unwrapped line clips names, count and loss warning at 80 columns.
         let tmp = TempDir::new().unwrap();
