@@ -20,6 +20,14 @@ fn plant_home(home: &Path) {
     fs::write(gemini.join("antigravity-oauth-token"), PLANTED_TOKEN).unwrap();
     fs::create_dir_all(home.join(".gemini/skills/warm")).unwrap();
     fs::write(home.join(".gemini/skills/warm/entry"), b"warm skill").unwrap();
+    fs::create_dir_all(home.join(".gemini/config/skills/s")).unwrap();
+    fs::write(home.join(".gemini/config/.migrated"), b"").unwrap();
+    fs::write(
+        home.join(".gemini/config/skills/s/SKILL.md"),
+        b"synthetic config skill",
+    )
+    .unwrap();
+    fs::write(home.join(".gemini/config/config.json"), b"private config").unwrap();
 }
 
 #[test]
@@ -114,6 +122,7 @@ exit "$AGY_SIGNIN_EXIT"
         plant_home(&home);
         if token == NO_EMAIL_TOKEN {
             fs::remove_dir_all(home.join(".gemini/skills")).unwrap();
+            fs::remove_dir_all(home.join(".gemini/config")).unwrap();
         }
         let call_log = temp.path().join("agy-calls");
         let args = if succeeds && token == OWN_TOKEN {
@@ -152,7 +161,9 @@ exit "$AGY_SIGNIN_EXIT"
             );
         } else {
             assert!(
-                message.contains("Antigravity seed from ~/.gemini: copied skills."),
+                message.contains(
+                    "Antigravity seed from ~/.gemini: copied config/skills, config/.migrated, skills."
+                ),
                 "{message}"
             );
         }
@@ -178,6 +189,17 @@ exit "$AGY_SIGNIN_EXIT"
                     fs::read(profile_dir.join("home/.gemini/skills/warm/entry")).unwrap(),
                     b"warm skill"
                 );
+                // Known-bad: the wired login omits .migrated, so agy's next start
+                // would migrate and replace the two copied MCP configurations.
+                let config = profile_dir.join("home/.gemini/config");
+                let marker = fs::symlink_metadata(config.join(".migrated")).unwrap();
+                assert!(marker.is_file());
+                assert_eq!(marker.len(), 0);
+                assert_eq!(
+                    fs::read(config.join("skills/s/SKILL.md")).unwrap(),
+                    b"synthetic config skill"
+                );
+                assert!(fs::symlink_metadata(config.join("config.json")).is_err());
             }
             assert_eq!(
                 fs::read_to_string(
@@ -207,6 +229,17 @@ exit "$AGY_SIGNIN_EXIT"
                 .unwrap(),
             PLANTED_TOKEN
         );
+        if token != NO_EMAIL_TOKEN {
+            assert_eq!(fs::read(home.join(".gemini/config/.migrated")).unwrap(), b"");
+            assert_eq!(
+                fs::read(home.join(".gemini/config/skills/s/SKILL.md")).unwrap(),
+                b"synthetic config skill"
+            );
+            assert_eq!(
+                fs::read(home.join(".gemini/config/config.json")).unwrap(),
+                b"private config"
+            );
+        }
         let calls = fs::read_to_string(&call_log).unwrap();
         let expected_home = profile_dir.join("home");
         for call in calls.lines() {
