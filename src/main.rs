@@ -816,6 +816,27 @@ mod agy_remove_tests {
         assert!(summary.starts_with("entry-00, entry-01"));
         assert!(summary.ends_with("entry-09, and 2 more"));
     }
+
+    #[test]
+    fn agy_remove_refusal_wires_the_ten_entry_limit() {
+        // Known-bad: the CLI passes a limit other than ten to local_summary.
+        let (_tmp, manager) = setup(Tool::Antigravity);
+        let home = manager.profile_dir("g").join("home");
+        for index in 0..12 {
+            fs::write(home.join(format!("local-{index:02}")), b"local").unwrap();
+        }
+        let message = remove_profile_with_usage(&manager, "g", false, false, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message.matches("local-").count(), 10, "{message}");
+        assert!(message.contains("local-00, local-01"), "{message}");
+        assert!(
+            message.contains("local-09, and 2 more. Removing"),
+            "{message}"
+        );
+        assert!(!message.contains("local-10") && !message.contains("local-11"));
+        assert!(manager.profile_dir("g").exists());
+    }
 }
 
 fn require_billing_class(
