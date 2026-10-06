@@ -67,7 +67,7 @@ mod stage_b_tests {
 
     #[test]
     fn antigravity_profile_home_is_detected_by_path_components() {
-        // Known-bad: no guard, or a suffix-only check that matches an ordinary HOME.
+        // Known-bad: no guard, or ignoring the .claude-switch ancestor or final home component.
         let detect = antigravity_profile_home_name;
         assert_eq!(
             detect(Path::new("/tmp/user/.claude-switch/profiles/g/home")),
@@ -77,6 +77,10 @@ mod stage_b_tests {
         assert_eq!(detect(Path::new("/tmp/home")), None);
         assert_eq!(detect(Path::new("/tmp/profiles/g/home")), None);
         assert_eq!(detect(Path::new("/tmp/.claude-switch/other/g/home")), None);
+        assert_eq!(
+            detect(Path::new("/tmp/.claude-switch/profiles/g/other")),
+            None
+        );
     }
 
     #[test]

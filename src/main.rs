@@ -2303,6 +2303,13 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("Farm:      1 link, 0 dangling"), "{output}");
+        fs::write(temp.path().join("second-shared"), b"synthetic").unwrap();
+        agy::link_farm(temp.path(), &profile_dir).unwrap();
+        let two_links = info_output(&manager, "g", Utc::now()).unwrap();
+        assert!(
+            two_links.contains("Farm:      2 links, 0 dangling"),
+            "{two_links}"
+        );
         assert!(output.contains("Local:     local"), "{output}");
         assert_eq!(
             require_billing_class(&manager, "g", true, "rates")
