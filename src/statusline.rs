@@ -235,8 +235,8 @@ pub fn read_disk(
                     .aliases
                     .get(&raw)
                     .map_or(raw.as_str(), String::as_str);
-                let (full, short) = project_display(project);
-                (Some(full), Some(short))
+                project_display(project)
+                    .map_or((None, None), |(full, short)| (Some(full), Some(short)))
             } else {
                 let workspace = attribute::workspace_for_path(cwd, &config);
                 (workspace.clone(), workspace)
@@ -281,15 +281,18 @@ fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option
     })
 }
 
-fn project_display(project: &str) -> (String, String) {
+fn project_display(project: &str) -> Option<(String, String)> {
+    if project == "(unattributed)" {
+        return None;
+    }
     if let Some((workspace, name)) = project.split_once('/') {
-        if workspace == name {
-            (name.to_string(), name.to_string())
+        if workspace == name || workspace == "(unattributed)" {
+            Some((name.to_string(), name.to_string()))
         } else {
-            (format!("{workspace} › {name}"), name.to_string())
+            Some((format!("{workspace} › {name}"), name.to_string()))
         }
     } else {
-        (project.to_string(), project.to_string())
+        Some((project.to_string(), project.to_string()))
     }
 }
 
@@ -868,6 +871,29 @@ mod tests {
             line(&full_input(), &bad, 200, false).split(" · ").next(),
             Some("default")
         );
+    }
+
+    #[test]
+    fn unattributed_project_displays_only_its_name() {
+        // Known-bad: the internal `(unattributed)` workspace leaks into the line.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("atlas");
+        let tool = root.join("apps/tool/src");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&tool).unwrap();
+        let usage = tmp.path().join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        fs::write(
+            usage.join("config.json"),
+            serde_json::to_vec(&json!({"superproject":root,"project_globs":["apps/*"]})).unwrap(),
+        )
+        .unwrap();
+        let input = json!({"cwd":tool});
+        let disk = read_disk(&input, tmp.path(), None, &usage);
+        assert_eq!(disk.project.as_deref(), Some("tool"));
+        assert_eq!(disk.project_short.as_deref(), Some("tool"));
+        assert!(!line(&input, &disk, 200, false).contains("(unattributed)"));
+        assert_eq!(project_display("(unattributed)"), None);
     }
 
     #[test]
