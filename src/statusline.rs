@@ -1524,6 +1524,24 @@ mod tests {
     }
 
     #[test]
+    fn shedding_drops_project_then_five_hour_and_keeps_exact_fit() {
+        // Known-bad: 5h drops before the project, the project never drops,
+        // or an exact budget fit is treated as too wide.
+        let input = json!({"rate_limits":{"five_hour":{"used_percentage":88},
+            "seven_day":{"used_percentage":71}}});
+        let mut data = disk();
+        data.account = "longaccount".into();
+        assert_eq!(line(&input, &data, 30, false), "longaccount · 5h 88%");
+        data.account = "longaccount1".into();
+        assert_eq!(line(&input, &data, 10, false), "longaccount1");
+        let full = line(&full_input(), &disk(), 200, false);
+        assert_eq!(
+            line(&full_input(), &disk(), full.chars().count() + 4, false),
+            full
+        );
+    }
+
+    #[test]
     fn shedding_with_headroom_follows_every_step() {
         // Known-bad: dropping headroom before shortening the project or counting ESC bytes.
         let mut input = full_input();
