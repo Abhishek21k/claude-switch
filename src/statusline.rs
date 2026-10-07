@@ -61,16 +61,13 @@ pub fn manage(
     executable: &Path,
     now: DateTime<Utc>,
 ) -> Result<(String, bool)> {
+    let executable = fs::canonicalize(executable).context("Cannot resolve cswitch executable")?;
     let command = match action {
-        Action::Install { no_refresh, .. } => {
-            let executable =
-                fs::canonicalize(executable).context("Cannot resolve cswitch executable")?;
-            Some(format!(
-                "{} statusline{}",
-                profile::shell_quote(&executable.to_string_lossy()),
-                if no_refresh { " --no-refresh" } else { "" }
-            ))
-        }
+        Action::Install { no_refresh, .. } => Some(format!(
+            "{} statusline{}",
+            profile::shell_quote(&executable.to_string_lossy()),
+            if no_refresh { " --no-refresh" } else { "" }
+        )),
         Action::Uninstall => None,
     };
     let names = if all {
@@ -87,7 +84,14 @@ pub fn manage(
     let mut failed = false;
     for name in names {
         let force = matches!(action, Action::Install { force: true, .. });
-        match key::edit_statusline(manager, &name, command.as_deref(), force, now) {
+        match key::edit_statusline(
+            manager,
+            &name,
+            command.as_deref(),
+            force,
+            Some(&executable),
+            now,
+        ) {
             Ok(changed) => {
                 let phrase = match (action, changed) {
                     (Action::Install { .. }, true) => "installed",
@@ -894,6 +898,101 @@ mod tests {
         assert_eq!(disk.project_short.as_deref(), Some("tool"));
         assert!(!line(&input, &disk, 200, false).contains("(unattributed)"));
         assert_eq!(project_display("(unattributed)"), None);
+    }
+
+    #[test]
+    fn renamed_executable_owns_only_its_installed_statusline() {
+        // Known-bad: only a file named cswitch is owned, or any tool-x path is owned.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude)]);
+        let manager =
+            ProfileManager::with_paths(home.join(".claude-switch"), home.join(".claude")).unwrap();
+        let executable = home.join("bin/tool-x");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"synthetic executable").unwrap();
+        let settings = manager.profile_dir("work").join("settings.json");
+        let install = Action::Install {
+            no_refresh: false,
+            force: false,
+        };
+        let (out, failed) =
+            manage(&manager, Some("work"), false, install, &executable, now()).unwrap();
+        assert_eq!(out, "work: installed\n");
+        assert!(!failed);
+        let bytes = fs::read(&settings).unwrap();
+        let backup_dir = manager.base_dir.join("backups/settings/work");
+        let backups = || {
+            fs::read_dir(&backup_dir)
+                .map(|rows| rows.count())
+                .unwrap_or(0)
+        };
+        let before = backups();
+        let (out, failed) =
+            manage(&manager, Some("work"), false, install, &executable, now()).unwrap();
+        assert_eq!(out, "work: already installed\n");
+        assert!(!failed);
+        assert_eq!(fs::read(&settings).unwrap(), bytes);
+        assert_eq!(backups(), before);
+
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        value["statusLine"]["padding"] = json!(2);
+        fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
+        let (out, failed) = manage(
+            &manager,
+            Some("work"),
+            false,
+            Action::Install {
+                no_refresh: true,
+                force: false,
+            },
+            &executable,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(out, "work: installed\n");
+        assert!(!failed);
+        let rewritten: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(rewritten["statusLine"]["padding"], 2);
+        assert!(
+            rewritten["statusLine"]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" --no-refresh")
+        );
+        let (out, failed) = manage(
+            &manager,
+            Some("work"),
+            false,
+            Action::Uninstall,
+            &executable,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(out, "work: removed\n");
+        assert!(!failed);
+
+        let other = home.join("other/tool-x");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, b"other synthetic executable").unwrap();
+        let foreign = json!({"statusLine":{"type":"command",
+            "command":format!("{} statusline", profile::shell_quote(&other.to_string_lossy()))}});
+        fs::write(&settings, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let bytes = fs::read(&settings).unwrap();
+        let (out, failed) =
+            manage(&manager, Some("work"), false, install, &executable, now()).unwrap();
+        assert!(failed && out.contains("pass --force"), "{out}");
+        let (out, failed) = manage(
+            &manager,
+            Some("work"),
+            false,
+            Action::Uninstall,
+            &executable,
+            now(),
+        )
+        .unwrap();
+        assert!(failed && out.contains("foreign status line"), "{out}");
+        assert_eq!(fs::read(&settings).unwrap(), bytes);
     }
 
     #[test]

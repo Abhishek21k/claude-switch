@@ -121,6 +121,7 @@ mod statusline_tests {
             Edit::StatuslineInstall {
                 command: "cswitch statusline",
                 force: false,
+                executable: None,
             },
             now(),
             |_| {},
@@ -151,7 +152,15 @@ mod statusline_tests {
         let before = fs::read(&path).unwrap();
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();
         assert!(
-            !edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).unwrap()
+            !edit_statusline(
+                &manager,
+                "work",
+                Some("cswitch statusline"),
+                false,
+                None,
+                now()
+            )
+            .unwrap()
         );
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
@@ -166,6 +175,7 @@ mod statusline_tests {
                 "work",
                 Some("cswitch statusline --no-refresh"),
                 false,
+                None,
                 now()
             )
             .unwrap()
@@ -182,12 +192,28 @@ mod statusline_tests {
         fs::write(&path, foreign).unwrap();
         let backups = backup_files(&manager, "work").len();
         assert!(
-            edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).is_err()
+            edit_statusline(
+                &manager,
+                "work",
+                Some("cswitch statusline"),
+                false,
+                None,
+                now()
+            )
+            .is_err()
         );
         assert_eq!(fs::read(&path).unwrap(), foreign);
         assert_eq!(backup_files(&manager, "work").len(), backups);
         assert!(
-            edit_statusline(&manager, "work", Some("cswitch statusline"), true, now()).unwrap()
+            edit_statusline(
+                &manager,
+                "work",
+                Some("cswitch statusline"),
+                true,
+                None,
+                now()
+            )
+            .unwrap()
         );
         let forced: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
@@ -207,19 +233,19 @@ mod statusline_tests {
             br#"{"theme":"dark","statusLine":{"type":"command","command":"cswitch statusline"}}"#,
         )
         .unwrap();
-        assert!(edit_statusline(&manager, "work", None, false, now()).unwrap());
+        assert!(edit_statusline(&manager, "work", None, false, None, now()).unwrap());
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value, json!({"theme":"dark"}));
         let bytes = fs::read(&path).unwrap();
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();
         let backups = backup_files(&manager, "work").len();
-        assert!(!edit_statusline(&manager, "work", None, false, now()).unwrap());
+        assert!(!edit_statusline(&manager, "work", None, false, None, now()).unwrap());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
         assert_eq!(backup_files(&manager, "work").len(), backups);
         let foreign = br#"{"statusLine":"foreign"}"#;
         fs::write(&path, foreign).unwrap();
-        assert!(edit_statusline(&manager, "work", None, false, now()).is_err());
+        assert!(edit_statusline(&manager, "work", None, false, None, now()).is_err());
         assert_eq!(fs::read(&path).unwrap(), foreign);
     }
 
@@ -235,13 +261,28 @@ mod statusline_tests {
         std::os::unix::fs::symlink(&target, manager.profile_dir("work").join("settings.json"))
             .unwrap();
         assert!(
-            edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).is_err()
+            edit_statusline(
+                &manager,
+                "work",
+                Some("cswitch statusline"),
+                false,
+                None,
+                now()
+            )
+            .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), b"{}");
         assert!(backup_files(&manager, "work").is_empty());
-        let error = edit_statusline(&manager, "codex", Some("cswitch statusline"), false, now())
-            .unwrap_err()
-            .to_string();
+        let error = edit_statusline(
+            &manager,
+            "codex",
+            Some("cswitch statusline"),
+            false,
+            None,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("status lines are a Claude Code feature"),
             "{error}"
@@ -253,6 +294,7 @@ mod statusline_tests {
                 "missing",
                 Some("cswitch statusline"),
                 false,
+                None,
                 now()
             )
             .is_err()
@@ -866,7 +908,12 @@ pub fn managed_helper_name(command: &str) -> Option<String> {
     Some(words[3].clone())
 }
 
+#[cfg(test)]
 pub fn owns_statusline(value: &Value) -> bool {
+    owns_statusline_with_executable(value, None)
+}
+
+fn owns_statusline_with_executable(value: &Value, executable: Option<&Path>) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -886,12 +933,13 @@ pub fn owns_statusline(value: &Value) -> bool {
     if words[1] != "statusline" || (words.len() == 3 && words[2] != "--no-refresh") {
         return false;
     }
-    matches!(
-        Path::new(&words[0])
-            .file_name()
-            .and_then(|name| name.to_str()),
-        Some("cswitch" | "cswitch.exe")
-    )
+    executable.is_some_and(|path| words[0] == path.to_string_lossy())
+        || matches!(
+            Path::new(&words[0])
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("cswitch" | "cswitch.exe")
+        )
 }
 
 pub fn edit_statusline(
@@ -899,6 +947,7 @@ pub fn edit_statusline(
     name: &str,
     command: Option<&str>,
     force: bool,
+    executable: Option<&Path>,
     now: DateTime<Utc>,
 ) -> Result<bool> {
     if manager.get_profile(name)?.tool != Tool::Claude {
@@ -906,8 +955,12 @@ pub fn edit_statusline(
     }
     let path = manager.profile_dir(name).join("settings.json");
     let edit = match command {
-        Some(command) => Edit::StatuslineInstall { command, force },
-        None => Edit::StatuslineUninstall,
+        Some(command) => Edit::StatuslineInstall {
+            command,
+            force,
+            executable,
+        },
+        None => Edit::StatuslineUninstall { executable },
     };
     Ok(edit_settings(&path, &manager.base_dir, name, edit, now, |_| {})?.changed)
 }
@@ -993,8 +1046,11 @@ enum Edit<'a> {
     StatuslineInstall {
         command: &'a str,
         force: bool,
+        executable: Option<&'a Path>,
     },
-    StatuslineUninstall,
+    StatuslineUninstall {
+        executable: Option<&'a Path>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1022,13 +1078,19 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
     let foreign = present;
     let managed = current.and_then(managed_helper_name);
     match edit {
-        Edit::StatuslineInstall { command, force } => {
+        Edit::StatuslineInstall {
+            command,
+            force,
+            executable,
+        } => {
             let current = object.get("statusLine");
-            if current.is_some_and(|value| !owns_statusline(value)) && !force {
+            if current.is_some_and(|value| !owns_statusline_with_executable(value, executable))
+                && !force
+            {
                 bail!("{name} already has a status line; pass --force to replace it");
             }
             if let Some(value) = current
-                && owns_statusline(value)
+                && owns_statusline_with_executable(value, executable)
                 && value.get("command").and_then(Value::as_str) == Some(command)
             {
                 return Ok(Merge {
@@ -1039,7 +1101,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                     removed_gateway_count: 0,
                 });
             }
-            if current.is_some_and(owns_statusline) {
+            if current.is_some_and(|value| owns_statusline_with_executable(value, executable)) {
                 object
                     .get_mut("statusLine")
                     .and_then(Value::as_object_mut)
@@ -1061,7 +1123,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                 removed_gateway_count: 0,
             })
         }
-        Edit::StatuslineUninstall => {
+        Edit::StatuslineUninstall { executable } => {
             let Some(current) = object.get("statusLine") else {
                 return Ok(Merge {
                     json,
@@ -1071,7 +1133,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
                     removed_gateway_count: 0,
                 });
             };
-            if !owns_statusline(current) {
+            if !owns_statusline_with_executable(current, executable) {
                 bail!("{name} has a foreign status line; nothing was removed");
             }
             object.remove("statusLine");
