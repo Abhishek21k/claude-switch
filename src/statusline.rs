@@ -1,7 +1,7 @@
 //! Claude Code's one-line, read-only status display.
 
 use crate::key;
-use crate::limits::{self, Limits, Snapshot, read_claude_json};
+use crate::limits::{self, Limits, Snapshot, read_claude_json_once};
 use crate::profile::{self, ProfileManager, Tool};
 use crate::usage::{attribute, metrics};
 use anyhow::{Context, Result};
@@ -172,14 +172,10 @@ pub fn read_disk(
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "cswitch".to_string())
     };
+    let claude = read_claude_json_once(config_dir);
     let per_token = registered.is_some_and(|profile| {
         manager.as_ref().is_some_and(|manager| {
-            key::read_auth_mode(
-                manager,
-                &profile.name,
-                read_claude_json(&manager.profile_dir(&profile.name)),
-            )
-            .api_billed()
+            key::read_auth_mode(manager, &profile.name, claude.clone()).api_billed()
         })
     });
     let snapshot = if input
@@ -187,7 +183,7 @@ pub fn read_disk(
         .and_then(Value::as_object)
         .is_none()
     {
-        read_claude_json(config_dir)
+        claude
             .ok()
             .flatten()
             .and_then(|json| match limits::parse_limits(&json) {
@@ -258,7 +254,7 @@ pub fn read_disk(
 
 fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option<Headroom> {
     let dir = manager.profile_dir(name);
-    let claude = read_claude_json(&dir);
+    let claude = read_claude_json_once(&dir);
     if key::read_auth_mode(manager, name, claude.clone()) != key::AuthMode::Subscription {
         return None;
     }
@@ -638,6 +634,65 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn statusline_reads_each_claude_file_once_without_sleeping() {
+        // Known-bad: the retrying reader sleeps on an invalid own or candidate file,
+        // or reads the own file again for the snapshot fallback.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(
+            home,
+            &[
+                ("work", Tool::Claude),
+                ("broken", Tool::Claude),
+                ("spare", Tool::Claude),
+            ],
+        );
+        let profiles = home.join(".claude-switch/profiles");
+        let work = profiles.join("work");
+        let usage = home.join("usage");
+        fs::write(work.join(".claude.json"), b"{").unwrap();
+        limits::reset_read_stats();
+        let disk = read_disk(&Value::Null, home, Some(&work), &usage);
+        assert_eq!(limits::read_stats(), (1, 0));
+        let output = line(&Value::Null, &disk, 200, false);
+        assert_eq!(output, "work");
+
+        fs::write(profiles.join("broken/.claude.json"), b"{").unwrap();
+        fs::write(
+            profiles.join("spare/.claude.json"),
+            serde_json::to_vec(&snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let high = json!({"rate_limits":{"five_hour":{"used_percentage":88}}});
+        limits::reset_read_stats();
+        let disk = read_disk(&high, home, Some(&work), &usage);
+        assert_eq!(limits::read_stats(), (3, 0));
+        assert!(line(&high, &disk, 200, false).contains("→ spare 5h 10%"));
+
+        fs::write(
+            work.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                42.0,
+                now().timestamp() + 3600,
+                71.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        limits::reset_read_stats();
+        let disk = read_disk(&Value::Null, home, Some(&work), &usage);
+        assert_eq!(limits::read_stats(), (1, 0));
+        assert!(line(&Value::Null, &disk, 200, false).contains("5h 42%"));
     }
 
     #[test]

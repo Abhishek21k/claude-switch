@@ -8,6 +8,23 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+thread_local! {
+    static READ_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn reset_read_stats() {
+    READ_ATTEMPTS.set(0);
+    SLEEPS.set(0);
+}
+
+#[cfg(test)]
+pub fn read_stats() -> (usize, usize) {
+    (READ_ATTEMPTS.get(), SLEEPS.get())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowGroup {
     Session,
@@ -137,16 +154,34 @@ pub fn read_claude_json(profile_dir: &Path) -> Result<Option<Value>, ()> {
         return Ok(None);
     }
     for attempt in 0..2 {
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(json) = serde_json::from_slice::<Value>(&bytes)
-        {
+        if let Ok(json) = read_json_attempt(&path) {
             return Ok(Some(json));
         }
         if attempt == 0 {
+            #[cfg(test)]
+            SLEEPS.set(SLEEPS.get() + 1);
             thread::sleep(Duration::from_millis(50));
         }
     }
     Err(())
+}
+
+/// Status-line reads are time bounded by making one filesystem and parse attempt.
+pub fn read_claude_json_once(profile_dir: &Path) -> Result<Option<Value>, ()> {
+    let path = profile_dir.join(".claude.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json_attempt(&path).map(Some)
+}
+
+fn read_json_attempt(path: &Path) -> Result<Value, ()> {
+    #[cfg(test)]
+    READ_ATTEMPTS.set(READ_ATTEMPTS.get() + 1);
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or(())
 }
 
 #[cfg(test)]
