@@ -1269,6 +1269,71 @@ mod tests {
     }
 
     #[test]
+    fn headroom_excludes_self_rolled_weekly_and_weekly_only_candidate() {
+        // Known-bads: the current profile competes with itself, a rolled weekly
+        // window is offered, or a weekly-only candidate gets a synthetic 5h 0%.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude), ("spare", Tool::Claude)]);
+        let profiles = home.join(".claude-switch/profiles");
+        let work = profiles.join("work");
+        let usage = home.join("usage");
+        fs::write(
+            work.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                5.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let spare_path = profiles.join("spare/.claude.json");
+        fs::write(
+            &spare_path,
+            serde_json::to_vec(&snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                85.0,
+                now().timestamp() - 1,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let high = json!({"rate_limits":{"five_hour":{"used_percentage":88}}});
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&work), &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("→ spare 5h 10%"), "{output}");
+        assert!(
+            !output.contains("→ work") && !output.contains("7d 85%"),
+            "{output}"
+        );
+        let mut weekly_only = snapshot(
+            10.0,
+            now().timestamp() + 3600,
+            85.0,
+            now().timestamp() + 86400,
+        );
+        weekly_only["cachedUsageUtilization"]["utilization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("five_hour");
+        fs::write(&spare_path, serde_json::to_vec(&weekly_only).unwrap()).unwrap();
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&work), &usage),
+            200,
+            false,
+        );
+        assert!(!output.contains('→'), "{output}");
+    }
+
+    #[test]
     fn headroom_requires_high_usage_and_selects_subscription_candidate() {
         // Known-bad: showing headroom below 80, offering API or Codex, or keeping a rolled value.
         let tmp = TempDir::new().unwrap();
