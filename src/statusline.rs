@@ -1134,6 +1134,59 @@ mod tests {
     }
 
     #[test]
+    fn limits_omit_invalid_windows_floor_minutes_and_use_null_fallback() {
+        // Known-bads: >= adds a reset suffix at now, invalid percent becomes 0%,
+        // minute rounding overshoots, or null blocks the saved fallback.
+        let at = now();
+        assert_eq!(reset_text(Some(at), at, offset()), None);
+        assert_eq!(
+            reset_text(Some(at + chrono::Duration::seconds(3599)), at, offset()).as_deref(),
+            Some("↻59m")
+        );
+        assert_eq!(
+            reset_text(Some(at + chrono::Duration::seconds(119)), at, offset()).as_deref(),
+            Some("↻1m")
+        );
+        for bad in [
+            Value::Null,
+            json!("42"),
+            json!({"resets_at":at.timestamp()}),
+        ] {
+            let input = json!({"rate_limits":{"five_hour":{"used_percentage":bad},
+                "seven_day":{"used_percentage":71}}});
+            let output = line(&input, &disk(), 200, false);
+            assert!(
+                !output.contains("5h") && output.contains("7d 71%"),
+                "{output}"
+            );
+        }
+        let missing = json!({"rate_limits":{"five_hour":{},
+            "seven_day":{"used_percentage":71}}});
+        assert!(!line(&missing, &disk(), 200, false).contains("5h"));
+        let at_reset = json!({"rate_limits":{"five_hour":{
+            "used_percentage":42,"resets_at":at.timestamp()}}});
+        assert_eq!(
+            line(&at_reset, &disk(), 200, false),
+            "work · acme › site · 5h 42%"
+        );
+        let mut data = disk();
+        data.snapshot = match limits::parse_limits(&snapshot(
+            42.0,
+            at.timestamp() + 3600,
+            71.0,
+            at.timestamp() + 86400,
+        )) {
+            Limits::Snapshot(snapshot) => Some(snapshot),
+            _ => unreachable!(),
+        };
+        let output = line(&json!({"rate_limits":null}), &data, 200, false);
+        assert!(
+            output.contains("5h 42%") && output.contains("7d 71%"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn snapshot_fallback_only_when_rate_limits_object_is_absent() {
         // Known-bad: filling a missing stdin window from a snapshot, or keeping a rolled window.
         let tmp = TempDir::new().unwrap();
