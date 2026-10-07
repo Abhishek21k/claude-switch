@@ -172,7 +172,12 @@ pub fn read_disk(
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "cswitch".to_string())
     };
-    let claude = read_claude_json_once(config_dir);
+    let snapshot_dir = if configured.is_none() {
+        home
+    } else {
+        config_dir
+    };
+    let claude = read_claude_json_once(snapshot_dir);
     let per_token = registered.is_some_and(|profile| {
         manager.as_ref().is_some_and(|manager| {
             key::read_auth_mode(manager, &profile.name, claude.clone()).api_billed()
@@ -906,7 +911,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         fs::create_dir_all(home.join(".claude")).unwrap();
-        let path = home.join(".claude/.claude.json");
+        let path = home.join(".claude.json");
         let saved = snapshot(
             42.0,
             now().timestamp() + 3600,
@@ -964,6 +969,46 @@ mod tests {
         let _ = read_disk(&Value::Null, home, None, &usage);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn default_uses_home_claude_json_instead_of_config_directory() {
+        // Known-bad: default reads ~/.claude/.claude.json instead of ~/.claude.json.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_vec(&snapshot(
+                42.0,
+                now().timestamp() + 3600,
+                71.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude/.claude.json"),
+            serde_json::to_vec(&snapshot(
+                11.0,
+                now().timestamp() + 3600,
+                22.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let disk = read_disk(&Value::Null, home, None, &home.join("usage"));
+        let output = line(&Value::Null, &disk, 200, false);
+        assert!(
+            output.contains("5h 42%") && output.contains("7d 71%"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("11%") && !output.contains("22%"),
+            "{output}"
+        );
     }
 
     #[test]
