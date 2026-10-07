@@ -3,7 +3,7 @@
 use crate::key;
 use crate::limits::{self, Limits, Snapshot, read_claude_json_once};
 use crate::profile::{self, ProfileManager, Tool};
-use crate::usage::{attribute, metrics};
+use crate::usage::{attribute, billing, chats, metrics, rates};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde_json::Value;
@@ -19,6 +19,9 @@ pub struct DiskData {
     per_token: bool,
     snapshot: Option<Snapshot>,
     headroom: Option<Headroom>,
+    hourly: Option<metrics::Hourly>,
+    chats: Option<chats::Chats>,
+    settings: Option<(rates::Rates, billing::Billing)>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +51,12 @@ struct WindowText {
 struct HeadroomText {
     base: String,
     weekly: Option<String>,
+    age: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TodayText {
+    base: String,
     age: Option<String>,
 }
 
@@ -239,23 +248,36 @@ pub fn read_disk(
         .and_then(|workspace| workspace.get("current_dir"))
         .and_then(Value::as_str)
         .or_else(|| input.get("cwd").and_then(Value::as_str));
-    let (project, project_short) = match (attribute::load_config(usage_dir), cwd) {
+    let (cwd_project, cwd_workspace) = match (attribute::load_config(usage_dir), cwd) {
         (Ok(config), Some(cwd)) => {
             let cwd = Path::new(cwd);
-            if let Some((_, raw)) = attribute::project_for_path(cwd, &config) {
-                let project = config
-                    .aliases
-                    .get(&raw)
-                    .map_or(raw.as_str(), String::as_str);
-                project_display(project)
-                    .map_or((None, None), |(full, short)| (Some(full), Some(short)))
-            } else {
-                let workspace = attribute::workspace_for_path(cwd, &config);
-                (workspace.clone(), workspace)
-            }
+            let project = attribute::project_for_path(cwd, &config)
+                .map(|(_, raw)| config.aliases.get(&raw).cloned().unwrap_or(raw));
+            (project, attribute::workspace_for_path(cwd, &config))
         }
         _ => (None, None),
     };
+    let chats = chats::read(usage_dir);
+    let hourly = metrics::read(usage_dir);
+    let settings = chats
+        .as_ref()
+        .and_then(|_| metrics::load_settings(usage_dir, now).ok());
+    let rollup_project = input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|session| {
+            chats
+                .as_ref()?
+                .projects
+                .iter()
+                .find(|project| project.profile == account && project.session == session)
+        });
+    let (project, project_short) = select_project(
+        cwd_project.as_deref(),
+        cwd_workspace.as_deref(),
+        rollup_project,
+    )
+    .map_or((None, None), |(full, short)| (Some(full), Some(short)));
     DiskData {
         account: clean(&account).trim().to_string(),
         project: project
@@ -267,6 +289,9 @@ pub fn read_disk(
         per_token,
         snapshot,
         headroom,
+        hourly,
+        chats,
+        settings,
     }
 }
 
@@ -299,14 +324,32 @@ fn project_display(project: &str) -> Option<(String, String)> {
         return None;
     }
     if let Some((workspace, name)) = project.split_once('/') {
+        if workspace == "(unattributed)" && name == "(workspace files)" {
+            return None;
+        }
         if workspace == name || workspace == "(unattributed)" {
             Some((name.to_string(), name.to_string()))
+        } else if name == "(workspace files)" {
+            Some((workspace.to_string(), workspace.to_string()))
         } else {
             Some((format!("{workspace} › {name}"), name.to_string()))
         }
     } else {
         Some((project.to_string(), project.to_string()))
     }
+}
+
+fn select_project(
+    cwd_project: Option<&str>,
+    cwd_workspace: Option<&str>,
+    rollup: Option<&chats::ChatProject>,
+) -> Option<(String, String)> {
+    let label = rollup.filter(|project| project.signal == "label");
+    label
+        .and_then(|project| project_display(&project.project))
+        .or_else(|| cwd_project.and_then(project_display))
+        .or_else(|| rollup.and_then(|project| project_display(&project.project)))
+        .or_else(|| cwd_workspace.and_then(project_display))
 }
 
 fn clean(value: &str) -> String {
@@ -449,6 +492,114 @@ fn context_text(input: &Value, colour: bool) -> Option<String> {
     }
 }
 
+fn session_amount(
+    rollup: &chats::Chats,
+    profile: &str,
+    session: &str,
+    rates: &rates::Rates,
+    entry: Option<&billing::ProfileBilling>,
+    per_token: bool,
+) -> (metrics::Amount, bool) {
+    let mut amount = metrics::Amount::default();
+    let mut found = false;
+    for row in rollup
+        .rows
+        .iter()
+        .filter(|row| row.profile == profile && row.session == session)
+    {
+        found = true;
+        let (list, spend) = billing::price(
+            &row.model,
+            row.speed.as_deref(),
+            row.tokens(),
+            rates,
+            entry,
+            per_token,
+        );
+        if let Some(value) = list {
+            amount.value += value;
+            amount.priced += row.requests;
+        } else {
+            amount.unpriced += row.requests;
+        }
+        if per_token {
+            if let Some(value) = spend {
+                amount.spend += value;
+                amount.spend_priced += row.requests;
+            } else {
+                amount.spend_unpriced += row.requests;
+            }
+        }
+    }
+    (amount, found)
+}
+
+fn money_segments(
+    input: &Value,
+    disk: &DiskData,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> (Option<String>, Option<TodayText>) {
+    let live = input
+        .get("cost")
+        .and_then(|cost| cost.get("total_cost_usd"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let mut chat = if disk.per_token {
+        None
+    } else {
+        live.map(|value| format!("chat ~{}", metrics::money(value)))
+    };
+    let (Some(rollup), Some((rates, billing))) = (&disk.chats, &disk.settings) else {
+        return (chat, None);
+    };
+    let entry = billing.profiles.get(&disk.account);
+    let session = input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(|session| {
+            session_amount(rollup, &disk.account, session, rates, entry, disk.per_token)
+        });
+    if disk.per_token {
+        chat = session
+            .as_ref()
+            .filter(|(_, found)| *found)
+            .map(|(amount, _)| format!("chat {}", amount.spend_cell()));
+    }
+    let today = disk.hourly.as_ref().map(|hourly| {
+        let mut amount = metrics::windows(
+            &hourly.rows,
+            &disk.account,
+            now,
+            offset,
+            rates,
+            entry,
+            disk.per_token,
+        )[0]
+        .clone();
+        if !disk.per_token
+            && let (Some(live), Some((ledger_chat, _))) = (live, &session)
+            && ledger_chat.unpriced == 0
+        {
+            let topup = (live - ledger_chat.value).max(0.0);
+            if topup > 0.0 {
+                amount.value += topup;
+                amount.priced += 1;
+            }
+        }
+        let cell = if disk.per_token {
+            amount.spend_cell()
+        } else {
+            amount.list_cell()
+        };
+        TodayText {
+            base: format!("today {cell}"),
+            age: age_suffix(now, hourly.generated_at),
+        }
+    });
+    (chat, today)
+}
+
 fn visible_len(value: &str) -> usize {
     let mut chars = value.chars();
     let mut length = 0;
@@ -473,7 +624,7 @@ fn compose(
     seven: &Option<WindowText>,
     headroom: &Option<HeadroomText>,
     ctx: &Option<String>,
-    chat: &Option<String>,
+    costs: (&Option<String>, &Option<TodayText>),
 ) -> String {
     let mut parts = vec![account.to_string()];
     if let Some(project) = project {
@@ -502,8 +653,15 @@ fn compose(
     if let Some(ctx) = ctx {
         parts.push(ctx.clone());
     }
-    if let Some(chat) = chat {
+    if let Some(chat) = costs.0 {
         parts.push(chat.clone());
+    }
+    if let Some(today) = costs.1 {
+        let mut text = today.base.clone();
+        if let Some(age) = &today.age {
+            text.push_str(&format!(" {age}"));
+        }
+        parts.push(text);
     }
     parts.join(" · ")
 }
@@ -547,18 +705,17 @@ pub fn render(
         age: age_suffix(now, candidate.fetched_at),
     });
     let mut ctx = context_text(input, colour);
-    let mut chat = if disk.per_token {
-        None
-    } else {
-        input
-            .get("cost")
-            .and_then(|cost| cost.get("total_cost_usd"))
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .map(|value| format!("chat ~{}", metrics::money(value)))
-    };
+    let (mut chat, mut today) = money_segments(input, disk, now, offset);
     for step in 0..11 {
-        let line = compose(&account, &project, &five, &seven, &headroom, &ctx, &chat);
+        let line = compose(
+            &account,
+            &project,
+            &five,
+            &seven,
+            &headroom,
+            &ctx,
+            (&chat, &today),
+        );
         if visible_len(&line) <= budget {
             return line;
         }
@@ -570,7 +727,11 @@ pub fn render(
                 if let Some(candidate) = &mut headroom {
                     candidate.age = None;
                 }
+                if let Some(today) = &mut today {
+                    today.age = None;
+                }
             }
+            1 => today = None,
             2 => chat = None,
             3 => {
                 if let Some(window) = &mut seven {
@@ -590,8 +751,15 @@ pub fn render(
                     .and_then(|value| value.weekly.take())
                     .is_some();
                 if had_weekly {
-                    let shorter =
-                        compose(&account, &project, &five, &seven, &headroom, &ctx, &chat);
+                    let shorter = compose(
+                        &account,
+                        &project,
+                        &five,
+                        &seven,
+                        &headroom,
+                        &ctx,
+                        (&chat, &today),
+                    );
                     if visible_len(&shorter) <= budget {
                         return shorter;
                     }
@@ -601,7 +769,7 @@ pub fn render(
             8 => seven = None,
             9 => project = None,
             10 => five = None,
-            _ => {} // Part B adds the first two steps.
+            _ => {}
         }
     }
     if account.chars().count() > budget {
@@ -634,7 +802,72 @@ mod tests {
             per_token: false,
             snapshot: None,
             headroom: None,
+            hourly: None,
+            chats: None,
+            settings: None,
         }
+    }
+    fn ledger_disk() -> DiskData {
+        let mut data = disk();
+        data.hourly = Some(metrics::Hourly {
+            version: 1,
+            generated_at: now(),
+            rows: vec![metrics::Bucket {
+                profile: "work".into(),
+                hour: now() - chrono::Duration::hours(1),
+                model: "priced".into(),
+                speed: None,
+                requests: 1,
+                input: 20_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+        });
+        data.chats = Some(chats::Chats {
+            version: 1,
+            generated_at: now(),
+            rows: vec![chats::ChatRow {
+                profile: "work".into(),
+                session: "s".into(),
+                model: "priced".into(),
+                speed: None,
+                requests: 1,
+                input: 1_000_000,
+                output: 0,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+                cache_read: 0,
+            }],
+            projects: Vec::new(),
+        });
+        let price = rates::Price {
+            input: 1.0,
+            output: 0.0,
+            cache_write_5m: 0.0,
+            cache_write_1h: 0.0,
+            cache_read: 0.0,
+        };
+        data.settings = Some((
+            rates::Rates {
+                source: "synthetic".into(),
+                unit: "USD per million tokens".into(),
+                models: BTreeMap::from([(
+                    "priced".into(),
+                    rates::ModelRate {
+                        standard: price,
+                        fast: None,
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+            },
+            billing::Billing {
+                version: 1,
+                ..billing::Billing::default()
+            },
+        ));
+        data
     }
     fn read_disk(
         input: &Value,
@@ -1044,6 +1277,133 @@ mod tests {
         assert_eq!(disk.project_short.as_deref(), Some("tool"));
         assert!(!line(&input, &disk, 200, false).contains("(unattributed)"));
         assert_eq!(project_display("(unattributed)"), None);
+    }
+
+    #[test]
+    fn rollup_project_follows_label_cwd_files_workspace_order() {
+        // Known-bads: cwd outranks a label or files outrank the cwd project.
+        let mut rollup = chats::ChatProject {
+            profile: "work".into(),
+            session: "s".into(),
+            project: "blue/label".into(),
+            signal: "label".into(),
+        };
+        assert_eq!(
+            select_project(Some("acme/site"), Some("acme"), Some(&rollup)),
+            Some(("blue › label".into(), "label".into()))
+        );
+        rollup.project = "blue/files".into();
+        rollup.signal = "files".into();
+        assert_eq!(
+            select_project(Some("acme/site"), Some("acme"), Some(&rollup)),
+            Some(("acme › site".into(), "site".into()))
+        );
+        assert_eq!(
+            select_project(None, Some("acme"), Some(&rollup)),
+            Some(("blue › files".into(), "files".into()))
+        );
+        assert_eq!(
+            select_project(None, Some("acme"), None),
+            Some(("acme".into(), "acme".into()))
+        );
+        rollup.project = "blue/(workspace files)".into();
+        assert_eq!(
+            select_project(None, Some("acme"), Some(&rollup)),
+            Some(("blue".into(), "blue".into()))
+        );
+        rollup.project = "(unattributed)/tool".into();
+        assert_eq!(
+            select_project(None, Some("acme"), Some(&rollup)),
+            Some(("tool".into(), "tool".into()))
+        );
+        rollup.project = "(unattributed)".into();
+        assert_eq!(
+            select_project(None, Some("acme"), Some(&rollup)),
+            Some(("acme".into(), "acme".into()))
+        );
+        rollup.project = "(unattributed)/(workspace files)".into();
+        assert_eq!(
+            select_project(None, Some("acme"), Some(&rollup)),
+            Some(("acme".into(), "acme".into()))
+        );
+    }
+
+    #[test]
+    fn read_disk_matches_rollup_session_before_cwd_project() {
+        // Known-bad: the rollup is read but its label loses to a different cwd project.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude)]);
+        let profile = home.join(".claude-switch/profiles/work");
+        let root = home.join("atlas");
+        let site = root.join("apps/site/src");
+        let other = root.join("apps/other/src");
+        let workspace_only = root.join("apps/misc");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("apps/site/.git")).unwrap();
+        fs::create_dir_all(root.join("apps/other/.git")).unwrap();
+        fs::create_dir_all(&site).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&workspace_only).unwrap();
+        let usage = home.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        fs::write(
+            usage.join("config.json"),
+            serde_json::to_vec(&json!({
+                "superproject":root,"workspaces":[{"glob":"apps/*","name":"acme"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut rollup = chats::Chats {
+            version: 1,
+            generated_at: now(),
+            rows: Vec::new(),
+            projects: vec![chats::ChatProject {
+                profile: "work".into(),
+                session: "s".into(),
+                project: "acme/site".into(),
+                signal: "label".into(),
+            }],
+        };
+        let save = |rollup: &chats::Chats| {
+            fs::write(
+                usage.join("chats.json"),
+                serde_json::to_vec(rollup).unwrap(),
+            )
+            .unwrap()
+        };
+        save(&rollup);
+        let input = json!({"session_id":"s","cwd":other});
+        assert_eq!(
+            read_disk(&input, home, Some(&profile), &usage)
+                .project
+                .as_deref(),
+            Some("acme › site")
+        );
+        rollup.projects[0].signal = "files".into();
+        save(&rollup);
+        assert_eq!(
+            read_disk(&input, home, Some(&profile), &usage)
+                .project
+                .as_deref(),
+            Some("acme › other")
+        );
+        let workspace_input = json!({"session_id":"s","cwd":workspace_only});
+        assert_eq!(
+            read_disk(&workspace_input, home, Some(&profile), &usage)
+                .project
+                .as_deref(),
+            Some("acme › site")
+        );
+        rollup.projects.clear();
+        save(&rollup);
+        assert_eq!(
+            read_disk(&workspace_input, home, Some(&profile), &usage)
+                .project
+                .as_deref(),
+            Some("acme")
+        );
     }
 
     #[test]
@@ -1798,6 +2158,125 @@ mod tests {
                 "{output}"
             );
         }
+    }
+
+    #[test]
+    fn today_tops_up_only_the_unrecorded_part_of_a_live_chat() {
+        // Known-bads: adding the full live cost twice, subtracting a negative
+        // top-up, or topping up an unpriced or unreadable session rollup.
+        let mut data = ledger_disk();
+        for (live, expected) in [(1.70, "today ~$20.70"), (0.50, "today ~$20.00")] {
+            let input = json!({"session_id":"s","cost":{"total_cost_usd":live}});
+            let output = line(&input, &data, 200, false);
+            assert!(output.contains(expected), "{output}");
+        }
+        data.chats.as_mut().unwrap().rows.clear();
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let output = line(&input, &data, 200, false);
+        assert!(output.contains("today ~$21.70"), "{output}");
+        data.chats.as_mut().unwrap().rows.push(chats::ChatRow {
+            profile: "work".into(),
+            session: "s".into(),
+            model: "unknown".into(),
+            speed: None,
+            requests: 1,
+            input: 1_000_000,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        });
+        let output = line(&input, &data, 200, false);
+        assert!(
+            output.contains("today ~$20.00") && !output.contains("20.70"),
+            "{output}"
+        );
+        data.chats = None;
+        let output = line(&input, &data, 200, false);
+        assert!(
+            !output.contains("today") && output.contains("chat ~$1.70"),
+            "{output}"
+        );
+        data.chats = ledger_disk().chats;
+        data.settings = None;
+        assert!(!line(&input, &data, 200, false).contains("today"));
+        let mut data = ledger_disk();
+        let zero = json!({"session_id":"s","cost":{"total_cost_usd":0}});
+        assert!(line(&zero, &data, 200, false).contains("today ~$20.00"));
+        assert!(!line(&zero, &data, 200, false).contains("chat"));
+        data.hourly.as_mut().unwrap().rows.push(metrics::Bucket {
+            profile: "work".into(),
+            hour: now() - chrono::Duration::hours(1),
+            model: "unknown".into(),
+            speed: None,
+            requests: 1,
+            input: 1,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        });
+        assert!(line(&zero, &data, 200, false).contains("today ~$20.00*"));
+    }
+
+    #[test]
+    fn per_token_chat_and_today_use_profile_flat_rate() {
+        // Known-bads: a per-token line uses the live estimate, list price,
+        // or a live top-up after pricing at the profile's flat rate.
+        let mut data = ledger_disk();
+        data.per_token = true;
+        data.settings.as_mut().unwrap().1.profiles.insert(
+            "work".into(),
+            billing::ProfileBilling {
+                rate: Some(billing::Rate {
+                    model_prefixes: Vec::new(),
+                    price: billing::RatePrice::Flat { flat: 2.0 },
+                }),
+                ..billing::ProfileBilling::default()
+            },
+        );
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":100.0}});
+        let output = line(&input, &data, 200, false);
+        assert!(
+            output.contains("chat $2.00") && output.contains("today $40.00"),
+            "{output}"
+        );
+        assert!(
+            !output.contains('~') && !output.contains("$100"),
+            "{output}"
+        );
+        data.chats.as_mut().unwrap().rows.clear();
+        let output = line(&input, &data, 200, false);
+        assert!(
+            !output.contains("chat") && output.contains("today $40.00"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn today_age_boundaries_and_shedding_are_exact() {
+        // Known-bad: a stale today figure has no age, or an age survives after chat sheds.
+        let mut data = ledger_disk();
+        for (seconds, expected) in [
+            (300, None),
+            (301, Some("(5m)")),
+            (3599, Some("(59m)")),
+            (3600, Some("(1h)")),
+            (48 * 3600, Some("(2d)")),
+        ] {
+            data.hourly.as_mut().unwrap().generated_at = now() - chrono::Duration::seconds(seconds);
+            let (_, today) = money_segments(&json!({"session_id":"s"}), &data, now(), offset());
+            assert_eq!(today.unwrap().age.as_deref(), expected);
+        }
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let full = line(&input, &data, 200, false);
+        let shed = line(&input, &data, full.chars().count() + 3, false);
+        assert!(full.contains("today ~$20.70 (2d)"), "{full}");
+        assert!(
+            shed.contains("today ~$20.70") && !shed.contains("(2d)"),
+            "{shed}"
+        );
+        assert!(shed.contains("chat ~$1.70"), "{shed}");
     }
 
     #[test]
