@@ -1479,6 +1479,41 @@ mod tests {
     }
 
     #[test]
+    fn context_zero_colour_and_large_values_are_distinct() {
+        // Known-bads: ctx 0, a never-yellow large context, or all million values as 1.0M.
+        assert!(
+            !line(
+                &json!({"context_window":{"total_input_tokens":0}}),
+                &disk(),
+                200,
+                false
+            )
+            .contains("ctx")
+        );
+        for (value, expected) in [(1_200_000, "ctx 1.2M"), (2_340_000, "ctx 2.3M")] {
+            let output = line(
+                &json!({"context_window":{"total_input_tokens":value}}),
+                &disk(),
+                200,
+                false,
+            );
+            assert!(output.contains(expected), "{output}");
+        }
+        let high = json!({"context_window":{"total_input_tokens":250_000},
+            "exceeds_200k_tokens":true});
+        assert!(line(&high, &disk(), 200, true).contains("\x1b[33mctx 250k\x1b[0m"));
+        for value in [json!(false), Value::Null] {
+            let input = json!({"context_window":{"total_input_tokens":250_000},
+                "exceeds_200k_tokens":value});
+            let output = line(&input, &disk(), 200, true);
+            assert!(
+                output.contains("ctx 250k") && !output.contains("\x1b[33mctx"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
     fn registered_per_token_profile_ignores_live_chat_cost() {
         // Known-bad: reading the live estimate for an API-billed profile.
         let tmp = TempDir::new().unwrap();
