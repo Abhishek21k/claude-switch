@@ -115,6 +115,10 @@ pub fn manage(
 }
 
 pub fn command_line() -> String {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CSWITCH_TEST_STATUSLINE_PANIC").is_some() {
+        panic!("statusline panic-guard probe");
+    }
     let input = if io::stdin().is_terminal() {
         Value::Null
     } else {

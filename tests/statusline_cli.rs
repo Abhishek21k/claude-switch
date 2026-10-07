@@ -12,7 +12,8 @@ fn command(home: &Path) -> Command {
         .env_remove("CSWITCH_USAGE_DIR")
         .env_remove("COLUMNS")
         .env_remove("NO_COLOR")
-        .env_remove("TZ");
+        .env_remove("TZ")
+        .env_remove("CSWITCH_TEST_STATUSLINE_PANIC");
     command
 }
 
@@ -328,4 +329,31 @@ fn binary_uses_tz_for_weekly_reset_weekday() {
         suffixes.push(expected.to_string());
     }
     assert_ne!(suffixes[0], suffixes[1]);
+}
+
+#[test]
+fn oversized_stdin_uses_account_fallback_without_failing() {
+    // Known-bad: a missing cap accepts the 1.5 MiB object's final rate_limits.
+    let home = TempDir::new().unwrap();
+    let payload = format!(
+        "{{\"padding\":\"{}\",\"rate_limits\":{{\"five_hour\":{{\"used_percentage\":88}}}}}}",
+        "x".repeat(1_500_000)
+    );
+    let output = run_status(home.path(), Some(payload.as_bytes()), |_| {});
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"default\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn panic_guard_prints_cswitch_without_stderr() {
+    // Known-bads: an empty fallback or the default panic hook writing to stderr.
+    let home = TempDir::new().unwrap();
+    let output = run_status(home.path(), Some(b"{}"), |command| {
+        command.env("CSWITCH_TEST_STATUSLINE_PANIC", "1");
+    });
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"cswitch\n");
+    assert!(output.stderr.is_empty());
 }
