@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde_json::Value;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Default)]
 pub struct DiskData {
@@ -64,6 +65,20 @@ struct TodayText {
 pub enum Action {
     Install { no_refresh: bool, force: bool },
     Uninstall,
+}
+
+pub struct CommandOutput {
+    line: String,
+    refresh_dir: Option<PathBuf>,
+}
+
+impl CommandOutput {
+    pub fn fallback() -> Self {
+        Self {
+            line: "cswitch".into(),
+            refresh_dir: None,
+        }
+    }
 }
 
 pub fn manage(
@@ -123,7 +138,7 @@ pub fn manage(
     Ok((output, failed))
 }
 
-pub fn command_line() -> String {
+pub fn command_line(no_refresh: bool) -> CommandOutput {
     #[cfg(debug_assertions)]
     if std::env::var_os("CSWITCH_TEST_STATUSLINE_PANIC").is_some() {
         panic!("statusline panic-guard probe");
@@ -149,14 +164,92 @@ pub fn command_line() -> String {
         .ok()
         .and_then(|raw| raw.parse().ok());
     let colour = std::env::var_os("NO_COLOR").is_none_or(|raw| raw.is_empty());
-    render(
+    let line = render(
         &input,
         &disk,
         columns,
         colour,
         now,
         local_now.offset().fix(),
-    )
+    );
+    let refresh_dir = refresh_dir(
+        &usage_dir,
+        no_refresh,
+        now,
+        disk.hourly.as_ref().map(|hourly| hourly.generated_at),
+        disk.chats.is_some(),
+    );
+    CommandOutput { line, refresh_dir }
+}
+
+fn refresh_dir(
+    usage_dir: &Path,
+    no_refresh: bool,
+    now: DateTime<Utc>,
+    hourly_at: Option<DateTime<Utc>>,
+    rollup_present: bool,
+) -> Option<PathBuf> {
+    if no_refresh || !usage_dir.join("cursors.json").exists() {
+        return None;
+    }
+    let last_attempt = fs::metadata(usage_dir.join(".refresh-attempt"))
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(DateTime::<Utc>::from);
+    refresh_due(now, hourly_at, rollup_present, last_attempt).then(|| usage_dir.to_path_buf())
+}
+
+fn refresh_due(
+    now: DateTime<Utc>,
+    hourly_at: Option<DateTime<Utc>>,
+    rollup_present: bool,
+    last_attempt: Option<DateTime<Utc>>,
+) -> bool {
+    let stale = !rollup_present
+        || hourly_at.is_none_or(|generated_at| (now - generated_at).num_seconds() > 300);
+    let allowed = last_attempt.is_none_or(|attempt| (now - attempt).num_seconds() > 60);
+    stale && allowed
+}
+
+pub fn emit_and_refresh<W: Write, F: FnOnce(&Path, &[&str])>(
+    output: CommandOutput,
+    stdout: &mut W,
+    launch: F,
+) {
+    if writeln!(stdout, "{}", output.line).is_err() || stdout.flush().is_err() {
+        return;
+    }
+    let Some(dir) = output.refresh_dir else {
+        return;
+    };
+    if fs::write(dir.join(".refresh-attempt"), b"").is_err() {
+        return;
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        launch(&executable, &["usage", "refresh"]);
+    }
+}
+
+pub fn spawn_refresh(executable: &Path, args: &[&str]) {
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let _ = command.spawn();
 }
 
 pub fn read_disk(
@@ -2277,6 +2370,109 @@ mod tests {
             "{shed}"
         );
         assert!(shed.contains("chat ~$1.70"), "{shed}");
+    }
+
+    #[test]
+    fn refresh_decision_uses_strict_age_edges_and_existing_ledger() {
+        // Known-bads: >= at either boundary, refreshing without cursors,
+        // or ignoring a missing rollup or attempt file.
+        let at = now();
+        for (hourly_age, attempt_age, expected) in [
+            (300, 60, false),
+            (300, 61, false),
+            (301, 60, false),
+            (301, 61, true),
+        ] {
+            assert_eq!(
+                refresh_due(
+                    at,
+                    Some(at - chrono::Duration::seconds(hourly_age)),
+                    true,
+                    Some(at - chrono::Duration::seconds(attempt_age)),
+                ),
+                expected
+            );
+        }
+        assert!(refresh_due(at, Some(at), false, None));
+        assert!(refresh_due(at, None, true, None));
+        assert!(refresh_due(
+            at,
+            Some(at - chrono::Duration::seconds(301)),
+            true,
+            None
+        ));
+        let tmp = TempDir::new().unwrap();
+        let usage = tmp.path().join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        assert!(refresh_dir(&usage, false, at, None, false).is_none());
+        fs::write(usage.join("cursors.json"), b"{}").unwrap();
+        assert_eq!(
+            refresh_dir(&usage, false, at, None, false).as_deref(),
+            Some(usage.as_path())
+        );
+        assert!(refresh_dir(&usage, true, at, None, false).is_none());
+    }
+
+    #[test]
+    fn refresh_launcher_runs_only_after_flush_and_successful_touch() {
+        // Known-bads: spawning before stdout is flushed, twice, on --no-refresh,
+        // or after the attempt marker could not be written.
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        struct ProbeWriter {
+            bytes: Rc<RefCell<Vec<u8>>>,
+            flushed: Rc<Cell<bool>>,
+        }
+        impl Write for ProbeWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed.set(true);
+                Ok(())
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let flushed = Rc::new(Cell::new(false));
+        let mut writer = ProbeWriter {
+            bytes: bytes.clone(),
+            flushed: flushed.clone(),
+        };
+        let calls = Cell::new(0);
+        emit_and_refresh(
+            CommandOutput {
+                line: "work".into(),
+                refresh_dir: Some(tmp.path().to_path_buf()),
+            },
+            &mut writer,
+            |_, args| {
+                calls.set(calls.get() + 1);
+                assert!(flushed.get());
+                assert_eq!(&*bytes.borrow(), b"work\n");
+                assert_eq!(args, ["usage", "refresh"]);
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(tmp.path().join(".refresh-attempt").exists());
+        emit_and_refresh(
+            CommandOutput {
+                line: "work".into(),
+                refresh_dir: None,
+            },
+            &mut writer,
+            |_, _| calls.set(calls.get() + 1),
+        );
+        emit_and_refresh(
+            CommandOutput {
+                line: "work".into(),
+                refresh_dir: Some(tmp.path().join("missing")),
+            },
+            &mut writer,
+            |_, _| calls.set(calls.get() + 1),
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

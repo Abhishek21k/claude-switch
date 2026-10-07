@@ -133,13 +133,7 @@ fn foreign_statusline_refusal_exits_one_without_a_write() {
 fn usage_refresh_is_silent_and_busy_lock_is_a_noop() {
     // Known-bad: a busy lock makes refresh fail or print a report.
     let home = TempDir::new().unwrap();
-    let profile = register(home.path(), "work");
-    let projects = profile.join("projects/demo");
-    fs::create_dir_all(&projects).unwrap();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/usage/profile/projects/demo/a.jsonl");
-    fs::copy(fixture, projects.join("a.jsonl")).unwrap();
-    let usage = home.path().join("usage");
+    let (_, usage) = usage_fixture(home.path());
     let refresh = || {
         command(home.path())
             .env("CSWITCH_USAGE_DIR", &usage)
@@ -177,6 +171,151 @@ fn usage_refresh_is_silent_and_busy_lock_is_a_noop() {
 }
 
 #[test]
+fn stale_statusline_prints_before_detached_refresh_and_never_waits_on_lock() {
+    // Known-bads: waiting for ingest, or blocking the line behind a held ledger lock.
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let hourly_path = usage.join("hourly.json");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    let make_stale = || {
+        let mut hourly: serde_json::Value =
+            serde_json::from_slice(&fs::read(&hourly_path).unwrap()).unwrap();
+        hourly["generated_at"] = serde_json::json!(stale);
+        fs::write(&hourly_path, serde_json::to_vec(&hourly).unwrap()).unwrap();
+    };
+    make_stale();
+    let payload =
+        br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#;
+    let render = || {
+        run_status(home.path(), Some(payload), |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &profile)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120")
+                .env("NO_COLOR", "1");
+        })
+    };
+    let start = Instant::now();
+    let output = render();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "statusline took {:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(line.contains("today") && line.contains("(10m)"), "{line}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let hourly: serde_json::Value =
+            serde_json::from_slice(&fs::read(&hourly_path).unwrap()).unwrap();
+        let generated: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(hourly["generated_at"].clone()).unwrap();
+        if generated > stale {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached refresh did not update hourly.json"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "first refresh held lock too long"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    make_stale();
+    fs::remove_file(usage.join(".refresh-attempt")).unwrap();
+    let files = ["hourly.json", "chats.json", "cursors.json", "summary.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let start = Instant::now();
+    let output = render();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "locked statusline took {:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(10m)"));
+    std::thread::sleep(Duration::from_millis(100));
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0, "{file}");
+        assert_eq!(
+            fs::metadata(path).unwrap().modified().unwrap(),
+            expected.1,
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn no_refresh_statusline_reads_existing_ledger_without_writes() {
+    // Known-bad: a statusline read seeds settings or refreshes a ledger anyway.
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
+    fn files(root: &Path) -> BTreeMap<std::path::PathBuf, (Vec<u8>, SystemTime)> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    found.insert(
+                        path.clone(),
+                        (
+                            fs::read(&path).unwrap(),
+                            fs::metadata(path).unwrap().modified().unwrap(),
+                        ),
+                    );
+                }
+            }
+        }
+        found
+    }
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let before = files(home.path());
+    let output = run_status(home.path(), Some(b"{}"), |command| {
+        command
+            .arg("--no-refresh")
+            .env("CLAUDE_CONFIG_DIR", &profile)
+            .env("CSWITCH_USAGE_DIR", &usage);
+    });
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(files(home.path()), before);
+    assert!(!usage.join(".refresh-attempt").exists());
+}
+
+#[test]
 fn no_color_env_removes_limit_escape_sequences() {
     // Known-bad: treating NO_COLOR as a terminal-only setting and emitting escapes into a pipe.
     let home = TempDir::new().unwrap();
@@ -206,6 +345,16 @@ fn register(home: &Path, name: &str) -> std::path::PathBuf {
     )
     .unwrap();
     profile
+}
+
+fn usage_fixture(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let profile = register(home, "work");
+    let projects = profile.join("projects/demo");
+    fs::create_dir_all(&projects).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/usage/profile/projects/demo/a.jsonl");
+    fs::copy(fixture, projects.join("a.jsonl")).unwrap();
+    (profile, home.join("usage"))
 }
 
 #[test]

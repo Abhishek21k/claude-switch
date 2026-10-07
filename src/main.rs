@@ -342,18 +342,17 @@ fn ask_save_defaults(base_dir: &Path, input: &gateway::GatewayInput) -> Result<b
 
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
-    if matches!(
-        &cli.command,
-        Some(Commands::Statusline {
-            install: false,
-            uninstall: false,
-            ..
-        })
-    ) {
+    if let Some(Commands::Statusline {
+        install: false,
+        uninstall: false,
+        no_refresh,
+        ..
+    }) = &cli.command
+    {
         std::panic::set_hook(Box::new(|_| {}));
-        let line = std::panic::catch_unwind(statusline::command_line)
-            .unwrap_or_else(|_| "cswitch".to_string());
-        let _ = io::stdout().write_all(format!("{line}\n").as_bytes());
+        let output = std::panic::catch_unwind(|| statusline::command_line(*no_refresh))
+            .unwrap_or_else(|_| statusline::CommandOutput::fallback());
+        statusline::emit_and_refresh(output, &mut io::stdout(), statusline::spawn_refresh);
         return Ok(());
     }
     if let Some(Commands::Statusline {
