@@ -186,10 +186,27 @@ enum Commands {
         action: Option<UsageAction>,
     },
 
-    /// Print one Claude Code status line
+    /// Print or install a Claude Code status line
+    #[command(group(ArgGroup::new("statusline_action").args(["install", "uninstall"])))]
+    #[command(group(ArgGroup::new("statusline_target").args(["name", "all"])))]
     Statusline {
+        /// Install the command in a profile's settings.json
+        #[arg(long, requires = "statusline_target")]
+        install: bool,
+        /// Remove a cswitch-owned status line
+        #[arg(long, requires = "statusline_target")]
+        uninstall: bool,
+        /// Registered Claude profile
+        #[arg(requires = "statusline_action")]
+        name: Option<String>,
+        /// Apply to every registered Claude profile
+        #[arg(long, requires = "statusline_action")]
+        all: bool,
+        /// Replace a status line owned by another command
+        #[arg(long, requires = "install", conflicts_with = "uninstall")]
+        force: bool,
         /// Render without a background ledger refresh
-        #[arg(long)]
+        #[arg(long, conflicts_with = "uninstall")]
         no_refresh: bool,
     },
 }
@@ -323,11 +340,55 @@ fn ask_save_defaults(base_dir: &Path, input: &gateway::GatewayInput) -> Result<b
 
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
-    if matches!(&cli.command, Some(Commands::Statusline { .. })) {
+    if matches!(
+        &cli.command,
+        Some(Commands::Statusline {
+            install: false,
+            uninstall: false,
+            ..
+        })
+    ) {
         std::panic::set_hook(Box::new(|_| {}));
         let line = std::panic::catch_unwind(statusline::command_line)
             .unwrap_or_else(|_| "cswitch".to_string());
         let _ = io::stdout().write_all(format!("{line}\n").as_bytes());
+        return Ok(());
+    }
+    if let Some(Commands::Statusline {
+        install,
+        name,
+        all,
+        force,
+        no_refresh,
+        ..
+    }) = &cli.command
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let manager = ProfileManager::with_paths_read_only(
+            home.join(".claude-switch"),
+            home.join(".claude"),
+        )?;
+        let action = if *install {
+            statusline::Action::Install {
+                no_refresh: *no_refresh,
+                force: *force,
+            }
+        } else {
+            statusline::Action::Uninstall
+        };
+        let (output, failed) = statusline::manage(
+            &manager,
+            name.as_deref(),
+            *all,
+            action,
+            &std::env::current_exe()?,
+            Utc::now(),
+        )?;
+        print!("{output}");
+        if failed {
+            std::process::exit(1);
+        }
         return Ok(());
     }
     if let Some(Commands::Key {
@@ -678,6 +739,43 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod statusline_flags_tests {
+    use super::*;
+
+    #[test]
+    fn install_uninstall_targets_and_force_are_checked_by_clap() {
+        // Known-bad: accepting a target without an action or --force on uninstall.
+        for args in [
+            vec!["cswitch", "statusline", "--install"],
+            vec!["cswitch", "statusline", "--uninstall"],
+            vec!["cswitch", "statusline", "work"],
+            vec!["cswitch", "statusline", "--all"],
+            vec!["cswitch", "statusline", "--force"],
+            vec!["cswitch", "statusline", "--install", "work", "--all"],
+            vec!["cswitch", "statusline", "--uninstall", "work", "--force"],
+            vec!["cswitch", "statusline", "--install", "--uninstall", "work"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+        for args in [
+            vec!["cswitch", "statusline"],
+            vec!["cswitch", "statusline", "--no-refresh"],
+            vec![
+                "cswitch",
+                "statusline",
+                "--install",
+                "work",
+                "--no-refresh",
+                "--force",
+            ],
+            vec!["cswitch", "statusline", "--uninstall", "--all"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+        }
+    }
 }
 
 fn remove_profile_with_usage(

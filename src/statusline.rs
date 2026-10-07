@@ -2,10 +2,12 @@
 
 use crate::key;
 use crate::limits::{self, Limits, Snapshot, read_claude_json};
-use crate::profile::{ProfileManager, Tool};
+use crate::profile::{self, ProfileManager, Tool};
 use crate::usage::{attribute, metrics};
+use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde_json::Value;
+use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,65 @@ struct WindowText {
 struct HeadroomText {
     base: String,
     weekly: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub enum Action {
+    Install { no_refresh: bool, force: bool },
+    Uninstall,
+}
+
+pub fn manage(
+    manager: &ProfileManager,
+    name: Option<&str>,
+    all: bool,
+    action: Action,
+    executable: &Path,
+    now: DateTime<Utc>,
+) -> Result<(String, bool)> {
+    let command = match action {
+        Action::Install { no_refresh, .. } => {
+            let executable =
+                fs::canonicalize(executable).context("Cannot resolve cswitch executable")?;
+            Some(format!(
+                "{} statusline{}",
+                profile::shell_quote(&executable.to_string_lossy()),
+                if no_refresh { " --no-refresh" } else { "" }
+            ))
+        }
+        Action::Uninstall => None,
+    };
+    let names = if all {
+        manager
+            .list_profiles()?
+            .into_iter()
+            .filter(|profile| profile.tool == Tool::Claude)
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>()
+    } else {
+        name.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    let mut output = String::new();
+    let mut failed = false;
+    for name in names {
+        let force = matches!(action, Action::Install { force: true, .. });
+        match key::edit_statusline(manager, &name, command.as_deref(), force, now) {
+            Ok(changed) => {
+                let phrase = match (action, changed) {
+                    (Action::Install { .. }, true) => "installed",
+                    (Action::Install { .. }, false) => "already installed",
+                    (Action::Uninstall, true) => "removed",
+                    (Action::Uninstall, false) => "nothing to remove",
+                };
+                output.push_str(&format!("{name}: {phrase}\n"));
+            }
+            Err(error) => {
+                failed = true;
+                output.push_str(&format!("{name}: {error}\n"));
+            }
+        }
+    }
+    Ok((output, failed))
 }
 
 pub fn command_line() -> String {
@@ -182,9 +243,13 @@ pub fn read_disk(
         _ => (None, None),
     };
     DiskData {
-        account: clean(&account),
-        project: project.map(|value| clean(&value)),
-        project_short: project_short.map(|value| clean(&value)),
+        account: clean(&account).trim().to_string(),
+        project: project
+            .map(|value| clean(&value).trim().to_string())
+            .filter(|value| !value.is_empty()),
+        project_short: project_short
+            .map(|value| clean(&value).trim().to_string())
+            .filter(|value| !value.is_empty()),
         per_token,
         snapshot,
         headroom,
@@ -934,6 +999,38 @@ mod tests {
             false,
         );
         assert!(output.contains("→ spare 5h 10%") && !output.contains("7d 79%"));
+        write(
+            "spare",
+            snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                80.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&current), &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("→ spare 5h 10% 7d 80%"), "{output}");
+        let mut mismatch = snapshot(
+            0.0,
+            now().timestamp() + 3600,
+            80.0,
+            now().timestamp() + 86400,
+        );
+        mismatch["cachedUsageUtilization"]["accountUuid"] =
+            json!("00000000-0000-4000-8000-000000000002");
+        write("spare", mismatch);
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&current), &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("→ other 5h 20%"), "{output}");
     }
 
     #[test]
@@ -1116,5 +1213,59 @@ mod tests {
         let mut after = BTreeMap::new();
         tree(home, &mut after);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn all_installs_claude_profiles_in_order_and_continues_after_refusal() {
+        // Known-bad: --all stops at the first refusal or includes a Codex profile.
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        register(
+            home,
+            &[
+                ("beta", Tool::Claude),
+                ("codex", Tool::Codex),
+                ("alpha", Tool::Claude),
+            ],
+        );
+        let manager =
+            ProfileManager::with_paths_read_only(home.join(".claude-switch"), home.join(".claude"))
+                .unwrap();
+        let executable = home.join("cswitch");
+        fs::write(&executable, b"synthetic executable").unwrap();
+        let action = Action::Install {
+            no_refresh: true,
+            force: false,
+        };
+        let (output, failed) = manage(&manager, None, true, action, &executable, now()).unwrap();
+        assert!(!failed, "{output}");
+        assert_eq!(output, "alpha: installed\nbeta: installed\n");
+        let settings = |name: &str| manager.profile_dir(name).join("settings.json");
+        for name in ["alpha", "beta"] {
+            let value: Value = serde_json::from_slice(&fs::read(settings(name)).unwrap()).unwrap();
+            assert!(
+                value["statusLine"]["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("statusline --no-refresh")
+            );
+        }
+        assert!(!settings("codex").exists());
+        fs::write(
+            settings("alpha"),
+            br#"{"statusLine":{"type":"command","command":"foreign status"}}"#,
+        )
+        .unwrap();
+        fs::write(settings("beta"), b"{}").unwrap();
+        let (output, failed) = manage(&manager, None, true, action, &executable, now()).unwrap();
+        assert!(failed);
+        assert!(
+            output.starts_with(
+                "alpha: alpha already has a status line; pass --force to replace it\n"
+            ),
+            "{output}"
+        );
+        assert!(output.ends_with("beta: installed\n"), "{output}");
+        assert!(!settings("codex").exists());
     }
 }

@@ -26,6 +26,260 @@ pub enum AuthMode {
     Via(Box<AuthMode>, String),
 }
 
+#[cfg(test)]
+mod statusline_tests {
+    use super::*;
+    use crate::profile::{Profile, Registry};
+    use chrono::TimeZone;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()
+    }
+    fn setup() -> (TempDir, ProfileManager) {
+        let temp = TempDir::new().unwrap();
+        let manager =
+            ProfileManager::with_paths(temp.path().join("switch"), temp.path().join(".claude"))
+                .unwrap();
+        (temp, manager)
+    }
+    fn register(manager: &ProfileManager, name: &str, tool: Tool) {
+        let mut registry: Registry = manager.load_registry().unwrap();
+        registry.profiles.insert(
+            name.into(),
+            Profile {
+                name: name.into(),
+                tool,
+                email: None,
+                added: now(),
+                last_used: None,
+            },
+        );
+        fs::write(
+            manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(manager.profile_dir(name)).unwrap();
+    }
+    fn backup_files(manager: &ProfileManager, name: &str) -> Vec<PathBuf> {
+        let dir = manager.base_dir.join("backups/settings").join(name);
+        fs::read_dir(dir)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn statusline_ownership_requires_exact_shell_words() {
+        // Known-bad: `contains("statusline")` accepts a foreign shell command.
+        for command in [
+            "cswitch statusline",
+            "'/path with spaces/cswitch' statusline",
+            "cswitch statusline --no-refresh",
+            "cswitch.exe statusline",
+        ] {
+            assert!(
+                owns_statusline(&json!({"type":"command","command":command})),
+                "{command}"
+            );
+        }
+        for command in [
+            "cswitch statusline --x",
+            "cswitch statusline --no-refresh --x",
+            "cswitch-other statusline",
+            "sh -c 'cswitch statusline'",
+            "cswitch statusline; echo x",
+        ] {
+            assert!(
+                !owns_statusline(&json!({"type":"command","command":command})),
+                "{command}"
+            );
+        }
+        assert!(!owns_statusline(
+            &json!({"type":"prompt","command":"cswitch statusline"})
+        ));
+    }
+
+    #[test]
+    fn install_reuses_editor_backup_mode_and_noop_rules() {
+        // Known-bad: replacing a foreign line without --force, or writing before backup.
+        let (_temp, manager) = setup();
+        register(&manager, "work", Tool::Claude);
+        let path = manager.profile_dir("work").join("settings.json");
+        let original = br#"{"theme":"dark","permissions":{"allow":["Read"]}}"#;
+        fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let result = edit_settings_with_backup_hook(
+            &path,
+            &manager.base_dir,
+            "work",
+            Edit::StatuslineInstall {
+                command: "cswitch statusline",
+                force: false,
+            },
+            now(),
+            |_| {},
+            |_| {
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let backups = backup_files(&manager, "work");
+                assert_eq!(backups.len(), 1);
+                assert_eq!(fs::read(&backups[0]).unwrap(), original);
+            },
+        )
+        .unwrap();
+        assert!(result.changed);
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed["theme"], "dark");
+        assert_eq!(installed["permissions"]["allow"][0], "Read");
+        assert_eq!(
+            installed["statusLine"],
+            json!({"type":"command","command":"cswitch statusline"})
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let before = fs::read(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            !edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).unwrap()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(backup_files(&manager, "work").len(), 1);
+        let mut enriched = installed;
+        enriched["statusLine"]["padding"] = json!(2);
+        enriched["statusLine"]["hideVimModeIndicator"] = json!(true);
+        fs::write(&path, serde_json::to_vec(&enriched).unwrap()).unwrap();
+        assert!(
+            edit_statusline(
+                &manager,
+                "work",
+                Some("cswitch statusline --no-refresh"),
+                false,
+                now()
+            )
+            .unwrap()
+        );
+        let rewritten: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten["statusLine"]["padding"], 2);
+        assert_eq!(rewritten["statusLine"]["hideVimModeIndicator"], true);
+        assert_eq!(
+            rewritten["statusLine"]["command"],
+            "cswitch statusline --no-refresh"
+        );
+        let foreign =
+            br#"{"theme":"dark","statusLine":{"type":"command","command":"other statusline"}}"#;
+        fs::write(&path, foreign).unwrap();
+        let backups = backup_files(&manager, "work").len();
+        assert!(
+            edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), foreign);
+        assert_eq!(backup_files(&manager, "work").len(), backups);
+        assert!(
+            edit_statusline(&manager, "work", Some("cswitch statusline"), true, now()).unwrap()
+        );
+        let forced: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            forced["statusLine"],
+            json!({"type":"command","command":"cswitch statusline"})
+        );
+    }
+
+    #[test]
+    fn uninstall_only_removes_owned_statusline() {
+        // Known-bad: uninstall removes a foreign status line or rewrites an absent one.
+        let (_temp, manager) = setup();
+        register(&manager, "work", Tool::Claude);
+        let path = manager.profile_dir("work").join("settings.json");
+        fs::write(
+            &path,
+            br#"{"theme":"dark","statusLine":{"type":"command","command":"cswitch statusline"}}"#,
+        )
+        .unwrap();
+        assert!(edit_statusline(&manager, "work", None, false, now()).unwrap());
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, json!({"theme":"dark"}));
+        let bytes = fs::read(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let backups = backup_files(&manager, "work").len();
+        assert!(!edit_statusline(&manager, "work", None, false, now()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(backup_files(&manager, "work").len(), backups);
+        let foreign = br#"{"statusLine":"foreign"}"#;
+        fs::write(&path, foreign).unwrap();
+        assert!(edit_statusline(&manager, "work", None, false, now()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), foreign);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_symlink_codex_and_unknown_without_writes() {
+        // Known-bad: the editor follows a symlink, or a non-Claude profile gets settings.
+        let (_temp, manager) = setup();
+        register(&manager, "work", Tool::Claude);
+        register(&manager, "codex", Tool::Codex);
+        let target = manager.base_dir.join("outside.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, manager.profile_dir("work").join("settings.json"))
+            .unwrap();
+        assert!(
+            edit_statusline(&manager, "work", Some("cswitch statusline"), false, now()).is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"{}");
+        assert!(backup_files(&manager, "work").is_empty());
+        let error = edit_statusline(&manager, "codex", Some("cswitch statusline"), false, now())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("status lines are a Claude Code feature"),
+            "{error}"
+        );
+        assert!(!manager.profile_dir("codex").join("settings.json").exists());
+        assert!(
+            edit_statusline(
+                &manager,
+                "missing",
+                Some("cswitch statusline"),
+                false,
+                now()
+            )
+            .is_err()
+        );
+        assert!(!manager.profile_dir("missing").exists());
+    }
+
+    #[test]
+    fn copied_profile_keeps_statusline_while_key_helper_is_stripped() {
+        // Known-bad: treating a portable statusLine like an account-bound key helper.
+        let (_temp, manager) = setup();
+        let source = manager.base_dir.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("settings.json"), br#"{"apiKeyHelper":"cswitch key print old","statusLine":{"type":"command","command":"cswitch statusline --no-refresh"}}"#).unwrap();
+        manager.add_profile_from("copy", &source).unwrap();
+        let value: Value = serde_json::from_slice(
+            &fs::read(manager.profile_dir("copy").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(value.get("apiKeyHelper").is_none());
+        assert_eq!(
+            value["statusLine"]["command"],
+            "cswitch statusline --no-refresh"
+        );
+    }
+}
+
 impl AuthMode {
     pub fn label(&self) -> String {
         if let Self::Via(mode, host) = self {
@@ -549,7 +803,7 @@ pub fn clear_key(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Re
 
 /// A strict shell-word parser for cswitch's generated command. Shell operators
 /// and expansions make a command foreign even when it contains `key print`.
-fn shell_words(command: &str) -> Option<Vec<String>> {
+pub(crate) fn shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
@@ -610,6 +864,52 @@ pub fn managed_helper_name(command: &str) -> Option<String> {
         return None;
     }
     Some(words[3].clone())
+}
+
+pub fn owns_statusline(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("command") {
+        return false;
+    }
+    let Some(words) = object
+        .get("command")
+        .and_then(Value::as_str)
+        .and_then(shell_words)
+    else {
+        return false;
+    };
+    if words.len() != 2 && words.len() != 3 {
+        return false;
+    }
+    if words[1] != "statusline" || (words.len() == 3 && words[2] != "--no-refresh") {
+        return false;
+    }
+    matches!(
+        Path::new(&words[0])
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("cswitch" | "cswitch.exe")
+    )
+}
+
+pub fn edit_statusline(
+    manager: &ProfileManager,
+    name: &str,
+    command: Option<&str>,
+    force: bool,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if manager.get_profile(name)?.tool != Tool::Claude {
+        bail!("status lines are a Claude Code feature");
+    }
+    let path = manager.profile_dir(name).join("settings.json");
+    let edit = match command {
+        Some(command) => Edit::StatuslineInstall { command, force },
+        None => Edit::StatuslineUninstall,
+    };
+    Ok(edit_settings(&path, &manager.base_dir, name, edit, now, |_| {})?.changed)
 }
 
 #[derive(Clone, Copy)]
@@ -690,6 +990,11 @@ enum Edit<'a> {
     Clear {
         owned: &'a BTreeSet<String>,
     },
+    StatuslineInstall {
+        command: &'a str,
+        force: bool,
+    },
+    StatuslineUninstall,
 }
 
 #[derive(Clone, Copy)]
@@ -717,6 +1022,67 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
     let foreign = present;
     let managed = current.and_then(managed_helper_name);
     match edit {
+        Edit::StatuslineInstall { command, force } => {
+            let current = object.get("statusLine");
+            if current.is_some_and(|value| !owns_statusline(value)) && !force {
+                bail!("{name} already has a status line; pass --force to replace it");
+            }
+            if let Some(value) = current
+                && owns_statusline(value)
+                && value.get("command").and_then(Value::as_str) == Some(command)
+            {
+                return Ok(Merge {
+                    json,
+                    changed: false,
+                    foreign_helper: false,
+                    overwritten: Vec::new(),
+                    removed_gateway_count: 0,
+                });
+            }
+            if current.is_some_and(owns_statusline) {
+                object
+                    .get_mut("statusLine")
+                    .and_then(Value::as_object_mut)
+                    .expect("owned status line is an object")
+                    .insert("command".into(), Value::String(command.into()));
+            } else {
+                object.insert(
+                    "statusLine".into(),
+                    serde_json::json!({
+                        "type": "command", "command": command
+                    }),
+                );
+            }
+            Ok(Merge {
+                json,
+                changed: true,
+                foreign_helper: false,
+                overwritten: Vec::new(),
+                removed_gateway_count: 0,
+            })
+        }
+        Edit::StatuslineUninstall => {
+            let Some(current) = object.get("statusLine") else {
+                return Ok(Merge {
+                    json,
+                    changed: false,
+                    foreign_helper: false,
+                    overwritten: Vec::new(),
+                    removed_gateway_count: 0,
+                });
+            };
+            if !owns_statusline(current) {
+                bail!("{name} has a foreign status line; nothing was removed");
+            }
+            object.remove("statusLine");
+            Ok(Merge {
+                json,
+                changed: true,
+                foreign_helper: false,
+                overwritten: Vec::new(),
+                removed_gateway_count: 0,
+            })
+        }
         Edit::Set {
             helper,
             replace,
@@ -847,6 +1213,7 @@ fn merge_settings(source: &Value, name: &str, edit: Edit<'_>) -> Result<Merge> {
 }
 
 struct EditOutcome {
+    changed: bool,
     foreign_helper: bool,
     removed_gateway_count: usize,
     overwritten: Vec<String>,
@@ -858,13 +1225,26 @@ fn edit_settings<F: FnMut(usize)>(
     name: &str,
     edit: Edit<'_>,
     now: DateTime<Utc>,
+    before_check: F,
+) -> Result<EditOutcome> {
+    edit_settings_with_backup_hook(path, base_dir, name, edit, now, before_check, |_| {})
+}
+
+fn edit_settings_with_backup_hook<F: FnMut(usize), G: FnMut(usize)>(
+    path: &Path,
+    base_dir: &Path,
+    name: &str,
+    edit: Edit<'_>,
+    now: DateTime<Utc>,
     mut before_check: F,
+    mut after_backup: G,
 ) -> Result<EditOutcome> {
     for attempt in 0..2 {
         let state = read_settings(path)?;
         let merged = merge_settings(&state.json, name, edit)?;
         if !merged.changed {
             return Ok(EditOutcome {
+                changed: false,
                 foreign_helper: merged.foreign_helper,
                 removed_gateway_count: merged.removed_gateway_count,
                 overwritten: merged.overwritten,
@@ -889,6 +1269,7 @@ fn edit_settings<F: FnMut(usize)>(
             if let Some(original) = &state.bytes {
                 backup_settings(base_dir, name, original, now)?;
             }
+            after_backup(attempt);
             // The backup itself takes time: compare again immediately before rename.
             if stamp(path)? != state.stamp {
                 return Ok(false);
@@ -899,6 +1280,7 @@ fn edit_settings<F: FnMut(usize)>(
         let _ = fs::remove_file(&temporary);
         if result? {
             return Ok(EditOutcome {
+                changed: true,
                 foreign_helper: false,
                 removed_gateway_count: merged.removed_gateway_count,
                 overwritten: merged.overwritten,
