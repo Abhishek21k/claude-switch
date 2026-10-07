@@ -1300,6 +1300,12 @@ mod persistence_tests {
         assert_eq!(first.rows[0].cache_write_1h, 40);
         assert_eq!(first.rows[0].cache_read, 50);
         assert_eq!(first.rows[0].speed.as_deref(), Some("fast"));
+        let first_chat = super::super::chats::read(&store.dir).unwrap();
+        assert_eq!(first_chat.rows.len(), 1);
+        assert_eq!(first_chat.rows[0].session, "s");
+        assert_eq!(first_chat.rows[0].requests, 1);
+        assert_eq!(first_chat.rows[0].tokens(), [10, 20, 30, 40, 50]);
+        assert_eq!(first_chat.rows[0].speed.as_deref(), Some("fast"));
         fs::write(
             project.join("a.jsonl"),
             format!("{}\n{}\n{}\n", record("1"), record("1"), record("2")),
@@ -1314,6 +1320,10 @@ mod persistence_tests {
         assert_eq!(second.rows[0].cache_write_1h, 80);
         assert_eq!(second.rows[0].cache_read, 100);
         assert_eq!(second.rows[0].speed.as_deref(), Some("fast"));
+        let second_chat = super::super::chats::read(&store.dir).unwrap();
+        assert_eq!(second_chat.rows.len(), 1);
+        assert_eq!(second_chat.rows[0].requests, 2);
+        assert_eq!(second_chat.rows[0].tokens(), [20, 40, 60, 80, 100]);
     }
     #[test]
     fn hourly_rollup_keeps_fast_and_standard_requests_separate() {

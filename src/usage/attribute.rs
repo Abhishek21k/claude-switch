@@ -367,6 +367,29 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Resolve a session when its current cwd offers no project signal.
+    pub fn session_project(
+        &self,
+        profile: &str,
+        session: &str,
+        metadata: Option<&Session>,
+    ) -> Option<(String, &'static str)> {
+        let explicit = self.labels.sessions.get(session).map(String::as_str);
+        let title = session_title_label(metadata);
+        for label in [explicit, title].into_iter().flatten() {
+            if let Ok(project) = label_project(label, &self.known) {
+                return Some((project, "label"));
+            }
+        }
+        let key = (profile.to_string(), session.to_string());
+        if let Some(project) = self.dominant.get(&key) {
+            return Some((project.clone(), "files"));
+        }
+        self.dominant_workspace
+            .get(&key)
+            .map(|workspace| (format!("{workspace}/(workspace files)"), "files workspace"))
+    }
+
     pub fn attribute(&self, request: &Request, session: Option<&Session>) -> Attribution {
         let config = self.config;
         let explicit = self
@@ -540,6 +563,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn session_project_uses_label_then_sixty_percent_files_then_workspace() {
+        // Known-bads: files wins at 59%, or an unknown label suppresses file evidence.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("atlas");
+        let team = root.join("teams/blue");
+        let alpha = team.join("apps/alpha");
+        let beta = team.join("apps/beta");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(alpha.join(".git")).unwrap();
+        fs::create_dir_all(beta.join(".git")).unwrap();
+        let config = Config {
+            superproject: Some(root),
+            project_globs: vec!["teams/*/apps/*".into()],
+            workspaces: vec![WorkspaceRule {
+                glob: "teams/*".into(),
+                name: None,
+                segment: Some(1),
+            }],
+            ..Config::default()
+        };
+        let make = |session: &str, alpha_count: usize| {
+            let touched = (0..100)
+                .map(|index| {
+                    if index < alpha_count {
+                        alpha.join(format!("a{index}.rs"))
+                    } else {
+                        beta.join(format!("b{index}.rs"))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let paths = touched.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+            let mut request = row(&team, &paths, session);
+            capture_signals(&mut request, &config);
+            request
+        };
+        let rows = vec![
+            make("files60", 60),
+            make("files59", 59),
+            make("unknown", 40),
+        ];
+        let labels = Labels {
+            sessions: BTreeMap::from([
+                ("labelled".into(), "alpha".into()),
+                ("unknown".into(), "missing".into()),
+            ]),
+        };
+        let resolver = Resolver::new(&rows, &config, &labels);
+        assert_eq!(
+            resolver.session_project("sample", "labelled", None),
+            Some(("blue/alpha".into(), "label"))
+        );
+        assert_eq!(
+            resolver.session_project("sample", "files60", None),
+            Some(("blue/alpha".into(), "files"))
+        );
+        assert_eq!(
+            resolver.session_project("sample", "files59", None),
+            Some(("blue/(workspace files)".into(), "files workspace"))
+        );
+        assert_eq!(
+            resolver.session_project("sample", "unknown", None),
+            Some(("blue/beta".into(), "files"))
+        );
+        let title = Session {
+            profile: "sample".into(),
+            id: "renamed".into(),
+            first: None,
+            last: None,
+            titles: vec![super::super::ledger::Title {
+                time: None,
+                file: "synthetic.jsonl".into(),
+                offset: 0,
+                value: "alpha: Fix header".into(),
+                source: "rename".into(),
+            }],
+            cost_state: None,
+        };
+        assert_eq!(
+            resolver.session_project("sample", "renamed", Some(&title)),
+            Some(("blue/alpha".into(), "label"))
+        );
     }
 
     #[test]

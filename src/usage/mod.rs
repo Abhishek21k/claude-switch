@@ -1,5 +1,6 @@
 pub mod attribute;
 pub mod billing;
+pub mod chats;
 pub mod ledger;
 pub mod metrics;
 pub mod parse;

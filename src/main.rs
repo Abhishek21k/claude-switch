@@ -221,6 +221,8 @@ enum ToolChoice {
 
 #[derive(Subcommand)]
 enum UsageAction {
+    /// Refresh the local usage ledger without printing a report
+    Refresh,
     /// Save a project label for a session
     Label { session: String, project: String },
     /// Compare priced requests with matching cost-state snapshots
@@ -592,6 +594,10 @@ fn main() -> Result<()> {
             let store = usage::store(&manager, directory)?;
             let mut verify_exit_code = 0;
             let output = match action {
+                Some(UsageAction::Refresh) => {
+                    store.ingest()?;
+                    String::new()
+                }
                 Some(UsageAction::Label { session, project }) => {
                     usage::report::label(&store, &session, &project)?
                 }

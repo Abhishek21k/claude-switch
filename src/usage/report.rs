@@ -209,7 +209,9 @@ pub(crate) fn refresh_summary(store: &Store, ledger: &Ledger) -> Result<Vec<Repo
     let rates = load_or_seed(&store.dir)?;
     let rows = make_rows(ledger, &config, &labels, &rates);
     write_summary(store, &rows)?;
-    super::metrics::write(&store.dir, ledger, Utc::now())?;
+    let now = Utc::now();
+    super::metrics::write(&store.dir, ledger, now)?;
+    super::chats::write(&store.dir, ledger, &config, &labels, now)?;
     Ok(rows)
 }
 

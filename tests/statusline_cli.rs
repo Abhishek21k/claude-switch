@@ -130,6 +130,53 @@ fn foreign_statusline_refusal_exits_one_without_a_write() {
 }
 
 #[test]
+fn usage_refresh_is_silent_and_busy_lock_is_a_noop() {
+    // Known-bad: a busy lock makes refresh fail or print a report.
+    let home = TempDir::new().unwrap();
+    let profile = register(home.path(), "work");
+    let projects = profile.join("projects/demo");
+    fs::create_dir_all(&projects).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/usage/profile/projects/demo/a.jsonl");
+    fs::copy(fixture, projects.join("a.jsonl")).unwrap();
+    let usage = home.path().join("usage");
+    let refresh = || {
+        command(home.path())
+            .env("CSWITCH_USAGE_DIR", &usage)
+            .args(["usage", "refresh"])
+            .output()
+            .unwrap()
+    };
+    let first = refresh();
+    assert!(first.status.success(), "{first:?}");
+    assert!(first.stdout.is_empty() && first.stderr.is_empty());
+    for file in ["hourly.json", "chats.json", "cursors.json"] {
+        assert!(usage.join(file).exists(), "{file}");
+    }
+    let files = ["hourly.json", "chats.json", "cursors.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let busy = refresh();
+    assert!(busy.status.success(), "{busy:?}");
+    assert!(busy.stdout.is_empty() && busy.stderr.is_empty());
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected.1);
+    }
+}
+
+#[test]
 fn no_color_env_removes_limit_escape_sequences() {
     // Known-bad: treating NO_COLOR as a terminal-only setting and emitting escapes into a pipe.
     let home = TempDir::new().unwrap();
