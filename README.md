@@ -97,6 +97,9 @@ cswitch
 | `cswitch usage` | Ingest local transcripts and show a 7-day token and API-equivalent cost report |
 | `cswitch usage label <session> <project>` | Label a past session without reopening it |
 | `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
+| `cswitch statusline` | Print one Claude Code status line from stdin and local profile data |
+| `cswitch statusline --install <name> [--no-refresh] [--force]` | Install the line for a registered Claude profile; `--all` selects every Claude profile |
+| `cswitch statusline --uninstall <name>` | Remove a cswitch-owned line; `--all` selects every Claude profile |
 | `cswitch aliases` | Print shell aliases for all profiles |
 | `cswitch --help` | Full CLI help |
 
@@ -135,6 +138,29 @@ Local entries exist only in the profile, and removing the profile deletes them. 
 ## Plan limits
 
 `cswitch list`, `cswitch info <name>`, and the TUI details panel show the 5-hour and 7-day plan limits from Claude Code's own cached snapshot. Each view shows when Claude Code fetched it, and marks a window as `reset` once its reset time has passed. A new profile may show `no data` until Claude Code writes a snapshot. `cswitch` reads the profile's cache without changing it, makes no network call, and never refreshes OAuth tokens.
+
+## Status line
+
+`cswitch statusline` prints one line for Claude Code's status row. These layout examples use invented values:
+
+```text
+work · acme › site · 5h 42% ↻1h20 · 7d 71% ↻Thu · ctx 142k · chat ~$1.70 · today ~$23.10
+work · acme › site · 5h 88% ↻20m · 7d 64% ↻Fri · → spare 5h 10% · ctx 142k
+work · site · 5h 42% · 7d 71%
+```
+
+The first fields identify the account and project. `5h` and `7d` are Claude Code's plan utilization and local reset time; `→` shows the registered subscription account with the most 5-hour headroom when the current account reaches 80% on either limit. `ctx` is the latest context size. `chat ~` is Claude Code's running cost estimate on a subscription profile. The `today` field in the first layout example is reserved for a later ledger integration and is not emitted yet. On a narrow terminal, the line drops `chat`, reset times and `ctx`, shortens the project, then drops headroom and limits as needed; it never wraps. Set `NO_COLOR` to a non-empty value to disable yellow and red limit highlighting.
+
+```bash
+cswitch statusline --install work
+cswitch statusline --install --all
+cswitch statusline --install work --force
+cswitch statusline --install work --no-refresh
+cswitch statusline --uninstall work
+cswitch statusline --uninstall --all
+```
+
+Install writes only the profile's `settings.json` key `"statusLine": { "type": "command", "command": "'<absolute path to cswitch>' statusline" }`; `--no-refresh` appends that flag to the command. The path is the resolved executable path and shell-quoted. The current status line does not start a refresh, so `--no-refresh` has the same rendered output. Install backs up the existing settings file before replacing it, preserves unrelated settings, and refuses another command's status line unless you pass `--force`. Uninstall removes only a cswitch-owned status line. Copied Claude profiles keep this portable command.
 
 ## Token usage
 
