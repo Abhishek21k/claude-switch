@@ -27,17 +27,20 @@ struct Headroom {
     five_percent: f64,
     five_reset: bool,
     weekly_percent: Option<f64>,
+    fetched_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
 struct PlanWindow {
     percent: f64,
     reset: Option<DateTime<Utc>>,
+    age: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct WindowText {
     base: String,
+    age: Option<String>,
     reset: Option<String>,
 }
 
@@ -45,6 +48,7 @@ struct WindowText {
 struct HeadroomText {
     base: String,
     weekly: Option<String>,
+    age: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -282,6 +286,7 @@ fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option
         five_percent: if five_reset { 0.0 } else { five.percent },
         five_reset,
         weekly_percent,
+        fetched_at: snapshot.fetched_at,
     })
 }
 
@@ -317,7 +322,11 @@ fn stdin_window(input: &Value, key: &str) -> Option<PlanWindow> {
         .get("resets_at")
         .and_then(Value::as_i64)
         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
-    Some(PlanWindow { percent, reset })
+    Some(PlanWindow {
+        percent,
+        reset,
+        age: None,
+    })
 }
 
 fn current_windows(
@@ -341,6 +350,7 @@ fn current_windows(
             .map(|window| PlanWindow {
                 percent: window.percent,
                 reset: window.resets_at,
+                age: snapshot.and_then(|snapshot| age_suffix(now, snapshot.fetched_at)),
             })
     };
     (
@@ -369,6 +379,20 @@ fn reset_text(
     }
 }
 
+pub(crate) fn age_suffix(now: DateTime<Utc>, fetched_at: DateTime<Utc>) -> Option<String> {
+    let seconds = (now - fetched_at).num_seconds();
+    if seconds <= 300 {
+        return None;
+    }
+    if seconds < 3_600 {
+        Some(format!("({}m)", seconds / 60))
+    } else if seconds < 172_800 {
+        Some(format!("({}h)", seconds / 3_600))
+    } else {
+        Some(format!("({}d)", seconds / 86_400))
+    }
+}
+
 fn colour_token(token: String, percent: f64, colour: bool) -> String {
     if !colour || percent < 80.0 {
         token
@@ -392,6 +416,7 @@ fn window_text(
     );
     WindowText {
         base: format!("{label} {percent}"),
+        age: window.age,
         reset: reset_text(window.reset, now, offset),
     }
 }
@@ -452,6 +477,9 @@ fn compose(
     }
     for window in [five, seven].into_iter().flatten() {
         let mut text = window.base.clone();
+        if let Some(age) = &window.age {
+            text.push_str(&format!(" {age}"));
+        }
         if let Some(reset) = &window.reset {
             text.push_str(&format!(" {reset}"));
         }
@@ -461,6 +489,9 @@ fn compose(
         let mut text = headroom.base.clone();
         if let Some(weekly) = &headroom.weekly {
             text.push_str(&format!(" {weekly}"));
+        }
+        if let Some(age) = &headroom.age {
+            text.push_str(&format!(" {age}"));
         }
         parts.push(text);
     }
@@ -509,6 +540,7 @@ pub fn render(
         weekly: candidate
             .weekly_percent
             .map(|percent| format!("7d {:.0}%", percent.round())),
+        age: age_suffix(now, candidate.fetched_at),
     });
     let mut ctx = context_text(input, colour);
     let mut chat = if disk.per_token {
@@ -527,6 +559,14 @@ pub fn render(
             return line;
         }
         match step {
+            0 => {
+                for window in [&mut five, &mut seven].into_iter().flatten() {
+                    window.age = None;
+                }
+                if let Some(candidate) = &mut headroom {
+                    candidate.age = None;
+                }
+            }
             2 => chat = None,
             3 => {
                 if let Some(window) = &mut seven {
@@ -1137,6 +1177,98 @@ mod tests {
     }
 
     #[test]
+    fn saved_snapshot_ages_have_strict_boundaries_and_shed_first() {
+        // Known-bad: old fallback limits look live, live limits inherit an age,
+        // or chat is shed before all saved ages.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let usage = home.join("usage");
+        let mut saved = snapshot(
+            42.0,
+            now().timestamp() + 3600,
+            71.0,
+            now().timestamp() + 86400,
+        );
+        for (seconds, expected) in [
+            (300, None),
+            (301, Some("(5m)")),
+            (31 * 3600, Some("(31h)")),
+            (48 * 3600, Some("(2d)")),
+        ] {
+            saved["cachedUsageUtilization"]["fetchedAtMs"] =
+                json!((now() - chrono::Duration::seconds(seconds)).timestamp_millis());
+            fs::write(
+                home.join(".claude.json"),
+                serde_json::to_vec(&saved).unwrap(),
+            )
+            .unwrap();
+            let disk = read_disk(&Value::Null, home, None, &usage);
+            let output = line(&Value::Null, &disk, 200, false);
+            if let Some(age) = expected {
+                assert_eq!(output.matches(age).count(), 2, "{output}");
+            } else {
+                assert!(!output.contains("(5m)"), "{output}");
+            }
+        }
+        let live = json!({"rate_limits":{"five_hour":{"used_percentage":42},
+            "seven_day":{"used_percentage":71}}});
+        let output = line(&live, &read_disk(&live, home, None, &usage), 200, false);
+        assert!(!output.contains("(2d)"), "{output}");
+
+        let mut disk = disk();
+        disk.snapshot = match limits::parse_limits(&saved) {
+            Limits::Snapshot(snapshot) => Some(snapshot),
+            _ => unreachable!(),
+        };
+        disk.headroom = Some(Headroom {
+            name: "spare".into(),
+            five_percent: 10.0,
+            five_reset: false,
+            weekly_percent: Some(85.0),
+            fetched_at: now() - chrono::Duration::hours(19),
+        });
+        let input = json!({"cost":{"total_cost_usd":1.70}});
+        let full = line(&input, &disk, 200, false);
+        let shed = line(&input, &disk, full.chars().count() + 3, false);
+        assert!(full.contains("(2d)") && full.contains("(19h)"), "{full}");
+        assert!(!shed.contains("(2d)") && !shed.contains("(19h)"), "{shed}");
+        assert!(shed.contains("chat ~$1.70"), "{shed}");
+    }
+
+    #[test]
+    fn headroom_age_follows_candidate_snapshot() {
+        // Known-bad: an old candidate offers headroom without its age.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude), ("spare", Tool::Claude)]);
+        let profiles = home.join(".claude-switch/profiles");
+        let work = profiles.join("work");
+        let usage = home.join("usage");
+        let high = json!({"rate_limits":{"five_hour":{"used_percentage":88}}});
+        let mut spare = snapshot(
+            10.0,
+            now().timestamp() + 3600,
+            85.0,
+            now().timestamp() + 86400,
+        );
+        for (seconds, age) in [(19 * 3600, " (19h)"), (300, "")] {
+            spare["cachedUsageUtilization"]["fetchedAtMs"] =
+                json!((now() - chrono::Duration::seconds(seconds)).timestamp_millis());
+            fs::write(
+                profiles.join("spare/.claude.json"),
+                serde_json::to_vec(&spare).unwrap(),
+            )
+            .unwrap();
+            let disk = read_disk(&high, home, Some(&work), &usage);
+            let output = line(&high, &disk, 200, false);
+            assert!(
+                output.contains(&format!("→ spare 5h 10% 7d 85%{age}")),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
     fn headroom_requires_high_usage_and_selects_subscription_candidate() {
         // Known-bad: showing headroom below 80, offering API or Codex, or keeping a rolled value.
         let tmp = TempDir::new().unwrap();
@@ -1402,6 +1534,7 @@ mod tests {
             five_percent: 10.0,
             five_reset: false,
             weekly_percent: Some(85.0),
+            fetched_at: now(),
         });
         let expected = [
             "work · acme › site · 5h 88% ↻1h20 · 7d 71% ↻Fri · → spare 5h 10% 7d 85% · ctx 142k · chat ~$1.70",
