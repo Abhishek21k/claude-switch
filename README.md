@@ -95,6 +95,7 @@ cswitch
 | `cswitch info <name>` | Show details for a profile |
 | `cswitch remove <name> [--purge-usage] [--force]` | Delete a profile; Antigravity local HOME entries require `--force`; keep usage unless explicitly purged |
 | `cswitch usage` | Ingest local transcripts and show a 7-day token and API-equivalent cost report |
+| `cswitch usage refresh` | Refresh the local ledger without printing a report |
 | `cswitch usage label <session> <project>` | Label a past session without reopening it |
 | `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
 | `cswitch statusline` | Print one Claude Code status line from stdin and local profile data |
@@ -149,7 +150,7 @@ work · acme › site · 5h 88% ↻20m · 7d 64% ↻Fri · → spare 5h 10% · c
 work · site · 5h 42% · 7d 71%
 ```
 
-The first fields identify the account and project. `5h` and `7d` are Claude Code's plan utilization and local reset time; `→` shows the registered subscription account with the most 5-hour headroom when the current account reaches 80% on either limit. `ctx` is the latest context size. `chat ~` is Claude Code's running cost estimate on a subscription profile. The `today` field in the first layout example is reserved for a later ledger integration and is not emitted yet. On a narrow terminal, the line drops `chat`, reset times and `ctx`, shortens the project, then drops headroom and limits as needed; it never wraps. Set `NO_COLOR` to a non-empty value to disable yellow and red limit highlighting.
+The first fields identify the account and project; an internal `(unattributed)` workspace is omitted. `5h` and `7d` use Claude Code's live plan utilization and local reset time. If stdin has no limits, a subscription profile uses its saved snapshot (`~/.claude.json` for `default`), and figures older than five minutes show their age. A per-token profile has no saved-limit fallback. `→` shows the registered subscription account with the most 5-hour headroom when the current account reaches 80% on either limit; its saved figure also shows its age. `ctx` is the latest context size. `chat ~$` is Claude Code's running estimate on a subscription profile, and `today ~$` is today's ledger list value plus this chat's unrecorded live cost. On a per-token profile, `chat $` and `today $` are priced from the ledger and the configured rate, without `~`. A stale `today` value shows its age. On a narrow terminal, the line drops ages, `today`, `chat`, reset times and `ctx`, shortens the project, then drops headroom and limits as needed; it never wraps. Set `NO_COLOR` to a non-empty value to disable yellow and red limit highlighting.
 
 ```bash
 cswitch statusline --install work
@@ -160,17 +161,18 @@ cswitch statusline --uninstall work
 cswitch statusline --uninstall --all
 ```
 
-Install writes only the profile's `settings.json` key `"statusLine": { "type": "command", "command": "'<absolute path to cswitch>' statusline" }`; `--no-refresh` appends that flag to the command. The path is the resolved executable path and shell-quoted. The current status line does not start a refresh, so `--no-refresh` has the same rendered output. Install backs up the existing settings file before replacing it, preserves unrelated settings, and refuses another command's status line unless you pass `--force`. Uninstall removes only a cswitch-owned status line. Copied Claude profiles keep this portable command.
+Install writes only the profile's `settings.json` key `"statusLine": { "type": "command", "command": "'<absolute path to cswitch>' statusline" }`; `--no-refresh` appends that flag to the command. The path is the resolved executable path and shell-quoted. When an existing ledger is over five minutes old or its per-chat rollup is missing, the line prints first and starts one detached `cswitch usage refresh`, throttled to one attempt per minute. `cswitch statusline --install <name> --no-refresh` installs the same display without background refresh. Install backs up the existing settings file before replacing it, preserves unrelated settings, and refuses another command's status line unless you pass `--force`. Uninstall removes only a cswitch-owned status line, including one installed by the same executable under another file name. Copied Claude profiles keep this portable command.
 
 ## Token usage
 
-`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
+`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
 
 ```bash
 cswitch usage --since 30d --by project
 cswitch usage --since all --profile work --json
 cswitch usage --explain <session-id>
 cswitch usage --unattributed
+cswitch usage refresh
 cswitch usage label <session-id> <workspace/project>
 cswitch usage verify
 cswitch usage alias 'acme/claude-x.5' claude-opus-5-5
