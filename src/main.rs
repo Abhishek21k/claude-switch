@@ -6,6 +6,7 @@ mod key;
 mod limits;
 mod profile;
 mod skills_sync;
+mod statusline;
 mod tui;
 mod usage;
 
@@ -184,6 +185,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<UsageAction>,
     },
+
+    /// Print one Claude Code status line
+    Statusline {
+        /// Render without a background ledger refresh
+        #[arg(long)]
+        no_refresh: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -315,6 +323,13 @@ fn ask_save_defaults(base_dir: &Path, input: &gateway::GatewayInput) -> Result<b
 
 fn main() -> Result<()> {
     let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    if matches!(&cli.command, Some(Commands::Statusline { .. })) {
+        std::panic::set_hook(Box::new(|_| {}));
+        let line = std::panic::catch_unwind(statusline::command_line)
+            .unwrap_or_else(|_| "cswitch".to_string());
+        let _ = io::stdout().write_all(format!("{line}\n").as_bytes());
+        return Ok(());
+    }
     if let Some(Commands::Key {
         action: KeyAction::Print { name },
     }) = &cli.command
@@ -659,6 +674,7 @@ fn main() -> Result<()> {
                 std::process::exit(verify_exit_code);
             }
         }
+        Some(Commands::Statusline { .. }) => unreachable!("handled before manager setup"),
     }
 
     Ok(())

@@ -841,13 +841,19 @@ impl ProfileManager {
 
     /// Inject both roots so tests never consult the caller's real home.
     pub fn with_paths(base_dir: PathBuf, claude_home: PathBuf) -> Result<Self> {
+        let manager = Self::with_paths_read_only(base_dir, claude_home)?;
+        fs::create_dir_all(&manager.profiles_dir)?;
+        Ok(manager)
+    }
+
+    /// Inspect profiles without creating the profile store on a status-line read.
+    pub fn with_paths_read_only(base_dir: PathBuf, claude_home: PathBuf) -> Result<Self> {
         let home = base_dir
             .parent()
             .context("Cannot determine parent of profile base directory")?;
         let codex_home = home.join(".codex");
         let profiles_dir = base_dir.join("profiles");
         let registry_path = base_dir.join("registry.json");
-        fs::create_dir_all(&profiles_dir)?;
         Ok(Self {
             base_dir,
             profiles_dir,
