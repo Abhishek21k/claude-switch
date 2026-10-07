@@ -178,10 +178,11 @@ pub fn read_disk(
             key::read_auth_mode(manager, &profile.name, claude.clone()).api_billed()
         })
     });
-    let snapshot = if input
-        .get("rate_limits")
-        .and_then(Value::as_object)
-        .is_none()
+    let snapshot = if !per_token
+        && input
+            .get("rate_limits")
+            .and_then(Value::as_object)
+            .is_none()
     {
         claude
             .ok()
@@ -693,6 +694,60 @@ mod tests {
         let disk = read_disk(&Value::Null, home, Some(&work), &usage);
         assert_eq!(limits::read_stats(), (1, 0));
         assert!(line(&Value::Null, &disk, 200, false).contains("5h 42%"));
+    }
+
+    #[test]
+    fn per_token_profile_ignores_saved_limits_but_accepts_live_limits() {
+        // Known-bad: a stale subscription snapshot follows a profile into API billing.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("metered", Tool::Claude), ("spare", Tool::Claude)]);
+        let profiles = home.join(".claude-switch/profiles");
+        let metered = profiles.join("metered");
+        let mut saved = snapshot(
+            88.0,
+            now().timestamp() + 3600,
+            64.0,
+            now().timestamp() + 86400,
+        );
+        saved["primaryApiKey"] = json!("synthetic-key");
+        fs::write(
+            metered.join(".claude.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("spare/.claude.json"),
+            serde_json::to_vec(&snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                20.0,
+                now().timestamp() + 86400,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let usage = home.join("usage");
+        let output = line(
+            &Value::Null,
+            &read_disk(&Value::Null, home, Some(&metered), &usage),
+            200,
+            false,
+        );
+        assert_eq!(output, "metered");
+        let live = json!({"rate_limits":{"five_hour":{"used_percentage":42},
+            "seven_day":{"used_percentage":71}}});
+        let output = line(
+            &live,
+            &read_disk(&live, home, Some(&metered), &usage),
+            200,
+            false,
+        );
+        assert!(
+            output.contains("5h 42%") && output.contains("7d 71%"),
+            "{output}"
+        );
+        assert!(!output.contains('→'));
     }
 
     #[test]
