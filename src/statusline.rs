@@ -1,7 +1,7 @@
 //! Claude Code's one-line, read-only status display.
 
 use crate::key;
-use crate::limits::read_claude_json;
+use crate::limits::{self, Limits, Snapshot, read_claude_json};
 use crate::profile::{ProfileManager, Tool};
 use crate::usage::{attribute, metrics};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
@@ -15,6 +15,16 @@ pub struct DiskData {
     project: Option<String>,
     project_short: Option<String>,
     per_token: bool,
+    snapshot: Option<Snapshot>,
+    headroom: Option<Headroom>,
+}
+
+#[derive(Clone, Debug)]
+struct Headroom {
+    name: String,
+    five_percent: f64,
+    five_reset: bool,
+    weekly_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +37,12 @@ struct PlanWindow {
 struct WindowText {
     base: String,
     reset: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct HeadroomText {
+    base: String,
+    weekly: Option<String>,
 }
 
 pub fn command_line() -> String {
@@ -44,18 +60,19 @@ pub fn command_line() -> String {
     let usage_dir = std::env::var_os("CSWITCH_USAGE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".claude-switch/usage"));
-    let disk = read_disk(&input, &home, config_dir.as_deref(), &usage_dir);
+    let local_now = Local::now();
+    let now = local_now.with_timezone(&Utc);
+    let disk = read_disk(&input, &home, config_dir.as_deref(), &usage_dir, now);
     let columns = std::env::var("COLUMNS")
         .ok()
         .and_then(|raw| raw.parse().ok());
     let colour = std::env::var_os("NO_COLOR").is_none_or(|raw| raw.is_empty());
-    let local_now = Local::now();
     render(
         &input,
         &disk,
         columns,
         colour,
-        local_now.with_timezone(&Utc),
+        now,
         local_now.offset().fix(),
     )
 }
@@ -65,6 +82,7 @@ pub fn read_disk(
     home: &Path,
     configured: Option<&Path>,
     usage_dir: &Path,
+    now: DateTime<Utc>,
 ) -> DiskData {
     let base = home.join(".claude-switch");
     let manager = ProfileManager::with_paths_read_only(base, home.join(".claude")).ok();
@@ -103,6 +121,44 @@ pub fn read_disk(
             .api_billed()
         })
     });
+    let snapshot = if input
+        .get("rate_limits")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        read_claude_json(config_dir)
+            .ok()
+            .flatten()
+            .and_then(|json| match limits::parse_limits(&json) {
+                Limits::Snapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+    } else {
+        None
+    };
+    let (five, seven) = current_windows(input, snapshot.as_ref(), now);
+    let needs_headroom = [five.as_ref(), seven.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|window| window.percent >= 80.0);
+    let headroom = if needs_headroom {
+        manager.as_ref().and_then(|manager| {
+            profiles
+                .iter()
+                .filter(|profile| {
+                    profile.tool == Tool::Claude
+                        && registered.is_none_or(|current| current.name != profile.name)
+                })
+                .filter_map(|profile| candidate(manager, &profile.name, now))
+                .min_by(|a, b| {
+                    a.five_percent
+                        .total_cmp(&b.five_percent)
+                        .then_with(|| a.name.cmp(&b.name))
+                })
+        })
+    } else {
+        None
+    };
     let cwd = input
         .get("workspace")
         .and_then(|workspace| workspace.get("current_dir"))
@@ -130,7 +186,32 @@ pub fn read_disk(
         project: project.map(|value| clean(&value)),
         project_short: project_short.map(|value| clean(&value)),
         per_token,
+        snapshot,
+        headroom,
     }
+}
+
+fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option<Headroom> {
+    let dir = manager.profile_dir(name);
+    let claude = read_claude_json(&dir);
+    if key::read_auth_mode(manager, name, claude.clone()) != key::AuthMode::Subscription {
+        return None;
+    }
+    let Limits::Snapshot(snapshot) = limits::parse_limits(&claude.ok()??) else {
+        return None;
+    };
+    let five = snapshot.session()?;
+    let five_reset = five.rolled_over(now);
+    let weekly_percent = snapshot
+        .weekly()
+        .filter(|window| !window.rolled_over(now) && window.percent >= 80.0)
+        .map(|window| window.percent);
+    Some(Headroom {
+        name: clean(name),
+        five_percent: if five_reset { 0.0 } else { five.percent },
+        five_reset,
+        weekly_percent,
+    })
 }
 
 fn project_display(project: &str) -> (String, String) {
@@ -163,6 +244,35 @@ fn stdin_window(input: &Value, key: &str) -> Option<PlanWindow> {
         .and_then(Value::as_i64)
         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
     Some(PlanWindow { percent, reset })
+}
+
+fn current_windows(
+    input: &Value,
+    snapshot: Option<&Snapshot>,
+    now: DateTime<Utc>,
+) -> (Option<PlanWindow>, Option<PlanWindow>) {
+    if input
+        .get("rate_limits")
+        .and_then(Value::as_object)
+        .is_some()
+    {
+        return (
+            stdin_window(input, "five_hour"),
+            stdin_window(input, "seven_day"),
+        );
+    }
+    let from_snapshot = |window: Option<&limits::Window>| {
+        window
+            .filter(|window| !window.rolled_over(now) && window.percent.is_finite())
+            .map(|window| PlanWindow {
+                percent: window.percent,
+                reset: window.resets_at,
+            })
+    };
+    (
+        from_snapshot(snapshot.and_then(Snapshot::session)),
+        from_snapshot(snapshot.and_then(Snapshot::weekly)),
+    )
 }
 
 fn reset_text(
@@ -258,6 +368,7 @@ fn compose(
     project: &Option<String>,
     five: &Option<WindowText>,
     seven: &Option<WindowText>,
+    headroom: &Option<HeadroomText>,
     ctx: &Option<String>,
     chat: &Option<String>,
 ) -> String {
@@ -269,6 +380,13 @@ fn compose(
         let mut text = window.base.clone();
         if let Some(reset) = &window.reset {
             text.push_str(&format!(" {reset}"));
+        }
+        parts.push(text);
+    }
+    if let Some(headroom) = headroom {
+        let mut text = headroom.base.clone();
+        if let Some(weekly) = &headroom.weekly {
+            text.push_str(&format!(" {weekly}"));
         }
         parts.push(text);
     }
@@ -301,10 +419,23 @@ pub fn render(
         disk.account.clone()
     };
     let mut project = disk.project.clone();
-    let mut five = stdin_window(input, "five_hour")
-        .map(|window| window_text("5h", window, colour, now, offset));
-    let mut seven = stdin_window(input, "seven_day")
-        .map(|window| window_text("7d", window, colour, now, offset));
+    let (five_window, seven_window) = current_windows(input, disk.snapshot.as_ref(), now);
+    let mut five = five_window.map(|window| window_text("5h", window, colour, now, offset));
+    let mut seven = seven_window.map(|window| window_text("7d", window, colour, now, offset));
+    let mut headroom = disk.headroom.as_ref().map(|candidate| HeadroomText {
+        base: format!(
+            "→ {} 5h {}",
+            candidate.name,
+            if candidate.five_reset {
+                "reset".to_string()
+            } else {
+                format!("{:.0}%", candidate.five_percent.round())
+            }
+        ),
+        weekly: candidate
+            .weekly_percent
+            .map(|percent| format!("7d {:.0}%", percent.round())),
+    });
     let mut ctx = context_text(input, colour);
     let mut chat = if disk.per_token {
         None
@@ -317,7 +448,7 @@ pub fn render(
             .map(|value| format!("chat ~{}", metrics::money(value)))
     };
     for step in 0..11 {
-        let line = compose(&account, &project, &five, &seven, &ctx, &chat);
+        let line = compose(&account, &project, &five, &seven, &headroom, &ctx, &chat);
         if visible_len(&line) <= budget {
             return line;
         }
@@ -335,10 +466,24 @@ pub fn render(
             }
             5 => ctx = None,
             6 => project = disk.project_short.clone(),
+            7 => {
+                let had_weekly = headroom
+                    .as_mut()
+                    .and_then(|value| value.weekly.take())
+                    .is_some();
+                if had_weekly {
+                    let shorter =
+                        compose(&account, &project, &five, &seven, &headroom, &ctx, &chat);
+                    if visible_len(&shorter) <= budget {
+                        return shorter;
+                    }
+                }
+                headroom = None;
+            }
             8 => seven = None,
             9 => project = None,
             10 => five = None,
-            _ => {} // Part B adds the first two steps; headroom uses step 7.
+            _ => {} // Part B adds the first two steps.
         }
     }
     if account.chars().count() > budget {
@@ -369,7 +514,17 @@ mod tests {
             project: Some("acme › site".into()),
             project_short: Some("site".into()),
             per_token: false,
+            snapshot: None,
+            headroom: None,
         }
+    }
+    fn read_disk(
+        input: &Value,
+        home: &Path,
+        configured: Option<&Path>,
+        usage_dir: &Path,
+    ) -> DiskData {
+        super::read_disk(input, home, configured, usage_dir, now())
     }
     fn line(input: &Value, disk: &DiskData, columns: usize, colour: bool) -> String {
         render(input, disk, Some(columns), colour, now(), offset())
@@ -402,6 +557,21 @@ mod tests {
             },
             "context_window": {"total_input_tokens": 142000},
             "cost": {"total_cost_usd": 1.70}
+        })
+    }
+    fn snapshot(five: f64, five_reset: i64, weekly: f64, weekly_reset: i64) -> Value {
+        json!({
+            "oauthAccount": {"accountUuid":"00000000-0000-4000-8000-000000000001"},
+            "cachedUsageUtilization": {
+                "accountUuid":"00000000-0000-4000-8000-000000000001",
+                "fetchedAtMs":now().timestamp_millis(),
+                "utilization": {
+                    "five_hour":{"utilization":five,
+                        "resets_at":DateTime::<Utc>::from_timestamp(five_reset, 0).unwrap().to_rfc3339()},
+                    "seven_day":{"utilization":weekly,
+                        "resets_at":DateTime::<Utc>::from_timestamp(weekly_reset, 0).unwrap().to_rfc3339()}
+                }
+            }
         })
     }
 
@@ -556,6 +726,217 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_fallback_only_when_rate_limits_object_is_absent() {
+        // Known-bad: filling a missing stdin window from a snapshot, or keeping a rolled window.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let path = home.join(".claude/.claude.json");
+        let saved = snapshot(
+            42.0,
+            now().timestamp() + 3600,
+            71.0,
+            now().timestamp() + 86400,
+        );
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let usage = home.join("usage");
+        let absent = read_disk(&Value::Null, home, None, &usage);
+        let output = line(&Value::Null, &absent, 200, false);
+        assert!(
+            output.contains("5h 42%") && output.contains("7d 71%"),
+            "{output}"
+        );
+        let partial = json!({"rate_limits":{"five_hour":{"used_percentage":15}}});
+        let output = line(
+            &partial,
+            &read_disk(&partial, home, None, &usage),
+            200,
+            false,
+        );
+        assert!(
+            output.contains("5h 15%") && !output.contains("7d"),
+            "{output}"
+        );
+        let empty = json!({"rate_limits":{}});
+        assert!(!line(&empty, &read_disk(&empty, home, None, &usage), 200, false).contains("5h"));
+        let rolled = snapshot(42.0, now().timestamp() - 1, 71.0, now().timestamp() + 86400);
+        fs::write(&path, serde_json::to_vec(&rolled).unwrap()).unwrap();
+        let output = line(
+            &Value::Null,
+            &read_disk(&Value::Null, home, None, &usage),
+            200,
+            false,
+        );
+        assert!(
+            !output.contains("5h") && output.contains("7d 71%"),
+            "{output}"
+        );
+        let mut mismatch = saved.clone();
+        mismatch["cachedUsageUtilization"]["accountUuid"] =
+            json!("00000000-0000-4000-8000-000000000002");
+        fs::write(&path, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        let output = line(
+            &Value::Null,
+            &read_disk(&Value::Null, home, None, &usage),
+            200,
+            false,
+        );
+        assert!(!output.contains("5h") && !output.contains("7d"), "{output}");
+        fs::write(&path, &bytes).unwrap();
+        fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+        let _ = read_disk(&Value::Null, home, None, &usage);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn headroom_requires_high_usage_and_selects_subscription_candidate() {
+        // Known-bad: showing headroom below 80, offering API or Codex, or keeping a rolled value.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(
+            home,
+            &[
+                ("work", Tool::Claude),
+                ("spare", Tool::Claude),
+                ("other", Tool::Claude),
+                ("api", Tool::Claude),
+                ("codex", Tool::Codex),
+            ],
+        );
+        let dir = |name: &str| home.join(".claude-switch/profiles").join(name);
+        let write = |name: &str, value: Value| {
+            fs::write(
+                dir(name).join(".claude.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+        };
+        write(
+            "work",
+            snapshot(
+                79.0,
+                now().timestamp() + 3600,
+                79.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        write(
+            "spare",
+            snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                85.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        write(
+            "other",
+            snapshot(
+                20.0,
+                now().timestamp() + 3600,
+                79.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        let mut api = snapshot(
+            0.0,
+            now().timestamp() + 3600,
+            10.0,
+            now().timestamp() + 86400,
+        );
+        api["primaryApiKey"] = json!("synthetic");
+        write("api", api);
+        write(
+            "codex",
+            snapshot(
+                0.0,
+                now().timestamp() + 3600,
+                10.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        let usage = home.join("usage");
+        let current = dir("work");
+        let low = json!({"rate_limits":{"five_hour":{"used_percentage":79.9},
+            "seven_day":{"used_percentage":79.9}}});
+        assert!(
+            read_disk(&low, home, Some(&current), &usage)
+                .headroom
+                .is_none()
+        );
+        for high in [
+            json!({"rate_limits":{"five_hour":{"used_percentage":80}}}),
+            json!({"rate_limits":{"seven_day":{"used_percentage":80}}}),
+        ] {
+            let output = line(
+                &high,
+                &read_disk(&high, home, Some(&current), &usage),
+                200,
+                false,
+            );
+            assert!(output.contains("→ spare 5h 10% 7d 85%"), "{output}");
+        }
+        write(
+            "other",
+            snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                79.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        let high = json!({"rate_limits":{"five_hour":{"used_percentage":80}}});
+        assert!(
+            line(
+                &high,
+                &read_disk(&high, home, Some(&current), &usage),
+                200,
+                false
+            )
+            .contains("→ other 5h 10%")
+        );
+        write(
+            "other",
+            snapshot(88.0, now().timestamp() - 1, 79.0, now().timestamp() + 86400),
+        );
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&current), &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("→ other 5h reset"), "{output}");
+        write(
+            "other",
+            snapshot(
+                20.0,
+                now().timestamp() + 3600,
+                79.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        write(
+            "spare",
+            snapshot(
+                10.0,
+                now().timestamp() + 3600,
+                79.0,
+                now().timestamp() + 86400,
+            ),
+        );
+        let output = line(
+            &high,
+            &read_disk(&high, home, Some(&current), &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("→ spare 5h 10%") && !output.contains("7d 79%"));
+    }
+
+    #[test]
     fn context_edges_and_chat_class() {
         // Known-bad: 999500 stays in k, or a per-token account shows Claude's estimate.
         for (tokens, expected) in [
@@ -631,6 +1012,51 @@ mod tests {
             "work · acme › site · 5h 42% · 7d 71%"
         );
         assert_eq!(line(&input, &disk(), 30, false), "work · site · 5h 42%");
+    }
+
+    #[test]
+    fn shedding_with_headroom_follows_every_step() {
+        // Known-bad: dropping headroom before shortening the project or counting ESC bytes.
+        let mut input = full_input();
+        input["rate_limits"]["five_hour"]["used_percentage"] = json!(88);
+        let mut data = disk();
+        data.headroom = Some(Headroom {
+            name: "spare".into(),
+            five_percent: 10.0,
+            five_reset: false,
+            weekly_percent: Some(85.0),
+        });
+        let expected = [
+            "work · acme › site · 5h 88% ↻1h20 · 7d 71% ↻Fri · → spare 5h 10% 7d 85% · ctx 142k · chat ~$1.70",
+            "work · acme › site · 5h 88% ↻1h20 · 7d 71% ↻Fri · → spare 5h 10% 7d 85% · ctx 142k",
+            "work · acme › site · 5h 88% ↻1h20 · 7d 71% · → spare 5h 10% 7d 85% · ctx 142k",
+            "work · acme › site · 5h 88% · 7d 71% · → spare 5h 10% 7d 85% · ctx 142k",
+            "work · acme › site · 5h 88% · 7d 71% · → spare 5h 10% 7d 85%",
+            "work · site · 5h 88% · 7d 71% · → spare 5h 10% 7d 85%",
+            "work · site · 5h 88% · 7d 71% · → spare 5h 10%",
+            "work · site · 5h 88% · 7d 71%",
+            "work · site · 5h 88%",
+        ];
+        assert_eq!(line(&input, &data, 200, false), expected[0]);
+        for pair in expected.windows(2) {
+            let columns = visible_len(pair[0]) + 3;
+            assert_eq!(
+                line(&input, &data, columns, false),
+                pair[1],
+                "columns={columns}"
+            );
+        }
+        for columns in 10..=200 {
+            let output = line(&input, &data, columns, false);
+            assert!(
+                visible_len(&output) <= columns.saturating_sub(4).max(20),
+                "{columns}: {output}"
+            );
+        }
+        assert_eq!(line(&input, &data, 120, false), expected[0]);
+        assert_eq!(line(&input, &data, 50, false), expected[6]);
+        data.account = "accountnamewithmorethantwentycharacters".into();
+        assert_eq!(line(&input, &data, 10, false), "accountnamewithmoret");
     }
 
     #[test]
