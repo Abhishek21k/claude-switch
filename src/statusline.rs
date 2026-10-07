@@ -857,6 +857,108 @@ mod tests {
     }
 
     #[test]
+    fn account_fallback_and_trailing_slash_keep_account_class() {
+        // Known-bads: an empty first segment or a registered trailing slash loses API billing.
+        let mut empty = disk();
+        empty.account.clear();
+        assert_eq!(
+            line(&Value::Null, &empty, 120, false).split(" · ").next(),
+            Some("cswitch")
+        );
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let root_data = read_disk(
+            &Value::Null,
+            home,
+            Some(Path::new("/")),
+            &home.join("usage"),
+        );
+        assert_eq!(root_data.account, "cswitch");
+        register(home, &[("metered", Tool::Claude)]);
+        let profile = home.join(".claude-switch/profiles/metered");
+        fs::write(
+            profile.join(".claude.json"),
+            br#"{"primaryApiKey":"synthetic-key"}"#,
+        )
+        .unwrap();
+        let trailing = PathBuf::from(format!("{}/", profile.display()));
+        let input = json!({"cost":{"total_cost_usd":1.70}});
+        let data = read_disk(&input, home, Some(&trailing), &home.join("usage"));
+        assert_eq!(data.account, "metered");
+        assert!(data.per_token);
+        assert!(!line(&input, &data, 120, false).contains("chat"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_and_project_names_sanitize_control_characters() {
+        // Known-bad: path-derived names inject tabs or terminal escape codes.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let config_dir = home.join("bad\t\x1b[31m");
+        fs::create_dir_all(&config_dir).unwrap();
+        let root = home.join("atlas");
+        let project = root.join("apps/site\tname/src");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("apps/site\tname/.git")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let usage = home.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        fs::write(
+            usage.join("config.json"),
+            serde_json::to_vec(&json!({
+                "superproject":root,"workspaces":[{"glob":"apps/*","name":"acme"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let input = json!({"cwd":project});
+        let data = read_disk(&input, home, Some(&config_dir), &usage);
+        let output = line(&input, &data, 200, false);
+        assert!(output.chars().all(|ch| !ch.is_control()), "{output:?}");
+        assert!(output.contains("acme › site name"), "{output}");
+    }
+
+    #[test]
+    fn workspace_current_dir_precedes_cwd_with_cwd_fallback() {
+        // Known-bad: cwd is used even when workspace.current_dir is supplied.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let root = home.join("atlas");
+        let site = root.join("apps/site/src");
+        let other = root.join("apps/other/src");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("apps/site/.git")).unwrap();
+        fs::create_dir_all(root.join("apps/other/.git")).unwrap();
+        fs::create_dir_all(&site).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let usage = home.join("usage");
+        fs::create_dir_all(&usage).unwrap();
+        fs::write(
+            usage.join("config.json"),
+            serde_json::to_vec(&json!({
+                "superproject":root,"workspaces":[{"glob":"apps/*","name":"acme"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let both = json!({"workspace":{"current_dir":site},"cwd":other});
+        let output = line(&both, &read_disk(&both, home, None, &usage), 200, false);
+        assert!(
+            output.contains("acme › site") && !output.contains("acme › other"),
+            "{output}"
+        );
+        let fallback = json!({"cwd":other});
+        let output = line(
+            &fallback,
+            &read_disk(&fallback, home, None, &usage),
+            200,
+            false,
+        );
+        assert!(output.contains("acme › other"), "{output}");
+    }
+
+    #[test]
     fn project_resolution_alias_and_bad_config_are_isolated() {
         // Known-bad: bad config fails the entire line, or an alias is ignored.
         let tmp = TempDir::new().unwrap();
