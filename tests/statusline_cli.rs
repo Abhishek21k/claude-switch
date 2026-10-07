@@ -109,6 +109,26 @@ fn built_binary_installs_and_uninstalls_only_named_profile() {
 }
 
 #[test]
+fn foreign_statusline_refusal_exits_one_without_a_write() {
+    // Known-bad: install or uninstall reports a refusal but exits zero.
+    let home = TempDir::new().unwrap();
+    let profile = register(home.path(), "work");
+    let settings = profile.join("settings.json");
+    let original =
+        br#"{"theme":"dark","statusLine":{"type":"command","command":"other statusline"}}"#;
+    fs::write(&settings, original).unwrap();
+    for args in [
+        ["statusline", "--install", "work"],
+        ["statusline", "--uninstall", "work"],
+    ] {
+        let output = run(home.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("work:"));
+        assert_eq!(fs::read(&settings).unwrap(), original);
+    }
+}
+
+#[test]
 fn no_color_env_removes_limit_escape_sequences() {
     // Known-bad: treating NO_COLOR as a terminal-only setting and emitting escapes into a pipe.
     let home = TempDir::new().unwrap();

@@ -88,6 +88,8 @@ mod statusline_tests {
             "cswitch statusline --x",
             "cswitch statusline --no-refresh --x",
             "cswitch-other statusline",
+            "cswitch list",
+            "cswitch usage --no-refresh",
             "sh -c 'cswitch statusline'",
             "cswitch statusline; echo x",
         ] {

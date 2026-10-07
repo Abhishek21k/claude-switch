@@ -1036,6 +1036,69 @@ mod tests {
     }
 
     #[test]
+    fn install_quotes_and_canonicalizes_executable_path() {
+        // Known-bads: the command stores an unquoted path or the path as supplied.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude)]);
+        let manager =
+            ProfileManager::with_paths(home.join(".claude-switch"), home.join(".claude")).unwrap();
+        let dir = home.join("a space's dir");
+        fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("tool-x");
+        fs::write(&executable, b"synthetic executable").unwrap();
+        let noncanonical = dir.join("..").join("a space's dir/tool-x");
+        let (out, failed) = manage(
+            &manager,
+            Some("work"),
+            false,
+            Action::Install {
+                no_refresh: false,
+                force: false,
+            },
+            &noncanonical,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(out, "work: installed\n");
+        assert!(!failed);
+        let settings: Value = serde_json::from_slice(
+            &fs::read(manager.profile_dir("work").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let words = key::shell_words(settings["statusLine"]["command"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            words,
+            vec![
+                fs::canonicalize(&executable)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "statusline".to_string()
+            ]
+        );
+        #[cfg(unix)]
+        {
+            let link = home.join("tool-link");
+            std::os::unix::fs::symlink(&executable, &link).unwrap();
+            let (out, failed) = manage(
+                &manager,
+                Some("work"),
+                false,
+                Action::Install {
+                    no_refresh: false,
+                    force: false,
+                },
+                &link,
+                now(),
+            )
+            .unwrap();
+            assert_eq!(out, "work: already installed\n");
+            assert!(!failed);
+        }
+    }
+
+    #[test]
     fn stdin_windows_round_without_clamping_or_past_reset() {
         // Known-bad: clamp values over 100 or show a suffix after reset.
         let value = json!({"rate_limits":{"five_hour":{"used_percentage":100.7,
