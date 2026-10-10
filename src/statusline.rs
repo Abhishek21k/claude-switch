@@ -1716,6 +1716,23 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_rollup_version_hides_ledger_figures() {
+        // Known-bad: reading a future rollup format as though it were version 1.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude)]);
+        let work = home.join(".claude-switch/profiles/work");
+        let usage = home.join("usage");
+        let mut data = ledger_disk();
+        data.chats.as_mut().unwrap().version = 2;
+        save_ledger(&usage, &data);
+        assert!(chats::read(&usage).is_none());
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let disk = read_disk(&input, home, Some(&work), &usage);
+        assert_eq!(line(&input, &disk, 200, false), "work · chat ~$1.70");
+    }
+
+    #[test]
     fn renamed_executable_owns_only_its_installed_statusline() {
         // Known-bad: only a file named cswitch is owned, or any tool-x path is owned.
         let tmp = TempDir::new().unwrap();

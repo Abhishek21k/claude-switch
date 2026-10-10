@@ -183,4 +183,64 @@ mod tests {
         assert_eq!(saved.projects[0].project, "acme/site");
         assert_eq!(saved.projects[0].signal, "label");
     }
+
+    #[test]
+    fn rollup_separates_model_and_speed_within_one_session() {
+        // Known-bads: grouping by session without model, or by model without speed.
+        let tmp = tempfile::tempdir().unwrap();
+        let requests = [
+            ("model-a", None, 10),
+            ("model-a", Some("fast"), 20),
+            ("model-b", None, 30),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (model, speed, input))| {
+            let record = json!({
+                "type":"assistant", "timestamp":"2030-01-01T12:00:00Z",
+                "sessionId":"s", "requestId":format!("request-{index}"),
+                "message":{"id":format!("message-{index}"),"model":model,
+                    "usage":{"input_tokens":input,"output_tokens":input * 2,"speed":speed}}
+            });
+            parse::parse(record.to_string().as_bytes(), "work")
+                .unwrap()
+                .unwrap()
+                .requests
+                .remove(0)
+        })
+        .collect::<Vec<_>>();
+        let ledger = Ledger {
+            requests,
+            ..Ledger::default()
+        };
+        let at = DateTime::parse_from_rfc3339("2030-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        write(
+            tmp.path(),
+            &ledger,
+            &Config::default(),
+            &Labels::default(),
+            at,
+        )
+        .unwrap();
+        let saved = read(tmp.path()).unwrap();
+        assert_eq!(saved.rows.len(), 3);
+        for (model, speed, input) in [
+            ("model-a", None, 10),
+            ("model-a", Some("fast"), 20),
+            ("model-b", None, 30),
+        ] {
+            let row = saved
+                .rows
+                .iter()
+                .find(|row| row.model == model && row.speed.as_deref() == speed)
+                .unwrap();
+            assert_eq!(row.profile, "work");
+            assert_eq!(row.session, "s");
+            assert_eq!(row.requests, 1);
+            assert_eq!(row.input, input);
+            assert_eq!(row.output, input * 2);
+        }
+    }
 }
