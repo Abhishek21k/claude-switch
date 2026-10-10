@@ -2892,7 +2892,11 @@ mod tests {
                 }
             }
             fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("synthetic flush failure"))
+                if self.fail_write {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("synthetic flush failure"))
+                }
             }
         }
         let tmp = TempDir::new().unwrap();
