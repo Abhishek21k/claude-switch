@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Default)]
 pub struct DiskData {
     account: String,
+    ledger_account: Option<String>,
     project: Option<String>,
     project_short: Option<String>,
     per_token: bool,
@@ -172,13 +173,15 @@ pub fn command_line(no_refresh: bool) -> CommandOutput {
         now,
         local_now.offset().fix(),
     );
-    let refresh_dir = refresh_dir(
-        &usage_dir,
-        no_refresh,
-        now,
-        disk.hourly.as_ref().map(|hourly| hourly.generated_at),
-        disk.chats.is_some(),
-    );
+    let refresh_dir = disk.ledger_account.as_ref().and_then(|_| {
+        refresh_dir(
+            &usage_dir,
+            no_refresh,
+            now,
+            disk.hourly.as_ref().map(|hourly| hourly.generated_at),
+            disk.chats.is_some(),
+        )
+    });
     CommandOutput { line, refresh_dir }
 }
 
@@ -286,6 +289,9 @@ pub fn read_disk(
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "cswitch".to_string())
     };
+    let ledger_account = registered
+        .map(|profile| profile.name.clone())
+        .or_else(|| configured.is_none().then(|| "default".to_string()));
     let snapshot_dir = if configured.is_none() {
         home
     } else {
@@ -350,8 +356,10 @@ pub fn read_disk(
         }
         _ => (None, None),
     };
-    let chats = chats::read(usage_dir);
-    let hourly = metrics::read(usage_dir);
+    let chats = ledger_account.as_ref().and_then(|_| chats::read(usage_dir));
+    let hourly = ledger_account
+        .as_ref()
+        .and_then(|_| metrics::read(usage_dir));
     let settings = chats
         .as_ref()
         .and_then(|_| metrics::load_settings(usage_dir, now).ok());
@@ -359,11 +367,10 @@ pub fn read_disk(
         .get("session_id")
         .and_then(Value::as_str)
         .and_then(|session| {
-            chats
-                .as_ref()?
-                .projects
-                .iter()
-                .find(|project| project.profile == account && project.session == session)
+            chats.as_ref()?.projects.iter().find(|project| {
+                ledger_account.as_deref() == Some(project.profile.as_str())
+                    && project.session == session
+            })
         });
     let (project, project_short) = select_project(
         cwd_project.as_deref(),
@@ -373,6 +380,7 @@ pub fn read_disk(
     .map_or((None, None), |(full, short)| (Some(full), Some(short)));
     DiskData {
         account: clean(&account).trim().to_string(),
+        ledger_account,
         project: project
             .map(|value| clean(&value).trim().to_string())
             .filter(|value| !value.is_empty()),
@@ -643,16 +651,16 @@ fn money_segments(
     } else {
         live.map(|value| format!("chat ~{}", metrics::money(value)))
     };
-    let (Some(rollup), Some((rates, billing))) = (&disk.chats, &disk.settings) else {
+    let (Some(profile), Some(rollup), Some((rates, billing))) =
+        (disk.ledger_account.as_deref(), &disk.chats, &disk.settings)
+    else {
         return (chat, None);
     };
-    let entry = billing.profiles.get(&disk.account);
+    let entry = billing.profiles.get(profile);
     let session = input
         .get("session_id")
         .and_then(Value::as_str)
-        .map(|session| {
-            session_amount(rollup, &disk.account, session, rates, entry, disk.per_token)
-        });
+        .map(|session| session_amount(rollup, profile, session, rates, entry, disk.per_token));
     if disk.per_token {
         chat = session
             .as_ref()
@@ -662,7 +670,7 @@ fn money_segments(
     let today = disk.hourly.as_ref().map(|hourly| {
         let mut amount = metrics::windows(
             &hourly.rows,
-            &disk.account,
+            profile,
             now,
             offset,
             rates,
@@ -890,6 +898,7 @@ mod tests {
     fn disk() -> DiskData {
         DiskData {
             account: "work".into(),
+            ledger_account: Some("work".into()),
             project: Some("acme › site".into()),
             project_short: Some("site".into()),
             per_token: false,
@@ -961,6 +970,26 @@ mod tests {
             },
         ));
         data
+    }
+    fn save_ledger(usage: &Path, data: &DiskData) {
+        fs::create_dir_all(usage).unwrap();
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(data.hourly.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            usage.join("chats.json"),
+            serde_json::to_vec(data.chats.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let (rates, billing) = data.settings.as_ref().unwrap();
+        fs::write(usage.join("rates.json"), serde_json::to_vec(rates).unwrap()).unwrap();
+        fs::write(
+            usage.join("billing.json"),
+            serde_json::to_vec(billing).unwrap(),
+        )
+        .unwrap();
     }
     fn read_disk(
         input: &Value,
@@ -1497,6 +1526,107 @@ mod tests {
                 .as_deref(),
             Some("acme")
         );
+    }
+
+    #[test]
+    fn ledger_identity_requires_a_registered_claude_profile() {
+        // Known-bad: an unregistered directory named work borrows work's money and project.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude), ("other", Tool::Codex)]);
+        let work = home.join(".claude-switch/profiles/work");
+        let other = home.join(".claude-switch/profiles/other");
+        let collision = home.join("elsewhere/work");
+        fs::create_dir_all(&collision).unwrap();
+        let usage = home.join("usage");
+        let mut data = ledger_disk();
+        data.chats
+            .as_mut()
+            .unwrap()
+            .projects
+            .push(chats::ChatProject {
+                profile: "work".into(),
+                session: "s".into(),
+                project: "acme/site".into(),
+                signal: "label".into(),
+            });
+        save_ledger(&usage, &data);
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let registered = line(
+            &input,
+            &read_disk(&input, home, Some(&work), &usage),
+            200,
+            false,
+        );
+        assert!(registered.contains("acme › site"), "{registered}");
+        assert!(registered.contains("chat ~$1.70"), "{registered}");
+        assert!(registered.contains("today ~$20.70"), "{registered}");
+        for dir in [&collision, &other] {
+            let disk = read_disk(&input, home, Some(dir), &usage);
+            assert!(disk.ledger_account.is_none());
+            assert!(disk.hourly.is_none() && disk.chats.is_none() && disk.settings.is_none());
+            let output = line(&input, &disk, 200, false);
+            assert!(output.starts_with(dir.file_name().unwrap().to_str().unwrap()));
+            assert!(output.contains("chat ~$1.70"), "{output}");
+            assert!(
+                !output.contains("today") && !output.contains("acme"),
+                "{output}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = home.join("elsewhere/linked");
+            std::os::unix::fs::symlink(&work, &link).unwrap();
+            let disk = read_disk(&input, home, Some(&link), &usage);
+            assert!(disk.ledger_account.is_none());
+            assert!(!line(&input, &disk, 200, false).contains("today"));
+        }
+    }
+
+    #[test]
+    fn unregistered_per_token_name_uses_live_chat_and_no_ledger() {
+        // Known-bad: a name collision with an API-billed profile hides the live chat.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("metered", Tool::Claude)]);
+        let metered = home.join(".claude-switch/profiles/metered");
+        fs::write(
+            metered.join(".claude.json"),
+            br#"{"primaryApiKey":"synthetic"}"#,
+        )
+        .unwrap();
+        let usage = home.join("usage");
+        let mut data = ledger_disk();
+        data.hourly.as_mut().unwrap().rows[0].profile = "metered".into();
+        data.chats.as_mut().unwrap().rows[0].profile = "metered".into();
+        save_ledger(&usage, &data);
+        let collision = home.join("elsewhere/metered");
+        fs::create_dir_all(&collision).unwrap();
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let output = line(
+            &input,
+            &read_disk(&input, home, Some(&collision), &usage),
+            200,
+            false,
+        );
+        assert_eq!(output, "metered · chat ~$1.70");
+    }
+
+    #[test]
+    fn default_remains_a_ledger_account() {
+        // Known-bad: guarding unregistered directories also hides default's ledger.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let usage = home.join("usage");
+        let mut data = ledger_disk();
+        data.hourly.as_mut().unwrap().rows[0].profile = "default".into();
+        data.chats.as_mut().unwrap().rows.clear();
+        save_ledger(&usage, &data);
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let disk = read_disk(&input, home, None, &usage);
+        assert_eq!(disk.ledger_account.as_deref(), Some("default"));
+        let output = line(&input, &disk, 200, false);
+        assert_eq!(output, "default · chat ~$1.70 · today ~$21.70");
     }
 
     #[test]

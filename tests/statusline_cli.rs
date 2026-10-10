@@ -270,6 +270,57 @@ fn stale_statusline_prints_before_detached_refresh_and_never_waits_on_lock() {
 }
 
 #[test]
+fn unregistered_config_directory_never_starts_ledger_refresh() {
+    // Known-bad: a stale ledger starts a refresh for a directory the ledger does not know.
+    let home = TempDir::new().unwrap();
+    let (_, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    for file in ["hourly.json", "chats.json"] {
+        let path = usage.join(file);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["generated_at"] = serde_json::json!(stale);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let files = ["hourly.json", "chats.json", "cursors.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let unknown = home.path().join("elsewhere/work");
+    fs::create_dir_all(&unknown).unwrap();
+    let output = run_status(
+        home.path(),
+        Some(br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#),
+        |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &unknown)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(line.starts_with("work · chat ~$1.70"), "{line}");
+    assert!(!line.contains("today"), "{line}");
+    assert!(!usage.join(".refresh-attempt").exists());
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected.1);
+    }
+}
+
+#[test]
 fn no_refresh_statusline_reads_existing_ledger_without_writes() {
     // Known-bad: a statusline read seeds settings or refreshes a ledger anyway.
     use std::collections::BTreeMap;
