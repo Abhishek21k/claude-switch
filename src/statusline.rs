@@ -409,6 +409,15 @@ fn candidate(manager: &ProfileManager, name: &str, now: DateTime<Utc>) -> Option
     };
     let five = snapshot.session()?;
     let five_reset = five.rolled_over(now);
+    if !five_reset && five.percent.round() >= 100.0 {
+        return None;
+    }
+    if snapshot
+        .weekly()
+        .is_some_and(|window| !window.rolled_over(now) && window.percent.round() >= 100.0)
+    {
+        return None;
+    }
     let weekly_percent = snapshot
         .weekly()
         .filter(|window| !window.rolled_over(now) && window.percent >= 80.0)
@@ -2213,6 +2222,64 @@ mod tests {
             false,
         );
         assert!(!output.contains('→'), "{output}");
+    }
+
+    #[test]
+    fn headroom_excludes_rounded_full_windows_unless_rolled_over() {
+        // Known-bads: no weekly check, > instead of >=, comparing unrounded
+        // percentages, or applying the check to a rolled-over window.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(
+            home,
+            &[
+                ("work", Tool::Claude),
+                ("spare", Tool::Claude),
+                ("third", Tool::Claude),
+            ],
+        );
+        let profiles = home.join(".claude-switch/profiles");
+        let work = profiles.join("work");
+        let usage = home.join("usage");
+        let high = json!({"rate_limits":{"five_hour":{"used_percentage":88}}});
+        let save = |name: &str, five: f64, five_reset: i64, weekly: f64, weekly_reset: i64| {
+            fs::write(
+                profiles.join(name).join(".claude.json"),
+                serde_json::to_vec(&snapshot(five, five_reset, weekly, weekly_reset)).unwrap(),
+            )
+            .unwrap();
+        };
+        let output = || {
+            line(
+                &high,
+                &read_disk(&high, home, Some(&work), &usage),
+                200,
+                false,
+            )
+        };
+        let future_five = now().timestamp() + 3600;
+        let future_weekly = now().timestamp() + 86400;
+
+        save("spare", 10.0, future_five, 100.0, future_weekly);
+        assert!(!output().contains('→'));
+
+        save("third", 40.0, future_five, 50.0, future_weekly);
+        assert!(output().contains("→ third 5h 40%"));
+
+        save("spare", 10.0, future_five, 99.4, future_weekly);
+        assert!(output().contains("→ spare 5h 10% 7d 99%"));
+        save("spare", 10.0, future_five, 99.5, future_weekly);
+        assert!(output().contains("→ third 5h 40%"));
+
+        save("spare", 100.0, future_five, 20.0, future_weekly);
+        assert!(output().contains("→ third 5h 40%"));
+        save("spare", 100.0, now().timestamp() - 1, 20.0, future_weekly);
+        assert!(output().contains("→ spare 5h reset"));
+
+        save("spare", 10.0, future_five, 100.0, now().timestamp() - 1);
+        let rolled = output();
+        assert!(rolled.contains("→ spare 5h 10%"), "{rolled}");
+        assert!(!rolled.contains("7d 100%"), "{rolled}");
     }
 
     #[test]
