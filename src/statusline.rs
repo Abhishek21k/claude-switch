@@ -2709,6 +2709,44 @@ mod tests {
     }
 
     #[test]
+    fn today_sheds_before_chat_at_the_exact_width() {
+        // Known-bad: swapping shedding steps 2 and 3 drops chat before today.
+        let data = ledger_disk();
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let full = "work · acme › site · chat ~$1.70 · today ~$20.70";
+        assert_eq!(line(&input, &data, full.chars().count() + 4, false), full);
+        assert_eq!(
+            line(&input, &data, full.chars().count() + 3, false),
+            "work · acme › site · chat ~$1.70"
+        );
+    }
+
+    #[test]
+    fn snapshot_age_precedes_its_reset_suffix() {
+        // Known-bad: composing a saved window as reset then age.
+        let weekly_reset = now() + chrono::Duration::days(3);
+        let mut saved = snapshot(
+            42.0,
+            now().timestamp() + 3600,
+            71.0,
+            weekly_reset.timestamp(),
+        );
+        saved["cachedUsageUtilization"]["fetchedAtMs"] =
+            json!((now() - chrono::Duration::hours(31)).timestamp_millis());
+        let mut data = disk();
+        data.snapshot = match limits::parse_limits(&saved) {
+            Limits::Snapshot(snapshot) => Some(snapshot),
+            _ => unreachable!(),
+        };
+        let output = line(&Value::Null, &data, 200, false);
+        let weekday = weekly_reset.with_timezone(&offset()).format("%a");
+        assert!(
+            output.contains(&format!("7d 71% (31h) ↻{weekday}")),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn refresh_decision_uses_strict_age_edges_and_existing_ledger() {
         // Known-bads: >= at either boundary, refreshing without cursors,
         // or ignoring a missing rollup or attempt file.
