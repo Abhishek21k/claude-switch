@@ -594,6 +594,13 @@ fn main() -> Result<()> {
             let mut verify_exit_code = 0;
             let output = match action {
                 Some(UsageAction::Refresh) => {
+                    #[cfg(debug_assertions)]
+                    if let Some(delay) = std::env::var("CSWITCH_TEST_REFRESH_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
                     store.ingest()?;
                     String::new()
                 }

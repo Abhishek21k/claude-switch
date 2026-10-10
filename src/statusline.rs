@@ -2750,6 +2750,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_is_not_started_if_output_write_or_flush_fails() {
+        // Known-bads: ignoring a failed write or flush starts a refresh before a line exists.
+        use std::cell::Cell;
+        struct FailingWriter {
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::other("synthetic write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("synthetic flush failure"))
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        for fail_write in [true, false] {
+            let dir = tmp.path().join(if fail_write { "write" } else { "flush" });
+            fs::create_dir_all(&dir).unwrap();
+            let called = Cell::new(false);
+            emit_and_refresh(
+                CommandOutput {
+                    line: "work".into(),
+                    refresh_dir: Some(dir.clone()),
+                },
+                &mut FailingWriter { fail_write },
+                |_, _| called.set(true),
+            );
+            assert!(!called.get());
+            assert!(!dir.join(".refresh-attempt").exists());
+        }
+    }
+
+    #[test]
     fn registered_per_token_profile_ignores_live_chat_cost() {
         // Known-bad: reading the live estimate for an API-billed profile.
         let tmp = TempDir::new().unwrap();

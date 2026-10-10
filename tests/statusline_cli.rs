@@ -13,7 +13,8 @@ fn command(home: &Path) -> Command {
         .env_remove("COLUMNS")
         .env_remove("NO_COLOR")
         .env_remove("TZ")
-        .env_remove("CSWITCH_TEST_STATUSLINE_PANIC");
+        .env_remove("CSWITCH_TEST_STATUSLINE_PANIC")
+        .env_remove("CSWITCH_TEST_REFRESH_DELAY_MS");
     command
 }
 
@@ -274,6 +275,86 @@ fn stale_statusline_prints_before_detached_refresh_and_never_waits_on_lock() {
             expected.1,
             "{file}"
         );
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn refresh_child_closes_pipes_and_survives_parent_group_signal() {
+    // Known-bads: waiting for the child, inheriting stdout or stderr, or
+    // leaving the child in the status line's process group.
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    for file in ["hourly.json", "chats.json"] {
+        let path = usage.join(file);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["generated_at"] = serde_json::json!(stale);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let mut statusline = command(home.path());
+    statusline
+        .arg("statusline")
+        .env("CLAUDE_CONFIG_DIR", &profile)
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .env("COLUMNS", "120")
+        .env("NO_COLOR", "1")
+        .env("CSWITCH_TEST_REFRESH_DELAY_MS", "3000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let start = Instant::now();
+    let mut child = statusline.spawn().unwrap();
+    let group = format!("-{}", child.id());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(line.lines().count(), 1);
+    assert!(line.contains("(10m)"), "{line}");
+    assert!(usage.join(".refresh-attempt").exists());
+    assert_eq!(generated_at(&usage.join("hourly.json")), stale);
+
+    let _ = Command::new("kill").args(["-TERM", "--", &group]).output();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if generated_at(&usage.join("hourly.json")) > stale {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refresh child did not survive signal"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "refresh held the lock too long");
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
