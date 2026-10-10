@@ -147,6 +147,11 @@ fn usage_refresh_is_silent_and_busy_lock_is_a_noop() {
     for file in ["hourly.json", "chats.json", "cursors.json"] {
         assert!(usage.join(file).exists(), "{file}");
     }
+    // Known-bad: a second clock read gives the rollup a different timestamp.
+    assert_eq!(
+        generated_at(&usage.join("hourly.json")),
+        generated_at(&usage.join("chats.json"))
+    );
     let files = ["hourly.json", "chats.json", "cursors.json"];
     let before = files.map(|file| {
         let path = usage.join(file);
@@ -185,10 +190,13 @@ fn stale_statusline_prints_before_detached_refresh_and_never_waits_on_lock() {
     let hourly_path = usage.join("hourly.json");
     let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
     let make_stale = || {
-        let mut hourly: serde_json::Value =
-            serde_json::from_slice(&fs::read(&hourly_path).unwrap()).unwrap();
-        hourly["generated_at"] = serde_json::json!(stale);
-        fs::write(&hourly_path, serde_json::to_vec(&hourly).unwrap()).unwrap();
+        for file in ["hourly.json", "chats.json"] {
+            let path = usage.join(file);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["generated_at"] = serde_json::json!(stale);
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
     };
     make_stale();
     let payload =
@@ -318,6 +326,76 @@ fn unregistered_config_directory_never_starts_ledger_refresh() {
         assert_eq!(fs::read(&path).unwrap(), expected.0);
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected.1);
     }
+}
+
+#[test]
+fn mismatched_rollup_starts_a_refresh_and_heals() {
+    // Known-bad: a mismatched rollup is used or a fresh hourly file prevents repair.
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let first = generated_at(&usage.join("hourly.json"));
+    let chat_path = usage.join("chats.json");
+    let mut chats: serde_json::Value =
+        serde_json::from_slice(&fs::read(&chat_path).unwrap()).unwrap();
+    chats["generated_at"] = serde_json::json!(first - chrono::Duration::seconds(1));
+    fs::write(&chat_path, serde_json::to_vec(&chats).unwrap()).unwrap();
+    let payload =
+        br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#;
+    let render = |no_refresh: bool| {
+        run_status(home.path(), Some(payload), |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &profile)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120");
+            if no_refresh {
+                command.arg("--no-refresh");
+            }
+        })
+    };
+    let output = render(false);
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        line.contains("chat ~$1.70") && !line.contains("today"),
+        "{line}"
+    );
+    assert!(usage.join(".refresh-attempt").exists());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let hourly = generated_at(&usage.join("hourly.json"));
+        let chats = generated_at(&chat_path);
+        if hourly > first && chats == hourly {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refresh did not repair timestamps"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "refresh held the lock too long");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let healed = render(true);
+    assert!(healed.status.success(), "{healed:?}");
+    assert!(String::from_utf8_lossy(&healed.stdout).contains("today"));
+}
+
+fn generated_at(path: &Path) -> chrono::DateTime<chrono::Utc> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    serde_json::from_value(value["generated_at"].clone()).unwrap()
 }
 
 #[test]

@@ -356,10 +356,12 @@ pub fn read_disk(
         }
         _ => (None, None),
     };
-    let chats = ledger_account.as_ref().and_then(|_| chats::read(usage_dir));
     let hourly = ledger_account
         .as_ref()
         .and_then(|_| metrics::read(usage_dir));
+    let chats = hourly.as_ref().and_then(|hourly| {
+        chats::read(usage_dir).filter(|chats| chats.generated_at == hourly.generated_at)
+    });
     let settings = chats
         .as_ref()
         .and_then(|_| metrics::load_settings(usage_dir, now).ok());
@@ -1488,6 +1490,16 @@ mod tests {
                 signal: "label".into(),
             }],
         };
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(&metrics::Hourly {
+                version: 1,
+                generated_at: now(),
+                rows: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         let save = |rollup: &chats::Chats| {
             fs::write(
                 usage.join("chats.json"),
@@ -1627,6 +1639,71 @@ mod tests {
         assert_eq!(disk.ledger_account.as_deref(), Some("default"));
         let output = line(&input, &disk, 200, false);
         assert_eq!(output, "default · chat ~$1.70 · today ~$21.70");
+    }
+
+    #[test]
+    fn rollup_requires_the_hourly_file_and_an_identical_timestamp() {
+        // Known-bad: a fresh hourly file combines with an older rollup for money and project.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        register(home, &[("work", Tool::Claude)]);
+        let work = home.join(".claude-switch/profiles/work");
+        let usage = home.join("usage");
+        let mut data = ledger_disk();
+        data.chats
+            .as_mut()
+            .unwrap()
+            .projects
+            .push(chats::ChatProject {
+                profile: "work".into(),
+                session: "s".into(),
+                project: "acme/site".into(),
+                signal: "label".into(),
+            });
+        save_ledger(&usage, &data);
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let same = read_disk(&input, home, Some(&work), &usage);
+        assert_eq!(same.project.as_deref(), Some("acme › site"));
+        assert!(line(&input, &same, 200, false).contains("today ~$20.70"));
+
+        let old = now() - chrono::Duration::seconds(1);
+        data.chats.as_mut().unwrap().generated_at = old;
+        fs::write(
+            usage.join("chats.json"),
+            serde_json::to_vec(data.chats.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mismatch = read_disk(&input, home, Some(&work), &usage);
+        assert!(mismatch.chats.is_none() && mismatch.settings.is_none());
+        assert_eq!(mismatch.project, None);
+        assert_eq!(line(&input, &mismatch, 200, false), "work · chat ~$1.70");
+
+        // Known-bad: a recent hourly timestamp alone suppresses a needed refresh.
+        data.hourly.as_mut().unwrap().generated_at = now() - chrono::Duration::seconds(10);
+        fs::write(
+            usage.join("hourly.json"),
+            serde_json::to_vec(data.hourly.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(usage.join("cursors.json"), b"{}").unwrap();
+        let mismatch = read_disk(&input, home, Some(&work), &usage);
+        assert!(mismatch.chats.is_none());
+        assert_eq!(
+            refresh_dir(
+                &usage,
+                false,
+                now(),
+                mismatch.hourly.as_ref().map(|hourly| hourly.generated_at),
+                mismatch.chats.is_some(),
+            ),
+            Some(usage.clone())
+        );
+
+        fs::remove_file(usage.join("hourly.json")).unwrap();
+        let missing = read_disk(&input, home, Some(&work), &usage);
+        assert!(missing.hourly.is_none() && missing.chats.is_none());
+        assert_eq!(missing.project, None);
+        assert_eq!(line(&input, &missing, 200, false), "work · chat ~$1.70");
     }
 
     #[test]
