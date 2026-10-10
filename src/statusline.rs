@@ -2604,6 +2604,51 @@ mod tests {
     }
 
     #[test]
+    fn chat_topup_uses_only_rows_for_this_profile() {
+        // Known-bad: matching a session id alone subtracts another profile's usage.
+        let mut data = ledger_disk();
+        let mut spare = data.chats.as_ref().unwrap().rows[0].clone();
+        spare.profile = "spare".into();
+        spare.input = 5_000_000;
+        data.chats.as_mut().unwrap().rows.push(spare);
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let output = line(&input, &data, 200, false);
+        assert!(output.contains("today ~$20.70"), "{output}");
+    }
+
+    #[test]
+    fn live_topup_prices_a_day_with_no_ledger_requests() {
+        // Known-bad: omitting the top-up's priced count leaves today as a dash.
+        let mut data = ledger_disk();
+        data.hourly.as_mut().unwrap().rows.clear();
+        data.chats.as_mut().unwrap().rows.clear();
+        let input = json!({"session_id":"s","cost":{"total_cost_usd":1.70}});
+        let output = line(&input, &data, 200, false);
+        assert!(output.contains("today ~$1.70"), "{output}");
+    }
+
+    #[test]
+    fn today_window_uses_the_supplied_local_offset() {
+        // Known-bad: a UTC-only day excludes a request from the local evening.
+        let mut data = ledger_disk();
+        let at = Utc.with_ymd_and_hms(2030, 1, 2, 1, 30, 0).unwrap();
+        data.hourly.as_mut().unwrap().generated_at = at;
+        data.hourly.as_mut().unwrap().rows[0].hour =
+            Utc.with_ymd_and_hms(2030, 1, 1, 20, 0, 0).unwrap();
+        let local = render(&Value::Null, &data, Some(200), false, at, offset());
+        assert!(local.contains("today ~$20.00"), "{local}");
+        let utc = render(
+            &Value::Null,
+            &data,
+            Some(200),
+            false,
+            at,
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        assert!(utc.contains("today —"), "{utc}");
+    }
+
+    #[test]
     fn per_token_chat_and_today_use_profile_flat_rate() {
         // Known-bads: a per-token line uses the live estimate, list price,
         // or a live top-up after pricing at the profile's flat rate.
