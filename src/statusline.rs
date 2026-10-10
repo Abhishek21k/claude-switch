@@ -2270,8 +2270,8 @@ mod tests {
 
     #[test]
     fn headroom_excludes_rounded_full_windows_unless_rolled_over() {
-        // Known-bads: no weekly check, > instead of >=, comparing unrounded
-        // percentages, or applying the check to a rolled-over window.
+        // Known-bads: no five-hour or weekly check, > instead of >=, comparing
+        // unrounded percentages, or checking a rolled-over window.
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         register(
@@ -2315,8 +2315,9 @@ mod tests {
         save("spare", 10.0, future_five, 99.5, future_weekly);
         assert!(output().contains("→ third 5h 40%"));
 
+        fs::remove_file(profiles.join("third/.claude.json")).unwrap();
         save("spare", 100.0, future_five, 20.0, future_weekly);
-        assert!(output().contains("→ third 5h 40%"));
+        assert!(!output().contains('→'));
         save("spare", 100.0, now().timestamp() - 1, 20.0, future_weekly);
         assert!(output().contains("→ spare 5h reset"));
 
