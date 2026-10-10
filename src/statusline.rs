@@ -1547,6 +1547,33 @@ mod tests {
                 .as_deref(),
             Some("acme")
         );
+
+        // Known-bad: a project is matched by session id without its profile.
+        let outside = json!({"session_id":"s","cwd":root.join("README")});
+        rollup.projects.push(chats::ChatProject {
+            profile: "spare".into(),
+            session: "s".into(),
+            project: "blue/spare".into(),
+            signal: "label".into(),
+        });
+        save(&rollup);
+        assert_eq!(
+            read_disk(&outside, home, Some(&profile), &usage).project,
+            None
+        );
+        rollup.projects.push(chats::ChatProject {
+            profile: "work".into(),
+            session: "s".into(),
+            project: "acme/site".into(),
+            signal: "label".into(),
+        });
+        save(&rollup);
+        assert_eq!(
+            read_disk(&outside, home, Some(&profile), &usage)
+                .project
+                .as_deref(),
+            Some("acme › site")
+        );
     }
 
     #[test]
