@@ -1,6 +1,6 @@
 //! Owner-entered offline billing assumptions. No billing service is contacted.
 use super::ledger::Store;
-use super::rates::{Cost, Price, Rates};
+use super::rates::{Cost, Price, PromptTier, Rates};
 use crate::atomic;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
@@ -298,13 +298,14 @@ pub fn price_tokens(
 pub fn price(
     model: &str,
     speed: Option<&str>,
+    prompt_tier: Option<PromptTier>,
     tokens: [u64; 5],
     rates: &Rates,
     entry: Option<&ProfileBilling>,
     per_token: bool,
 ) -> (Option<f64>, Option<f64>) {
     let list = rates
-        .price_for(model, speed)
+        .price_for(model, speed, prompt_tier)
         .map(|p| price_tokens(tokens[0], tokens[1], tokens[2], tokens[3], tokens[4], p).total());
     let spend = if per_token {
         entry
@@ -349,6 +350,7 @@ mod tests {
         let (list, spend) = price(
             "acme/m",
             None,
+            None,
             [1_000_000; 5],
             &rates::seed(),
             Some(&entry),
@@ -365,6 +367,7 @@ mod tests {
             price(
                 "claude-opus-5",
                 Some("fast"),
+                None,
                 [1_000_000, 0, 0, 0, 0],
                 &rates,
                 None,
@@ -378,6 +381,7 @@ mod tests {
             price(
                 "claude-opus-5",
                 Some("fast"),
+                None,
                 [1_000_000, 0, 0, 0, 0],
                 &rates,
                 None,
@@ -764,6 +768,7 @@ mod tests {
         let (list, spend) = price(
             "acme/claude-x.5",
             None,
+            None,
             [1_000_000; 5],
             &rates::seed(),
             Some(&entry),
@@ -786,6 +791,7 @@ mod tests {
         let (list, spend) = price(
             "claude-opus-5",
             None,
+            None,
             [1_000_000, 0, 0, 0, 0],
             &rates,
             Some(&entry),
@@ -796,6 +802,7 @@ mod tests {
         assert_eq!(
             price(
                 "acme/haiku",
+                None,
                 None,
                 [1_000_000, 0, 0, 0, 0],
                 &rates,
@@ -812,6 +819,7 @@ mod tests {
         let rates = rates::seed();
         let (list, spend) = price(
             "claude-opus-5",
+            None,
             None,
             [1_000_000, 0, 0, 0, 0],
             &rates,

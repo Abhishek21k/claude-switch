@@ -2,6 +2,7 @@
 
 use super::attribute::{Config, Labels, Resolver};
 use super::ledger::{Ledger, Session};
+use super::rates::{PromptTier, Rates};
 use crate::atomic;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -24,6 +25,8 @@ pub struct ChatRow {
     pub session: String,
     pub model: String,
     pub speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tier: Option<PromptTier>,
     pub requests: u64,
     pub input: u64,
     pub output: u64,
@@ -62,23 +65,28 @@ pub fn write(
     ledger: &Ledger,
     config: &Config,
     labels: &Labels,
+    rates: &Rates,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let mut grouped = BTreeMap::<(String, String, String, Option<String>), ChatRow>::new();
+    let mut grouped =
+        BTreeMap::<(String, String, String, Option<String>, Option<PromptTier>), ChatRow>::new();
     let mut sessions = BTreeSet::<(String, String)>::new();
     for request in &ledger.requests {
         sessions.insert((request.profile.clone(), request.session.clone()));
+        let prompt_tier = rates.prompt_tier(request);
         let key = (
             request.profile.clone(),
             request.session.clone(),
             request.model.clone(),
             request.speed.clone(),
+            prompt_tier,
         );
         let row = grouped.entry(key).or_insert_with(|| ChatRow {
             profile: request.profile.clone(),
             session: request.session.clone(),
             model: request.model.clone(),
             speed: request.speed.clone(),
+            prompt_tier,
             requests: 0,
             input: 0,
             output: 0,
@@ -172,7 +180,15 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2030-01-01T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        write(&usage, &ledger, &config, &labels, now).unwrap();
+        write(
+            &usage,
+            &ledger,
+            &config,
+            &labels,
+            &super::super::rates::seed(),
+            now,
+        )
+        .unwrap();
         let saved = read(&usage).unwrap();
         assert_eq!(saved.version, 1);
         assert_eq!(saved.generated_at, now);
@@ -221,6 +237,7 @@ mod tests {
             &ledger,
             &Config::default(),
             &Labels::default(),
+            &super::super::rates::seed(),
             at,
         )
         .unwrap();

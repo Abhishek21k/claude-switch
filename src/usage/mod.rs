@@ -6,6 +6,8 @@ pub mod metrics;
 pub mod parse;
 pub mod rates;
 pub mod report;
+#[cfg(test)]
+mod tier_tests;
 
 use crate::profile::{ProfileManager, Tool};
 use anyhow::Result;

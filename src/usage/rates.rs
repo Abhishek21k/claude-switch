@@ -20,6 +20,22 @@ pub struct ModelRate {
     pub standard: Price,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_prompt: Option<LongPrompt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LongPrompt {
+    pub over_tokens: u64,
+    pub standard: Price,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<Price>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PromptTier {
+    pub over_tokens: u64,
+    pub long: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,12 +78,13 @@ fn model(
             cache_read,
         },
         fast: None,
+        long_prompt: None,
     }
 }
 
 pub fn seed() -> Rates {
     Rates {
-        source: "Anthropic first-party list prices, Claude Code 2.1.280 bundled API reference (2026-06-24)".into(),
+        source: "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10)".into(),
         unit: "USD per million tokens".into(),
         aliases: BTreeMap::new(),
         models: BTreeMap::from([
@@ -76,6 +93,22 @@ pub fn seed() -> Rates {
             ("claude-opus-4-8".into(), model(5.0, 25.0, 6.25, 10.0, 0.5)),
             ("claude-sonnet-5".into(), model(2.0, 10.0, 2.5, 4.0, 0.2)),
             ("claude-haiku-4-5-20251001".into(), model(1.0, 5.0, 1.25, 2.0, 0.1)),
+            ("claude-sonnet-5-5".into(), model(2.0, 10.0, 2.5, 4.0, 0.1)),
+            ("claude-fable-5-1".into(), model(10.0, 50.0, 12.5, 20.0, 0.25)),
+            ("claude-haiku-5-5".into(), ModelRate {
+                long_prompt: Some(LongPrompt {
+                    over_tokens: 100_000,
+                    standard: Price {
+                        input: 0.5,
+                        output: 2.5,
+                        cache_write_5m: 0.625,
+                        cache_write_1h: 1.0,
+                        cache_read: 0.05,
+                    },
+                    fast: None,
+                }),
+                ..model(0.1, 0.5, 0.125, 0.2, 0.01)
+            }),
         ]),
     }
 }
@@ -103,12 +136,39 @@ impl Rates {
             .get(name)
             .or_else(|| self.aliases.get(name).and_then(|id| self.models.get(id)))
     }
-    pub fn price_for(&self, name: &str, speed: Option<&str>) -> Option<&Price> {
+    pub fn prompt_tier(&self, request: &Request) -> Option<PromptTier> {
+        let long_prompt = self.model_rate(&request.model)?.long_prompt.as_ref()?;
+        let length = u128::from(request.input)
+            + u128::from(request.cache_write_5m)
+            + u128::from(request.cache_write_1h)
+            + u128::from(request.cache_read);
+        Some(PromptTier {
+            over_tokens: long_prompt.over_tokens,
+            long: length > u128::from(long_prompt.over_tokens),
+        })
+    }
+
+    pub fn price_for(
+        &self,
+        name: &str,
+        speed: Option<&str>,
+        tier: Option<PromptTier>,
+    ) -> Option<&Price> {
         let model = self.model_rate(name)?;
-        if speed == Some("fast") {
-            model.fast.as_ref()
+        let (standard, fast) = if let Some(long_prompt) = &model.long_prompt {
+            let tier = tier.filter(|tier| tier.over_tokens == long_prompt.over_tokens)?;
+            if tier.long {
+                (&long_prompt.standard, long_prompt.fast.as_ref())
+            } else {
+                (&model.standard, model.fast.as_ref())
+            }
         } else {
-            Some(&model.standard)
+            (&model.standard, model.fast.as_ref())
+        };
+        if speed == Some("fast") {
+            fast
+        } else {
+            Some(standard)
         }
     }
 }
@@ -149,7 +209,11 @@ pub fn edit_alias(dir: &Path, model: &str, target: Option<&str>) -> Result<bool>
 pub fn cost(request: &Request, rates: &Rates) -> Option<Cost> {
     // Known-bad: prefix matching "sonnet" or pricing fast as standard silently
     // invents a rate. Both cases must remain unpriced until explicitly listed.
-    let price = rates.price_for(&request.model, request.speed.as_deref())?;
+    let price = rates.price_for(
+        &request.model,
+        request.speed.as_deref(),
+        rates.prompt_tier(request),
+    )?;
     let per_million = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
     Some(Cost {
         input: per_million(request.input, price.input),
@@ -180,6 +244,138 @@ mod tests {
             .unwrap()
             .requests
             .remove(0)
+    }
+
+    fn close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn seed_has_exact_new_model_cards_and_source() {
+        // Known-bads: Sonnet 5.5 cache reads at 0.20, or identical Haiku 5.5 cards.
+        let rates = seed();
+        assert_eq!(
+            rates.source,
+            "Anthropic first-party list prices, https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-10)"
+        );
+        let values = |price: &Price| {
+            [
+                price.input,
+                price.output,
+                price.cache_write_5m,
+                price.cache_write_1h,
+                price.cache_read,
+            ]
+        };
+        let total = |price: &Price| values(price).into_iter().sum::<f64>();
+        let haiku = &rates.models["claude-haiku-5-5"];
+        assert_eq!(values(&haiku.standard), [0.1, 0.5, 0.125, 0.2, 0.01]);
+        assert_eq!(total(&haiku.standard), 0.935);
+        let long = haiku.long_prompt.as_ref().unwrap();
+        assert_eq!(long.over_tokens, 100_000);
+        assert_eq!(values(&long.standard), [0.5, 2.5, 0.625, 1.0, 0.05]);
+        assert_eq!(total(&long.standard), 4.675);
+        assert!(haiku.fast.is_none() && long.fast.is_none());
+        let sonnet = &rates.models["claude-sonnet-5-5"];
+        assert_eq!(values(&sonnet.standard), [2.0, 10.0, 2.5, 4.0, 0.1]);
+        assert_eq!(total(&sonnet.standard), 18.6);
+        assert!(sonnet.fast.is_none() && sonnet.long_prompt.is_none());
+        let fable = &rates.models["claude-fable-5-1"];
+        assert_eq!(values(&fable.standard), [10.0, 50.0, 12.5, 20.0, 0.25]);
+        assert_eq!(total(&fable.standard), 92.75);
+        assert!(fable.fast.is_none() && fable.long_prompt.is_none());
+    }
+
+    #[test]
+    fn prompt_threshold_is_exclusive() {
+        // Known-bad: >= switches the exactly-100,000-token prompt to the long card.
+        let rates = seed();
+        let mut row = request("claude-haiku-5-5", None);
+        row.input = 1;
+        row.output = 0;
+        row.cache_write_5m = 0;
+        row.cache_write_1h = 0;
+        row.cache_read = 99_999;
+        assert!(!rates.prompt_tier(&row).unwrap().long);
+        close(
+            cost(&row, &rates).unwrap().cache_read,
+            99_999.0 * 0.01 / 1_000_000.0,
+        );
+        row.input = 2;
+        assert!(rates.prompt_tier(&row).unwrap().long);
+        close(
+            cost(&row, &rates).unwrap().cache_read,
+            99_999.0 * 0.05 / 1_000_000.0,
+        );
+    }
+
+    #[test]
+    fn prompt_length_counts_four_input_kinds_but_not_output() {
+        // Known-bads: omitting any input kind, using input alone, or counting output.
+        let rates = seed();
+        let mut row = request("claude-haiku-5-5", None);
+        row.input = 10;
+        row.cache_write_5m = 40_000;
+        row.cache_write_1h = 30_000;
+        row.cache_read = 30_001;
+        row.output = 0;
+        assert!(rates.prompt_tier(&row).unwrap().long);
+        close(
+            cost(&row, &rates).unwrap().cache_read,
+            30_001.0 * 0.05 / 1_000_000.0,
+        );
+        row.input = 1_000;
+        row.cache_write_5m = 9_000;
+        row.cache_write_1h = 10_000;
+        row.cache_read = 40_000;
+        row.output = 50_000;
+        assert!(!rates.prompt_tier(&row).unwrap().long);
+        close(
+            cost(&row, &rates).unwrap().cache_read,
+            40_000.0 * 0.01 / 1_000_000.0,
+        );
+    }
+
+    #[test]
+    fn fast_long_request_requires_long_fast_card() {
+        // Known-bads: falling back to long standard or the model's short fast card.
+        let mut rates = seed();
+        let mut invented = model(1.0, 0.0, 0.0, 0.0, 0.0);
+        invented.fast = Some(Price {
+            input: 7.0,
+            ..invented.standard.clone()
+        });
+        invented.long_prompt = Some(LongPrompt {
+            over_tokens: 100,
+            standard: Price {
+                input: 9.0,
+                ..invented.standard.clone()
+            },
+            fast: None,
+        });
+        rates.models.insert("invented-model".into(), invented);
+        let mut row = request("invented-model", Some("fast"));
+        row.input = 101;
+        row.output = 0;
+        row.cache_write_5m = 0;
+        row.cache_write_1h = 0;
+        row.cache_read = 0;
+        assert!(cost(&row, &rates).is_none());
+        rates
+            .models
+            .get_mut("invented-model")
+            .unwrap()
+            .long_prompt
+            .as_mut()
+            .unwrap()
+            .fast = Some(Price {
+            input: 11.0,
+            ..model(0.0, 0.0, 0.0, 0.0, 0.0).standard
+        });
+        close(
+            cost(&row, &rates).unwrap().total(),
+            101.0 * 11.0 / 1_000_000.0,
+        );
     }
 
     #[test]
@@ -267,18 +463,20 @@ mod alias_file_tests {
     }
     #[test]
     fn alias_edit_preserves_unknown_fields_at_both_depths() {
-        // Known-bad: serializing through Rates drops hand-edited fields.
+        // Known-bad: serializing through Rates drops hand-edited fields or the long card.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rates.json");
         let mut raw = serde_json::to_value(seed()).unwrap();
         raw["note"] = serde_json::json!("synthetic note");
         raw["models"]["claude-opus-5"]["standard"]["extra"] = serde_json::json!(42);
+        let long_card = raw["models"]["claude-haiku-5-5"]["long_prompt"].clone();
         fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
         edit_alias(tmp.path(), "acme/x", Some("claude-opus-5")).unwrap();
         let set: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(set["aliases"]["acme/x"], "claude-opus-5");
         assert_eq!(set["note"], "synthetic note");
         assert_eq!(set["models"]["claude-opus-5"]["standard"]["extra"], 42);
+        assert_eq!(set["models"]["claude-haiku-5-5"]["long_prompt"], long_card);
         edit_alias(tmp.path(), "acme/x", None).unwrap();
         let removed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
@@ -290,6 +488,28 @@ mod alias_file_tests {
         );
         assert_eq!(removed["note"], "synthetic note");
         assert_eq!(removed["models"]["claude-opus-5"]["standard"]["extra"], 42);
+        assert_eq!(
+            removed["models"]["claude-haiku-5-5"]["long_prompt"],
+            long_card
+        );
+    }
+    #[test]
+    fn incomplete_long_prompt_cards_fail_without_rewriting_rates_file() {
+        // Known-bad: a default of zero for missing over_tokens accepts malformed rates.
+        for missing in ["over_tokens", "standard"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("rates.json");
+            let mut raw = serde_json::to_value(seed()).unwrap();
+            raw["models"]["claude-haiku-5-5"]["long_prompt"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            let bytes = serde_json::to_vec_pretty(&raw).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(load_or_seed(tmp.path()).is_err(), "missing {missing}");
+            assert!(edit_alias(tmp.path(), "acme/tiny", Some("claude-haiku-5-5")).is_err());
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
     }
     #[test]
     fn removing_missing_alias_is_a_noop() {

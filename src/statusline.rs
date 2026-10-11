@@ -623,6 +623,7 @@ fn session_amount(
         let (list, spend) = billing::price(
             &row.model,
             row.speed.as_deref(),
+            row.prompt_tier,
             row.tokens(),
             rates,
             entry,
@@ -930,6 +931,7 @@ mod tests {
                 hour: now() - chrono::Duration::hours(1),
                 model: "priced".into(),
                 speed: None,
+                prompt_tier: None,
                 requests: 1,
                 input: 20_000_000,
                 output: 0,
@@ -946,6 +948,7 @@ mod tests {
                 session: "s".into(),
                 model: "priced".into(),
                 speed: None,
+                prompt_tier: None,
                 requests: 1,
                 input: 1_000_000,
                 output: 0,
@@ -971,6 +974,7 @@ mod tests {
                     rates::ModelRate {
                         standard: price,
                         fast: None,
+                        long_prompt: None,
                     },
                 )]),
                 aliases: BTreeMap::new(),
@@ -981,6 +985,34 @@ mod tests {
             },
         ));
         data
+    }
+
+    #[test]
+    fn session_amount_prices_each_prompt_card_from_chats_rollup() {
+        // Known-bad: session_amount drops prompt_tier and marks both rows unpriced.
+        let mut rollup = ledger_disk().chats.unwrap();
+        let mut short = rollup.rows.remove(0);
+        short.model = "claude-haiku-5-5".into();
+        short.prompt_tier = Some(rates::PromptTier {
+            over_tokens: 100_000,
+            long: false,
+        });
+        short.input = 1_000;
+        short.output = 2_000;
+        short.cache_write_5m = 9_000;
+        short.cache_write_1h = 10_000;
+        short.cache_read = 40_000;
+        let mut long = short.clone();
+        long.prompt_tier = Some(rates::PromptTier {
+            over_tokens: 100_000,
+            long: true,
+        });
+        long.cache_read = 130_000;
+        rollup.rows = vec![short, long];
+        let (amount, found) = session_amount(&rollup, "work", "s", &rates::seed(), None, false);
+        assert!(found);
+        assert!((amount.value - 0.03225).abs() < 1e-9);
+        assert_eq!((amount.priced, amount.unpriced), (2, 0));
     }
     fn save_ledger(usage: &Path, data: &DiskData) {
         fs::create_dir_all(usage).unwrap();
@@ -2591,6 +2623,7 @@ mod tests {
             session: "s".into(),
             model: "unknown".into(),
             speed: None,
+            prompt_tier: None,
             requests: 1,
             input: 1_000_000,
             output: 0,
@@ -2621,6 +2654,7 @@ mod tests {
             hour: now() - chrono::Duration::hours(1),
             model: "unknown".into(),
             speed: None,
+            prompt_tier: None,
             requests: 1,
             input: 1,
             output: 0,

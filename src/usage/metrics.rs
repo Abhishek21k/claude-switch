@@ -1,7 +1,7 @@
 //! Read-only usage views and the hourly aggregate persisted after ingest.
 use super::billing::{self, Billing};
 use super::ledger::Ledger;
-use super::rates::Rates;
+use super::rates::{PromptTier, Rates};
 use crate::atomic;
 use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ pub struct Bucket {
     pub hour: DateTime<Utc>,
     pub model: String,
     pub speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tier: Option<PromptTier>,
     pub requests: u64,
     pub input: u64,
     pub output: u64,
@@ -47,20 +49,32 @@ pub fn floor_hour(time: DateTime<Utc>) -> DateTime<Utc> {
         .with_nanosecond(0)
         .unwrap()
 }
-pub fn write(dir: &Path, ledger: &Ledger, now: DateTime<Utc>) -> anyhow::Result<()> {
-    let mut grouped = BTreeMap::<(String, DateTime<Utc>, String, Option<String>), Bucket>::new();
+pub fn write(dir: &Path, ledger: &Ledger, rates: &Rates, now: DateTime<Utc>) -> anyhow::Result<()> {
+    let mut grouped = BTreeMap::<
+        (
+            String,
+            DateTime<Utc>,
+            String,
+            Option<String>,
+            Option<PromptTier>,
+        ),
+        Bucket,
+    >::new();
     for r in &ledger.requests {
+        let prompt_tier = rates.prompt_tier(r);
         let key = (
             r.profile.clone(),
             floor_hour(r.time),
             r.model.clone(),
             r.speed.clone(),
+            prompt_tier,
         );
         let b = grouped.entry(key).or_insert_with(|| Bucket {
             profile: r.profile.clone(),
             hour: floor_hour(r.time),
             model: r.model.clone(),
             speed: r.speed.clone(),
+            prompt_tier,
             requests: 0,
             input: 0,
             output: 0,
@@ -182,6 +196,7 @@ pub fn window<'a>(
         let (list, spend) = billing::price(
             &b.model,
             b.speed.as_deref(),
+            b.prompt_tier,
             b.tokens(),
             rates,
             billing,
@@ -625,6 +640,7 @@ mod tests {
             hour: now - Duration::hours(1),
             model: "claude-opus-5".into(),
             speed: Some("fast".into()),
+            prompt_tier: None,
             requests: 1,
             input: 1_000_000,
             output: 0,
@@ -659,6 +675,7 @@ mod tests {
             hour: DateTime::parse_from_rfc3339(hour).unwrap().to_utc(),
             model: model.into(),
             speed: None,
+            prompt_tier: None,
             requests: 1,
             input: 1_000_000,
             output: 0,
@@ -792,6 +809,7 @@ mod reset_capacity_tests {
             hour: at(hour),
             model: "claude-opus-5".into(),
             speed: None,
+            prompt_tier: None,
             requests: 1,
             input: millions * 1_000_000,
             output: 0,
