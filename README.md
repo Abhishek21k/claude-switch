@@ -167,7 +167,7 @@ Install writes only the profile's `settings.json` key `"statusLine": { "type": "
 
 ## Token usage
 
-`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
+`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
 
 ```bash
 cswitch usage --since 30d --by project
@@ -200,6 +200,20 @@ Capacity:  weekly limit ≈ $380–$450 of list-price usage (est. from 70% at 01
 ```
 
 List prices stay in `rates.json`. Its optional `aliases` object maps exact transcript model names to existing rate model IDs, for example `"acme/claude-x.5": "claude-opus-5-5"`. No name normalization occurs; unaliased names remain unpriced. `usage verify` skips aliased requests because Claude Code's cost state cannot price them.
+
+A model may have this second card (invented model and prices):
+
+```json
+"invented-model": {
+  "standard": { "input": 3, "output": 6, "cache_write_5m": 4, "cache_write_1h": 5, "cache_read": 1 },
+  "long_prompt": {
+    "over_tokens": 120000,
+    "standard": { "input": 8, "output": 12, "cache_write_5m": 9, "cache_write_1h": 10, "cache_read": 2 }
+  }
+}
+```
+
+The prompt length is input tokens plus 5-minute cache writes, 1-hour cache writes and cache reads; output tokens do not count. The long card applies only when that length is **greater than** `over_tokens`. Both `over_tokens` and `long_prompt.standard` are required. An existing `rates.json` is never rewritten, so add new models to it by hand in this shape, then run `cswitch usage refresh` to re-price the history.
 
 Owner billing settings live in private `~/.claude-switch/usage/billing.json`, created atomically with mode `0600`. Rates are USD per million tokens. A rate applies only to its listed model prefixes; without prefixes it applies to every model. Other models use list price. Example with synthetic values:
 
