@@ -1,6 +1,6 @@
 use super::attribute::{Attribution, Config, Labels, Resolver, load_config, load_labels};
 use super::ledger::{IngestReport, Ledger, Session, Store};
-use super::parse::Request;
+use super::parse::{ModelCost, Request};
 use super::rates::{Rates, cost, load_or_seed, read_or_seed};
 use crate::atomic;
 use anyhow::{Result, bail};
@@ -462,6 +462,192 @@ pub fn label(store: &Store, session: &str, project: &str) -> Result<String> {
     Ok(format!("Label saved in labels.json.\n{explanations}"))
 }
 
+#[derive(Clone, Copy, Default)]
+struct VerifyTokens {
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+}
+
+impl VerifyTokens {
+    fn add_request(&mut self, row: &Request) {
+        self.input += row.input;
+        self.output += row.output;
+        self.cache_write += row.cache_write_5m + row.cache_write_1h;
+        self.cache_read += row.cache_read;
+    }
+
+    fn add(&mut self, other: Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_write += other.cache_write;
+        self.cache_read += other.cache_read;
+    }
+
+    fn values(self) -> [u64; 4] {
+        [self.input, self.output, self.cache_write, self.cache_read]
+    }
+}
+
+impl From<&ModelCost> for VerifyTokens {
+    fn from(value: &ModelCost) -> Self {
+        Self {
+            input: value.input,
+            output: value.output,
+            cache_write: value.cache_write,
+            cache_read: value.cache_read,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum VerifyClass {
+    Equal,
+    SubAgentShortfall,
+    MainLoopShortfall,
+    RowsAboveOrMixed,
+    NoTranscriptRequests,
+}
+
+impl VerifyClass {
+    const ORDER: [Self; 5] = [
+        Self::Equal,
+        Self::SubAgentShortfall,
+        Self::MainLoopShortfall,
+        Self::RowsAboveOrMixed,
+        Self::NoTranscriptRequests,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Equal => "equal",
+            Self::SubAgentShortfall => "sub-agent shortfall",
+            Self::MainLoopShortfall => "main-loop shortfall",
+            Self::RowsAboveOrMixed => "rows above or mixed",
+            Self::NoTranscriptRequests => "no transcript requests",
+        }
+    }
+}
+
+fn verify_class(rows: VerifyTokens, state: VerifyTokens, requests: &[&Request]) -> VerifyClass {
+    if requests.is_empty() {
+        return VerifyClass::NoTranscriptRequests;
+    }
+    let rows = rows.values();
+    let state = state.values();
+    if rows == state {
+        VerifyClass::Equal
+    } else if rows
+        .iter()
+        .zip(state)
+        .all(|(row, expected)| *row <= expected)
+    {
+        if requests.iter().any(|row| row.sidechain) {
+            VerifyClass::SubAgentShortfall
+        } else {
+            VerifyClass::MainLoopShortfall
+        }
+    } else {
+        VerifyClass::RowsAboveOrMixed
+    }
+}
+
+#[derive(Default)]
+struct VerifyPairPrice {
+    usd: f64,
+    unpriced_rows: usize,
+    start_of_response_rows: usize,
+    sub_agent_rows: usize,
+}
+
+impl VerifyPairPrice {
+    fn from_requests(requests: &[&Request], rates: &Rates) -> Self {
+        let mut pair = Self::default();
+        for row in requests {
+            if let Some(amount) = cost(row, rates) {
+                pair.usd += amount.total();
+            } else {
+                pair.unpriced_rows += 1;
+            }
+            if row.sidechain {
+                pair.sub_agent_rows += 1;
+                if row.speed.is_none() {
+                    pair.start_of_response_rows += 1;
+                }
+            }
+        }
+        pair
+    }
+
+    fn star(&self) -> &'static str {
+        if self.unpriced_rows > 0 { "*" } else { "" }
+    }
+}
+
+#[derive(Default)]
+struct VerifyClassTotal {
+    pairs: usize,
+    state_usd: f64,
+    rows_usd: f64,
+    unpriced_rows: usize,
+    start_of_response_rows: usize,
+    sub_agent_rows: usize,
+    state_tokens: VerifyTokens,
+    rows_tokens: VerifyTokens,
+}
+
+impl VerifyClassTotal {
+    fn add(&mut self, expected: &ModelCost, rows: VerifyTokens, pair: &VerifyPairPrice) {
+        self.pairs += 1;
+        self.state_usd += expected.usd;
+        self.state_tokens.add(expected.into());
+        self.rows_tokens.add(rows);
+        self.rows_usd += pair.usd;
+        self.unpriced_rows += pair.unpriced_rows;
+        self.start_of_response_rows += pair.start_of_response_rows;
+        self.sub_agent_rows += pair.sub_agent_rows;
+    }
+
+    fn lines(&self, class: VerifyClass) -> String {
+        let star = if self.unpriced_rows > 0 { "*" } else { "" };
+        let short = self.state_usd - self.rows_usd;
+        let percent = if self.state_usd == 0.0 {
+            String::new()
+        } else {
+            format!(" ({:.1}%)", short / self.state_usd * 100.0)
+        };
+        let start_rows = if class == VerifyClass::SubAgentShortfall {
+            format!(
+                "; start-of-response rows {} of {} sub-agent rows",
+                self.start_of_response_rows, self.sub_agent_rows
+            )
+        } else {
+            String::new()
+        };
+        let unpriced = if self.unpriced_rows > 0 {
+            format!("; unpriced rows {}", self.unpriced_rows)
+        } else {
+            String::new()
+        };
+        format!(
+            "  {}: pairs {}; cost state ${:.4}; rows ${:.4}{star}; short ${short:.4}{star}{percent}{start_rows}{unpriced}\n    tokens, cost state / rows: input {} / {}; output {} / {}; cache write {} / {}; cache read {} / {}\n",
+            class.name(),
+            self.pairs,
+            self.state_usd,
+            self.rows_usd,
+            self.state_tokens.input,
+            self.rows_tokens.input,
+            self.state_tokens.output,
+            self.rows_tokens.output,
+            self.state_tokens.cache_write,
+            self.rows_tokens.cache_write,
+            self.state_tokens.cache_read,
+            self.rows_tokens.cache_read,
+        )
+    }
+}
+
 pub fn verify(store: &Store) -> Result<(String, i32)> {
     let ingest = store.ingest()?;
     let ledger = store.load()?;
@@ -482,6 +668,7 @@ pub fn verify(store: &Store) -> Result<(String, i32)> {
     let mut checked_sessions = 0;
     let mut checked = 0;
     let mut failed = 0;
+    let mut class_totals = BTreeMap::<VerifyClass, VerifyClassTotal>::new();
     for session in &ledger.sessions {
         let Some(state) = &session.cost_state else {
             continue;
@@ -507,9 +694,22 @@ pub fn verify(store: &Store) -> Result<(String, i32)> {
         }
         for (model, expected) in &state.models {
             let model_name = format!("{name} {model}");
-            let Some(requests) =
-                grouped.get(&(session.profile.clone(), session.id.clone(), model.clone()))
-            else {
+            let requests = grouped
+                .get(&(session.profile.clone(), session.id.clone(), model.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut rows = VerifyTokens::default();
+            for row in requests {
+                rows.add_request(row);
+            }
+            let state_tokens = VerifyTokens::from(expected);
+            let class = verify_class(rows, state_tokens, requests);
+            let price = VerifyPairPrice::from_requests(requests, &rates);
+            class_totals
+                .entry(class)
+                .or_default()
+                .add(expected, rows, &price);
+            if class == VerifyClass::NoTranscriptRequests {
                 let category = if model.contains("haiku") {
                     "background Haiku"
                 } else {
@@ -519,22 +719,19 @@ pub fn verify(store: &Store) -> Result<(String, i32)> {
                     "  {model_name}: no transcript requests ({category})\n"
                 ));
                 continue;
-            };
-            let input: u64 = requests.iter().map(|row| row.input).sum();
-            let output_tokens: u64 = requests.iter().map(|row| row.output).sum();
-            let write: u64 = requests
-                .iter()
-                .map(|row| row.cache_write_5m + row.cache_write_1h)
-                .sum();
-            let read: u64 = requests.iter().map(|row| row.cache_read).sum();
-            if (input, output_tokens, write, read)
-                != (
-                    expected.input,
-                    expected.output,
-                    expected.cache_write,
-                    expected.cache_read,
-                )
-            {
+            }
+            if class == VerifyClass::SubAgentShortfall {
+                let star = price.star();
+                let row_usd = price.usd;
+                let sub_agent_rows = price.sub_agent_rows;
+                let start_rows = price.start_of_response_rows;
+                output.push_str(&format!(
+                    "  {model_name}: sub-agent shortfall: rows ${row_usd:.4}{star} vs cost state ${:.4} ({start_rows} of {sub_agent_rows} sub-agent rows hold a start-of-response usage)\n",
+                    expected.usd
+                ));
+                continue;
+            }
+            if class != VerifyClass::Equal {
                 output.push_str(&format!(
                     "  {model_name}: tokens differ (resumed/unflushed session)\n"
                 ));
@@ -565,6 +762,14 @@ pub fn verify(store: &Store) -> Result<(String, i32)> {
         }
         if checked > checked_before {
             checked_sessions += 1;
+        }
+    }
+    if !class_totals.is_empty() {
+        output.push_str("Totals by class (excluded sessions are left out):\n");
+        for class in VerifyClass::ORDER {
+            if let Some(totals) = class_totals.get(&class) {
+                output.push_str(&totals.lines(class));
+            }
         }
     }
     output.push_str(&format!(

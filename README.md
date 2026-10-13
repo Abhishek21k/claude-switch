@@ -97,7 +97,7 @@ cswitch
 | `cswitch usage` | Ingest local transcripts and show a 7-day token and API-equivalent cost report |
 | `cswitch usage refresh` | Refresh the local ledger without printing a report |
 | `cswitch usage label <session> <project>` | Label a past session without reopening it |
-| `cswitch usage verify` | Check matching transcript tokens against Claude Code's cost-state snapshot |
+| `cswitch usage verify` | Check transcript tokens against Claude Code's cost-state snapshot, and add up the differences by class |
 | `cswitch statusline` | Print one Claude Code status line from stdin and local profile data |
 | `cswitch statusline --install <name> [--no-refresh] [--force]` | Install the line for a registered Claude profile; `--all` selects every Claude profile |
 | `cswitch statusline --uninstall <name>` | Remove a cswitch-owned line; `--all` selects every Claude profile |
@@ -167,7 +167,7 @@ Install writes only the profile's `settings.json` key `"statusLine": { "type": "
 
 ## Token usage
 
-`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Unknown models and fast requests without an explicit fast rate show `$*`. A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
+`cswitch usage` reads complete JSONL lines from the default Claude Code directory and registered profiles, then keeps deduplicated request rows in `~/.claude-switch/usage/`. It stores token counters, model IDs, timestamps, session titles, and project signals; it does not store prompts or tool inputs. `hourly.json` holds hourly totals, and `chats.json` holds per-session totals and one project signal per session. Its dollar column is an **API-equivalent weight**, not a subscription bill. Where a sub-agent ran, the dollar column is a floor: Claude Code often writes a sub-agent's request to the transcript only as its response starts, so the output count there is a placeholder, and its cost state can count requests that no transcript holds; `cswitch usage verify` adds up the difference by class, in tokens and dollars. Unknown models and fast requests without an explicit fast rate show `$*`. A model can have a second price card for long prompts; a rollup row classified under another rate table shows `$*` until the next `cswitch usage refresh`. The editable `rates.json` is seeded once and never overwritten. Ingest makes no network call and does not change Claude Code files. The [ccusage Claude adapter notes](https://github.com/ccusage/ccusage/blob/main/rust/adapters/claude/src/README.md) describe the transcript layout and sidechain replay behavior used here.
 
 ```bash
 cswitch usage --since 30d --by project

@@ -8,6 +8,8 @@ pub mod rates;
 pub mod report;
 #[cfg(test)]
 mod tier_tests;
+#[cfg(test)]
+mod verify_tests;
 
 use crate::profile::{ProfileManager, Tool};
 use anyhow::Result;
