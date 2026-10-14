@@ -1,14 +1,23 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use chrono::{DateTime, Local, Utc};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    DefaultTerminal, Frame,
 };
 
-use crate::profile::{describe_age, detect_current_account, Profile, ProfileManager};
+use crate::gateway::{self, GatewayInput};
+use crate::key::{self, AuthMode, InputStep};
+use crate::limits::{Limits, Window, parse_limits, read_claude_json};
+use crate::profile::{
+    LoginMethod, LoginOutcome, Profile, ProfileManager, Tool, describe_age, detect_current_account,
+};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -31,6 +40,10 @@ enum Mode {
     Help,
     ConfirmDelete,
     ConfirmRefresh,
+    ConfirmKeyClear,
+    KeyEntry,
+    GatewayEntry,
+    ConfirmGatewayDefaults,
     AddName,
     /// Name accepted; now choosing *how* the profile gets its account.
     /// Split from `AddName` so Esc backs out one step at a time and the
@@ -46,7 +59,13 @@ enum Mode {
 #[derive(Debug, Clone, PartialEq)]
 enum PendingAction {
     /// Authenticate a brand-new profile as a different Claude account.
-    Login { name: String },
+    Login {
+        name: String,
+        method: LoginMethod,
+    },
+    CodexLogin {
+        name: String,
+    },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -56,6 +75,11 @@ pub struct App {
     list_state: ListState,
     mode: Mode,
     input_buffer: String,
+    key_buffer: String,
+    gateway_buffer: String,
+    pending_gateway: Option<GatewayInput>,
+    gateway_replaces_defaults: bool,
+    executable: PathBuf,
     search_query: String,
     /// Indices into `profiles` matching the current search.
     filtered_indices: Vec<usize>,
@@ -74,10 +98,17 @@ pub struct App {
     /// reason: the confirmation should name every consequence, not just the
     /// credential one.
     selected_has_history: bool,
+    selected_has_key: bool,
     pending: Option<PendingAction>,
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
     account_probe: AccountProbe,
+    limits: HashMap<String, Limits>,
+    auth_modes: HashMap<String, AuthMode>,
+    codex_plans: HashMap<String, Option<String>>,
+    limits_selection: Option<String>,
+    last_limits_refresh: Option<Instant>,
+    limits_now: DateTime<Utc>,
 }
 
 type AccountProbe = fn() -> Option<String>;
@@ -110,6 +141,11 @@ impl App {
             list_state,
             mode,
             input_buffer,
+            key_buffer: String::new(),
+            gateway_buffer: String::new(),
+            pending_gateway: None,
+            gateway_replaces_defaults: false,
+            executable: PathBuf::new(),
             search_query: String::new(),
             filtered_indices,
             detected_email,
@@ -117,9 +153,21 @@ impl App {
             current_account: None,
             selected_in_use: None,
             selected_has_history: false,
+            selected_has_key: false,
             pending: None,
             account_probe: live_account_email,
+            limits: HashMap::new(),
+            auth_modes: HashMap::new(),
+            codex_plans: HashMap::new(),
+            limits_selection: None,
+            last_limits_refresh: None,
+            limits_now: Utc::now(),
         })
+    }
+
+    pub fn with_executable(mut self, executable: PathBuf) -> Self {
+        self.executable = executable;
+        self
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -134,7 +182,50 @@ impl App {
             self.list_state
                 .select(Some(idx.min(self.filtered_indices.len() - 1)));
         }
+        self.last_limits_refresh = None;
         Ok(())
+    }
+
+    fn refresh_limits_if_due(&mut self, instant: Instant) {
+        let selected = self.selected_profile().map(|profile| profile.name.clone());
+        let changed = selected != self.limits_selection;
+        let due = self
+            .last_limits_refresh
+            .is_none_or(|last| instant.duration_since(last) >= Duration::from_secs(30));
+        if let Some(name) = &selected
+            && (changed || due)
+        {
+            if let Some(tool) = self.selected_profile().map(|profile| profile.tool.clone())
+                && tool != Tool::Claude
+            {
+                self.limits.remove(name);
+                self.auth_modes.remove(name);
+                if tool == Tool::Codex {
+                    self.codex_plans.insert(
+                        name.clone(),
+                        self.manager
+                            .codex_identity(name)
+                            .and_then(|identity| identity.plan_type),
+                    );
+                }
+                self.limits_selection = selected;
+                self.last_limits_refresh = Some(instant);
+                return;
+            }
+            let claude = read_claude_json(&self.manager.profile_dir(name));
+            self.auth_modes.insert(
+                name.clone(),
+                key::read_auth_mode(&self.manager, name, claude.clone()),
+            );
+            self.limits.insert(
+                name.clone(),
+                claude
+                    .map(|json| json.map_or(Limits::Unreadable, |value| parse_limits(&value)))
+                    .unwrap_or(Limits::Unreadable),
+            );
+            self.last_limits_refresh = Some(instant);
+        }
+        self.limits_selection = selected;
     }
 
     fn apply_filter(&mut self) {
@@ -148,11 +239,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| {
                     p.name.to_lowercase().contains(&q)
-                        || p.email
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&q)
+                        || p.email.as_deref().unwrap_or("").to_lowercase().contains(&q)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -234,9 +321,13 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.limits_now = Utc::now();
+            self.refresh_limits_if_due(Instant::now());
             terminal.draw(|f| self.render(f))?;
 
-            if let Event::Key(key) = event::read()? {
+            if event::poll(Duration::from_secs(30))?
+                && let Event::Key(key) = event::read()?
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -266,6 +357,10 @@ impl App {
                     Mode::ConfirmRefresh => {
                         self.handle_confirm_refresh(key.code)?;
                     }
+                    Mode::ConfirmKeyClear => self.handle_confirm_key_clear(key.code)?,
+                    Mode::KeyEntry => self.handle_key_entry(key)?,
+                    Mode::GatewayEntry => self.handle_gateway_entry(key)?,
+                    Mode::ConfirmGatewayDefaults => self.handle_confirm_gateway_defaults(key)?,
                     Mode::AddName => {
                         if self.handle_add_name(key.code)? {
                             return Ok(());
@@ -298,44 +393,27 @@ impl App {
     /// Tear the TUI down, run `action` against the real terminal, then rebuild
     /// the TUI and carry on. Errors are shown in-app rather than propagated —
     /// a cancelled or failed login must not take the whole program down with it.
-    fn run_pending(
-        &mut self,
-        action: PendingAction,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<()> {
+    fn run_pending(&mut self, action: PendingAction, terminal: &mut DefaultTerminal) -> Result<()> {
         ratatui::restore();
 
         // `select` is only set when a profile actually landed in the registry,
         // so a failed attempt leaves the current selection alone.
-        let (select, message) = match action {
-            PendingAction::Login { name } => {
-                match self.manager.login_profile(&name, false, None) {
-                    Ok(result) => {
-                        let others: Vec<&str> = result
-                            .same_account_as
-                            .iter()
-                            .map(String::as_str)
-                            .filter(|n| *n != name)
-                            .collect();
-
-                        let msg = if others.is_empty() {
-                            format!("Profile '{}' logged in as {}.", name, result.display_email())
-                        } else {
-                            // Not an error: two profiles for one account is a
-                            // valid setup. But say it, or it reads as a new one.
-                            format!(
-                                "Profile '{}' is {} — the same account as {}. \
-                                 Sign out of claude.ai and retry if you wanted a different one.",
-                                name,
-                                result.display_email(),
-                                others.join(", ")
-                            )
-                        };
-                        (Some(name), Mode::Message(msg, false))
-                    }
-                    Err(e) => (None, Mode::Message(e.to_string(), true)),
-                }
+        let (name, result, method) = match action {
+            PendingAction::Login { name, method } => {
+                let result = self.manager.login_profile(&name, false, None, method);
+                (name, result, Some(method))
             }
+            PendingAction::CodexLogin { name } => {
+                let result = self.manager.login_codex_profile(&name);
+                (name, result, None)
+            }
+        };
+        let (select, message) = match result {
+            Ok(result) => {
+                let msg = pending_login_message(&name, &result, method);
+                (Some(name), Mode::Message(msg, false))
+            }
+            Err(e) => (None, Mode::Message(e.to_string(), true)),
         };
 
         // Rebuild the terminal the loop is about to draw into.
@@ -352,11 +430,7 @@ impl App {
 
     // ── Key handlers ──────────────────────────────────────────────────────────
 
-    fn handle_first_run_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_first_run_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -364,6 +438,10 @@ impl App {
         if !self.claude_dir_found {
             match code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                KeyCode::Char('a') => {
+                    self.input_buffer.clear();
+                    self.mode = Mode::AddName;
+                }
                 _ => self.mode = Mode::Normal,
             }
             return Ok(false);
@@ -372,7 +450,6 @@ impl App {
         match code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('q') => return Ok(true),
-
             KeyCode::Char('1') => {
                 let name = self.input_buffer.trim().to_string();
                 if name.is_empty() {
@@ -404,7 +481,21 @@ impl App {
                 self.detected_email = None;
                 self.claude_dir_found = false;
                 self.mode = Mode::Normal;
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
+            }
+
+            KeyCode::Char('3') => {
+                let name = self.input_buffer.trim().to_string();
+                if name.is_empty() {
+                    return Ok(false);
+                }
+                self.detected_email = None;
+                self.claude_dir_found = false;
+                self.mode = Mode::Normal;
+                self.pending = Some(PendingAction::CodexLogin { name });
             }
 
             KeyCode::Backspace => {
@@ -418,11 +509,7 @@ impl App {
         Ok(false)
     }
 
-    fn handle_normal_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_normal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
@@ -442,16 +529,49 @@ impl App {
 
             KeyCode::Enter => {
                 if let Some(p) = self.selected_profile() {
+                    if matches!(p.tool, Tool::Unknown(_)) {
+                        self.mode = Mode::Message(
+                            "Profile has an unknown tool; cannot use or log in.".into(),
+                            true,
+                        );
+                        return Ok(false);
+                    }
                     let name = p.name.clone();
+                    let tool = p.tool.clone();
                     ratatui::restore();
-                    println!("Launching Claude with profile '{}'…", name);
-                    self.manager.launch_claude(&name, &[])?;
+                    println!("Launching {} with profile '{}'…", tool.label(), name);
+                    self.manager.launch_profile(&name, &[])?;
                 }
             }
 
             KeyCode::Char('l') => {
                 self.mode = Mode::LoginName;
                 self.input_buffer.clear();
+            }
+
+            KeyCode::Char('p') if self.selected_profile().is_some() => {
+                if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool != Tool::Claude)
+                {
+                    self.mode = Mode::Message("API keys are Claude-only.".into(), true);
+                    return Ok(false);
+                }
+                self.key_buffer.clear();
+                self.gateway_buffer.clear();
+                self.pending_gateway = None;
+                self.gateway_replaces_defaults = false;
+                self.mode = Mode::KeyEntry;
+            }
+            KeyCode::Char('P') if self.selected_profile().is_some() => {
+                self.mode = if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool == Tool::Claude)
+                {
+                    Mode::ConfirmKeyClear
+                } else {
+                    Mode::Message("API keys are Claude-only.".into(), true)
+                };
             }
 
             KeyCode::Char('a') => {
@@ -471,9 +591,19 @@ impl App {
             // account theft when they are not — so it is confirmed against the
             // identities involved.
             KeyCode::Char('r') if self.selected_profile().is_some() => {
+                if self
+                    .selected_profile()
+                    .is_some_and(|p| p.tool != Tool::Claude)
+                {
+                    self.mode = Mode::Message("Refresh is Claude-only".into(), true);
+                    return Ok(false);
+                }
                 self.current_account = (self.account_probe)();
                 self.selected_in_use = self.selected_session_age();
                 self.selected_has_history = self.selected_holds_history();
+                self.selected_has_key = self
+                    .selected_profile()
+                    .is_some_and(|p| key::has_key(&self.manager, &p.name));
                 self.mode = Mode::ConfirmRefresh;
             }
 
@@ -486,6 +616,10 @@ impl App {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(p) = self.selected_profile() {
+                    if p.tool != Tool::Claude {
+                        self.mode = Mode::Message("Refresh is Claude-only".into(), true);
+                        return Ok(());
+                    }
                     let name = p.name.clone();
                     match self.manager.add_profile_force(&name, false) {
                         Ok(p) => {
@@ -511,11 +645,177 @@ impl App {
         Ok(())
     }
 
-    fn handle_search_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_key_entry(&mut self, event: KeyEvent) -> Result<()> {
+        match key::apply_key_event(&mut self.key_buffer, event) {
+            InputStep::Continue => {}
+            InputStep::Abort => {
+                self.gateway_buffer.clear();
+                self.pending_gateway = None;
+                self.mode = Mode::Normal;
+            }
+            InputStep::TooLong => unreachable!(),
+            InputStep::Complete => {
+                if let Some(profile) = self.selected_profile() {
+                    let name = profile.name.clone();
+                    let check = key::validate_key_input(&self.key_buffer)
+                        .and_then(|_| key::precheck_set_key(&self.manager, &name, false));
+                    self.mode = match check {
+                        Ok(()) => Mode::GatewayEntry,
+                        Err(error) => {
+                            self.key_buffer.clear();
+                            Mode::Message(error.to_string(), true)
+                        }
+                    };
+                } else {
+                    self.key_buffer.clear();
+                    self.mode = Mode::Normal;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_gateway_entry(&mut self) {
+        self.key_buffer.clear();
+        self.gateway_buffer.clear();
+        self.pending_gateway = None;
+        self.gateway_replaces_defaults = false;
+        self.mode = Mode::Normal;
+    }
+
+    fn handle_gateway_entry(&mut self, event: KeyEvent) -> Result<()> {
+        match key::apply_gateway_event(&mut self.gateway_buffer, event) {
+            InputStep::Continue => {}
+            InputStep::Abort => self.cancel_gateway_entry(),
+            InputStep::TooLong => {
+                self.cancel_gateway_entry();
+                self.mode = Mode::Message("Gateway input is too long.".into(), true);
+            }
+            InputStep::Complete => {
+                let mut input = std::mem::take(&mut self.gateway_buffer);
+                let parsed = key::parse_gateway_input(&input);
+                input.clear();
+                self.mode = match parsed {
+                    Ok(gateway) => {
+                        let confirm = matches!(gateway, GatewayInput::Json { .. });
+                        if let GatewayInput::Json { url, settings, .. } = &gateway {
+                            match gateway::read_defaults(&self.manager.base_dir) {
+                                Ok(defaults) => {
+                                    self.gateway_replaces_defaults =
+                                        defaults.get(url).is_some_and(|old| old != settings)
+                                }
+                                Err(error) => {
+                                    self.key_buffer.clear();
+                                    self.mode = Mode::Message(error.to_string(), true);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        self.pending_gateway = Some(gateway);
+                        if confirm {
+                            Mode::ConfirmGatewayDefaults
+                        } else {
+                            self.finish_key_set(false)?;
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        self.key_buffer.clear();
+                        Mode::Message(error.to_string(), true)
+                    }
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_gateway_defaults(&mut self, event: KeyEvent) -> Result<()> {
+        if event.code == KeyCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cancel_gateway_entry();
+            return Ok(());
+        }
+        match event.code {
+            KeyCode::Esc => self.cancel_gateway_entry(),
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.finish_key_set(true)?
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.finish_key_set(false)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish_key_set(&mut self, save_defaults: bool) -> Result<()> {
+        let gateway = self.pending_gateway.take().unwrap_or(GatewayInput::Keep);
+        let mut input = std::mem::take(&mut self.key_buffer);
+        self.gateway_buffer.clear();
+        let Some(profile) = self.selected_profile() else {
+            self.mode = Mode::Normal;
+            return Ok(());
+        };
+        let name = profile.name.clone();
+        self.mode = match key::set_key_with_gateway(
+            &self.manager,
+            &name,
+            &input,
+            &self.executable,
+            false,
+            &gateway,
+            save_defaults,
+            Utc::now(),
+        ) {
+            Ok(outcome) => {
+                self.last_limits_refresh = None;
+                let mut lines = vec![format!("API key saved for profile '{name}'.")];
+                lines.extend(outcome.gateway_lines);
+                if outcome.running_session {
+                    lines.push("Restart running sessions.".into());
+                }
+                if outcome.overrides_subscription {
+                    lines.push("Billing moves to the API.".into());
+                }
+                if outcome.build_path {
+                    lines.push(
+                        "Helper uses a build directory; install cswitch and rerun key set.".into(),
+                    );
+                }
+                Mode::Message(lines.join("\n"), false)
+            }
+            Err(error) => Mode::Message(error.to_string(), true),
+        };
+        input.clear();
+        Ok(())
+    }
+
+    fn handle_confirm_key_clear(&mut self, code: KeyCode) -> Result<()> {
+        if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && let Some(profile) = self.selected_profile()
+        {
+            let name = profile.name.clone();
+            self.mode = match key::clear_key(&self.manager, &name, Utc::now()) {
+                Ok(result) => {
+                    self.last_limits_refresh = None;
+                    let mut message = format!(
+                        "API key removed for '{name}'. Fallback: {}.",
+                        result.fallback
+                    );
+                    if result.foreign_helper {
+                        message.push_str(" A foreign helper remains active.");
+                    }
+                    if let Some(line) = result.gateway_line {
+                        message.push_str(&format!("\n{line}"));
+                    }
+                    Mode::Message(message, false)
+                }
+                Err(error) => Mode::Message(error.to_string(), true),
+            };
+            return Ok(());
+        }
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -631,7 +931,19 @@ impl App {
                 }
             }
             KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::Console,
+                });
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.pending = Some(PendingAction::CodexLogin { name });
             }
             // Esc steps back to the name, not out of the flow — a typo in the
             // name should not cost the whole interaction.
@@ -656,7 +968,10 @@ impl App {
                     self.mode = Mode::Message(existing, true);
                     return Ok(false);
                 }
-                self.pending = Some(PendingAction::Login { name });
+                self.pending = Some(PendingAction::Login {
+                    name,
+                    method: LoginMethod::ClaudeAi,
+                });
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Backspace => {
@@ -720,6 +1035,10 @@ impl App {
             Mode::Help => self.render_help(f),
             Mode::ConfirmDelete => self.render_confirm_delete_popup(f),
             Mode::ConfirmRefresh => self.render_confirm_refresh_popup(f),
+            Mode::ConfirmKeyClear => self.render_confirm_key_clear_popup(f),
+            Mode::KeyEntry => self.render_key_entry_popup(f),
+            Mode::GatewayEntry => self.render_gateway_entry_popup(f),
+            Mode::ConfirmGatewayDefaults => self.render_confirm_gateway_defaults_popup(f),
             Mode::AddName => self.render_add_name_popup(f),
             Mode::AddChoice => self.render_add_choice_popup(f),
             Mode::LoginName => self.render_login_name_popup(f),
@@ -784,6 +1103,8 @@ impl App {
                 Span::styled("copy session  ", Style::default().fg(DIM)),
                 Span::styled(" 2 ", Style::default().fg(ACCENT).bold()),
                 Span::styled("login new  ", Style::default().fg(DIM)),
+                Span::styled(" 3 ", Style::default().fg(ACCENT).bold()),
+                Span::styled("codex login  ", Style::default().fg(DIM)),
                 Span::styled(" esc ", Style::default().fg(ACCENT).bold()),
                 Span::styled("skip  ", Style::default().fg(DIM)),
                 Span::styled(" q ", Style::default().fg(ACCENT).bold()),
@@ -832,11 +1153,17 @@ impl App {
                 Style::default().fg(DIM),
             )),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(SUCCESS).bold()),
-                Span::styled("Claude Code installation detected", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "Claude Code installation detected",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -844,9 +1171,15 @@ impl App {
                 Span::styled(email, Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  Set up your first profile:", Style::default().fg(TEXT))),
+            Line::from(Span::styled(
+                "  Set up your first profile:",
+                Style::default().fg(TEXT),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Profile name   ", Style::default().fg(DIM)),
@@ -858,19 +1191,41 @@ impl App {
                 Span::styled(dest, Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [1] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Copy active session as this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Copy active session as this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Uses your existing credentials — no re-login needed", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Uses your existing credentials — no re-login needed",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [2] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Login to a different account for this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Login to a different account for this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Opens Claude for you to authenticate a new account", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Opens Claude for you to authenticate a new account",
+                Style::default().fg(DIM),
+            )),
+            Line::from(vec![
+                Span::styled("  [3] ", Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    "Log in to a Codex (ChatGPT) account",
+                    Style::default().fg(TEXT),
+                ),
+            ]),
         ]
     }
 
@@ -882,14 +1237,23 @@ impl App {
                 Span::styled("claude-switch", Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✗ ", Style::default().fg(DANGER).bold()),
-                Span::styled("No Claude Code installation found at ~/.claude", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "No Claude Code installation found at ~/.claude",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  You need to install and log in to Claude Code before adding profiles.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  Claude Code is not set up here. You can still add a Codex profile.",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Install   ", Style::default().fg(DIM)),
@@ -907,7 +1271,10 @@ impl App {
                 Span::styled("claude", Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Then re-run cswitch to set up your first profile.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  Press [a] to choose Codex login, or install Claude Code first.",
+                Style::default().fg(DIM),
+            )),
         ]
     }
 
@@ -998,7 +1365,10 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  ", Style::default()),
-                        Span::styled(email.to_string(), Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("{} · {email}", p.tool.label()),
+                            Style::default().fg(DIM),
+                        ),
                     ]),
                 ])
             })
@@ -1046,13 +1416,16 @@ impl App {
 
         let profile_dir = self.manager.profile_dir(&profile.name);
 
-        let lines: Vec<Line> = vec![
+        let mut lines: Vec<Line> = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Name         ", Style::default().fg(DIM)),
                 Span::styled(profile.name.clone(), Style::default().fg(ACCENT).bold()),
             ]),
-            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Tool         ", Style::default().fg(DIM)),
+                Span::styled(profile.tool.label(), Style::default().fg(TEXT)),
+            ]),
             Line::from(vec![
                 Span::styled("  Email        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1060,7 +1433,31 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Auth         ", Style::default().fg(DIM)),
+                Span::styled(
+                    if profile.tool == Tool::Claude {
+                        self.auth_modes
+                            .get(&profile.name)
+                            .map(AuthMode::label)
+                            .unwrap_or_else(|| "unreadable".into())
+                    } else {
+                        "—".into()
+                    },
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Gateway      ", Style::default().fg(DIM)),
+                Span::styled(
+                    if profile.tool == Tool::Claude {
+                        key::gateway_info(&self.manager, &profile.name)
+                    } else {
+                        "—".into()
+                    },
+                    Style::default().fg(TEXT),
+                ),
+            ]),
             Line::from(vec![
                 Span::styled("  Added        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1068,7 +1465,6 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Last used    ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1079,10 +1475,65 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
+        ];
+        if profile.tool == Tool::Codex {
+            lines.push(Line::from(vec![
+                Span::styled("  Plan         ", Style::default().fg(DIM)),
+                Span::styled(
+                    self.codex_plans
+                        .get(&profile.name)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| "—".into()),
+                    Style::default().fg(TEXT),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        if profile.tool != Tool::Claude {
+            lines.push(Line::from("  Plan limits  —"));
+        } else {
+            match self.limits.get(&profile.name) {
+                Some(Limits::Snapshot(snapshot)) => {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Plan limits  ", Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("as of {}", snapshot.age(self.limits_now)),
+                            Style::default().fg(TEXT),
+                        ),
+                    ]));
+                    if snapshot.windows.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "    No limit windows in this snapshot.",
+                            Style::default().fg(MUTED),
+                        )));
+                    }
+                    for window in &snapshot.windows {
+                        lines.push(limit_line(window, self.limits_now));
+                    }
+                }
+                Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
+                    "  Plan limits  mismatch: another account's snapshot",
+                    Style::default().fg(MUTED),
+                ))),
+                Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
+                    "  Plan limits  unreadable: file couldn't be read",
+                    Style::default().fg(MUTED),
+                ))),
+                Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
+                    "  Plan limits  no data: no cached snapshot yet",
+                    Style::default().fg(MUTED),
+                ))),
+            }
+        }
+        lines.extend([
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Config dir   ", Style::default().fg(DIM)),
-                Span::styled(profile_dir.display().to_string(), Style::default().fg(MUTED)),
+                Span::styled(
+                    profile_dir.display().to_string(),
+                    Style::default().fg(MUTED),
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -1093,18 +1544,41 @@ impl App {
             Line::from(Span::styled("  Launch command", Style::default().fg(DIM))),
             Line::from(Span::styled(
                 if cfg!(target_os = "windows") {
-                    format!("  $env:CLAUDE_CONFIG_DIR='{}'; claude", profile_dir.display())
+                    format!(
+                        "  $env:{}='{}'; {}",
+                        if profile.tool == Tool::Codex {
+                            "CODEX_HOME"
+                        } else {
+                            "CLAUDE_CONFIG_DIR"
+                        },
+                        profile_dir.display(),
+                        if profile.tool == Tool::Codex {
+                            "codex"
+                        } else {
+                            "claude"
+                        }
+                    )
                 } else {
-                    format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
+                    format!(
+                        "  {}='{}' {}",
+                        if profile.tool == Tool::Codex {
+                            "CODEX_HOME"
+                        } else {
+                            "CLAUDE_CONFIG_DIR"
+                        },
+                        profile_dir.display(),
+                        if profile.tool == Tool::Codex {
+                            "codex"
+                        } else {
+                            "claude"
+                        }
+                    )
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
-        ];
+        ]);
 
-        f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -1115,11 +1589,7 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let keys: Vec<(&str, &str)> = if self.mode == Mode::Search {
-            vec![
-                ("↑/↓", "navigate"),
-                ("enter", "confirm"),
-                ("esc", "clear"),
-            ]
+            vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
         } else {
             vec![
                 ("↑↓/jk", "nav"),
@@ -1127,6 +1597,8 @@ impl App {
                 ("/", "search"),
                 ("a", "add account"),
                 ("l", "login"),
+                ("p", "set key"),
+                ("P", "clear key"),
                 ("r", "refresh"),
                 ("d", "delete"),
                 ("?", "help"),
@@ -1145,10 +1617,7 @@ impl App {
             })
             .collect();
 
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).block(block),
-            area,
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     // ── Overlay popups ────────────────────────────────────────────────────────
@@ -1169,10 +1638,12 @@ impl App {
 
         let help_entries: Vec<(&str, &str)> = vec![
             ("↑/↓  j/k", "Navigate profiles"),
-            ("Enter", "Launch Claude with selected profile"),
+            ("Enter", "Launch selected profile's tool"),
             ("/", "Search profiles by name or email"),
-            ("a", "Add account — then choose copy or login"),
+            ("a", "Add account — choose Claude or Codex login"),
             ("l", "Login — straight to a different account"),
+            ("p", "Set API key for selected profile"),
+            ("P", "Clear API key after confirmation"),
             ("r", "Refresh — overwrite with current session"),
             ("d / Del", "Delete selected profile"),
             ("?", "Toggle this help dialog"),
@@ -1239,7 +1710,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1297,7 +1771,7 @@ impl App {
 
     /// The step that makes the side effect explicit before it happens.
     fn render_add_choice_popup(&self, f: &mut Frame) {
-        let area = centered_rect(66, 12, f.area());
+        let area = centered_rect(66, 17, f.area());
         f.render_widget(Clear, area);
 
         let block = Block::default()
@@ -1332,7 +1806,10 @@ impl App {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  [l] ", Style::default().fg(ACCENT).bold()),
-                    Span::styled("Log in to a different Claude account", Style::default().fg(TEXT)),
+                    Span::styled(
+                        "Log in to a different Claude account",
+                        Style::default().fg(TEXT),
+                    ),
                 ]),
                 Line::from(Span::styled(
                     "      Opens Claude's login. Sign out of claude.ai first,",
@@ -1342,6 +1819,21 @@ impl App {
                     "      or it will grant the account already signed in there.",
                     Style::default().fg(DIM),
                 )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [p] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        "Log in with the Anthropic Console (API billing)",
+                        Style::default().fg(TEXT),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  [o] ", Style::default().fg(ACCENT).bold()),
+                    Span::styled(
+                        "Log in to a Codex (ChatGPT) account",
+                        Style::default().fg(TEXT),
+                    ),
+                ]),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Esc back · q cancel",
@@ -1371,14 +1863,12 @@ impl App {
         // Overwriting a profile another terminal is using is its own hazard,
         // independent of which account it holds — as is destroying history,
         // which happens even on a same-account refresh.
-        let color = if replaces_account
-            || self.selected_in_use.is_some()
-            || self.selected_has_history
-        {
-            DANGER
-        } else {
-            ACCENT
-        };
+        let color =
+            if replaces_account || self.selected_in_use.is_some() || self.selected_has_history {
+                DANGER
+            } else {
+                ACCENT
+            };
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1423,7 +1913,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1444,6 +1937,14 @@ impl App {
             lines.push(Line::from(Span::styled(
                 "  Transcripts and prompt history cannot be recovered.",
                 Style::default().fg(DANGER),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        if self.selected_has_key {
+            lines.push(Line::from(Span::styled(
+                "  Its saved API key will be deleted.",
+                Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(""));
         }
@@ -1495,8 +1996,123 @@ impl App {
         );
     }
 
-    fn render_message(&self, f: &mut Frame, msg: &str, is_err: bool) {
+    fn render_key_entry_popup(&self, f: &mut Frame) {
+        let area = centered_rect(60, 7, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Set API key ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!(
+                "  API key: {}",
+                "•".repeat(self.key_buffer.chars().count())
+            )),
+            Line::from(""),
+            Line::from("  Enter continues · Esc or Ctrl-C cancels"),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_gateway_entry_popup(&self, f: &mut Frame) {
+        let area = centered_rect(82, 9, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Gateway ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let current = self.selected_profile().map_or_else(
+            || "the Anthropic API".into(),
+            |profile| key::gateway_display(&self.manager, &profile.name),
+        );
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!("  Gateway now: {current}")),
+            Line::from(format!(
+                "  Input: {} characters (hidden)",
+                self.gateway_buffer.chars().count()
+            )),
+            Line::from(""),
+            Line::from("  Enter keeps it · \"none\" for the Anthropic API"),
+            Line::from("  Paste a URL or the provider's JSON · a blank line ends a JSON paste"),
+            Line::from("  Esc cancels"),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_confirm_gateway_defaults_popup(&self, f: &mut Frame) {
+        let area = centered_rect(82, 12, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Save gateway defaults ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(PANEL));
+        let mut lines = vec![Line::from("")];
+        if let Some(GatewayInput::Json {
+            url,
+            settings,
+            dropped,
+        }) = &self.pending_gateway
+        {
+            lines.push(Line::from(format!(
+                "  Read: {}",
+                settings.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+            if !dropped.is_empty() {
+                lines.push(Line::from(format!("  Ignored: {}", dropped.join(", "))));
+            }
+            let suffix = if self.gateway_replaces_defaults {
+                " (replaces the saved ones)"
+            } else {
+                ""
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Save these {} settings as the defaults for {url}? [Y/n]{suffix}",
+                settings.len()
+            )));
+        }
+        lines.push(Line::from("  Enter/y saves · n skips · Esc cancels"));
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_confirm_key_clear_popup(&self, f: &mut Frame) {
         let area = centered_rect(60, 6, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Clear API key ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DANGER))
+            .style(Style::default().bg(PANEL));
+        f.render_widget(
+            Paragraph::new(
+                "\n  Delete this profile's saved API key?\n\n  [y] Confirm · any other key cancels",
+            )
+            .block(block),
+            area,
+        );
+    }
+
+    fn render_message(&self, f: &mut Frame, msg: &str, is_err: bool) {
+        let area = centered_rect(
+            78,
+            (msg.lines().count() as u16 + 5).min(f.area().height),
+            f.area(),
+        );
         f.render_widget(Clear, area);
 
         let color = if is_err { DANGER } else { SUCCESS };
@@ -1513,18 +2129,20 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         f.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {}", msg),
-                    Style::default().fg(TEXT),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press any key to continue",
-                    Style::default().fg(DIM),
-                )),
-            ]))
+            Paragraph::new(Text::from(
+                std::iter::once(Line::from(""))
+                    .chain(msg.lines().map(|line| {
+                        Line::from(Span::styled(format!("  {line}"), Style::default().fg(TEXT)))
+                    }))
+                    .chain([
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Press any key to continue",
+                            Style::default().fg(DIM),
+                        )),
+                    ])
+                    .collect::<Vec<_>>(),
+            ))
             .block(block)
             .wrap(Wrap { trim: false }),
             area,
@@ -1532,7 +2150,77 @@ impl App {
     }
 }
 
+fn pending_login_message(name: &str, result: &LoginOutcome, method: Option<LoginMethod>) -> String {
+    if result.email.is_none() {
+        if result.tool == Tool::Codex {
+            return format!("Codex login completed for profile '{name}' (email unavailable).");
+        }
+        if method == Some(LoginMethod::Console) {
+            return format!("Console login completed for profile '{name}' (email unavailable).");
+        }
+    }
+    let others: Vec<&str> = result
+        .same_account_as
+        .iter()
+        .map(String::as_str)
+        .filter(|other| *other != name)
+        .collect();
+    if others.is_empty() {
+        format!(
+            "Profile '{}' logged in as {}.",
+            name,
+            result.display_email()
+        )
+    } else {
+        format!(
+            "Profile '{}' is {} — the same {} account as {}.",
+            name,
+            result.display_email(),
+            result.tool.label(),
+            others.join(", ")
+        )
+    }
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn limit_line(window: &Window, now: DateTime<Utc>) -> Line<'static> {
+    let reset = window.rolled_over(now);
+    let color = if reset {
+        MUTED
+    } else {
+        match window.severity.as_deref() {
+            Some("normal") => SUCCESS,
+            Some("warning") => ACCENT,
+            Some("critical") => DANGER,
+            _ => MUTED,
+        }
+    };
+    let value = if reset {
+        format!("reset (was {:.0}%)", window.percent.round())
+    } else {
+        window.percent_label(now)
+    };
+    let bar = if reset {
+        "░".repeat(10)
+    } else {
+        window.bar()
+    };
+    let reset_time = window
+        .resets_at
+        .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string());
+    Line::from(Span::styled(
+        format!(
+            "  {:<14} {} {:<5} {}",
+            window.label(),
+            bar,
+            value,
+            reset_time
+        ),
+        Style::default().fg(color),
+    ))
+}
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * percent_x / 100;
@@ -1551,6 +2239,8 @@ mod tests {
     use super::*;
     use crate::profile::Profile;
     use chrono::Utc;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::fs;
     use tempfile::TempDir;
 
     const STUB_EMAIL: &str = "current@example.com";
@@ -1566,8 +2256,7 @@ mod tests {
     /// An App wired to a manager that cannot reach the real `~/.claude-switch`,
     /// with the live-account probe stubbed out.
     fn make_app(tmp: &TempDir, existing: &[(&str, Option<&str>)]) -> App {
-        let manager =
-            ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
+        let manager = ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
 
         for (name, email) in existing {
             let mut registry = manager.load_registry().unwrap();
@@ -1575,6 +2264,7 @@ mod tests {
                 name.to_string(),
                 Profile {
                     name: name.to_string(),
+                    tool: Tool::Claude,
                     email: email.map(String::from),
                     added: Utc::now(),
                     last_used: None,
@@ -1594,10 +2284,270 @@ mod tests {
         app
     }
 
+    fn render_text(app: &mut App) -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn console_choice_routes_through_pending_action() {
+        // Known-bad: [p] falling through to the subscription login.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "api".to_string();
+        app.handle_add_choice(KeyCode::Char('p')).unwrap();
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::Login {
+                name: "api".to_string(),
+                method: LoginMethod::Console
+            })
+        );
+        assert!(app.manager.load_registry().unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn key_popup_masks_secret_and_escape_clears_it() {
+        // Known-bad: the entered key appears in a TUI frame or survives Escape.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::KeyEntry);
+        app.key_buffer = "sk-ant-api03-TESTKEY000".to_string();
+        let frame = render_text(&mut app);
+        assert!(!frame.contains("sk-ant-api03-TESTKEY000"));
+        assert!(frame.contains('•'));
+        app.handle_key_entry(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.key_buffer.is_empty());
+    }
+
+    #[test]
+    fn t4_foreign_helper_refuses_before_gateway_entry() {
+        // Known-bad: bypassing the TUI pre-check opens GatewayEntry over a foreign helper.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        let profile_dir = app.manager.profile_dir("api");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let settings = br#"{"apiKeyHelper":"foreign helper","env":{"OTHER":"keep"}}"#;
+        let path = profile_dir.join("settings.json");
+        fs::write(&path, settings).unwrap();
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::KeyEntry);
+        for ch in "TESTKEY".chars() {
+            app.handle_key_entry(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.mode, Mode::Message(message, true) if message.contains("foreign apiKeyHelper"))
+        );
+        assert!(app.key_buffer.is_empty());
+        assert!(!key::key_path(&app.manager.base_dir, "api").exists());
+        assert!(!key::manifest_path(&app.manager.base_dir, "api").exists());
+        assert_eq!(fs::read(&path).unwrap(), settings);
+    }
+
+    #[test]
+    fn g13_gateway_modes_hide_pasted_token_and_abort_clears_both_buffers() {
+        // Known-bad: a pasted JSON token reaches a TUI frame or survives cancellation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        let json = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example.com","ANTHROPIC_AUTH_TOKEN":"TOKEN-CANARY"}}"#;
+        let executable = tmp.path().join("cswitch");
+        fs::write(&executable, "synthetic executable").unwrap();
+        let parsed = key::parse_gateway_input(json).unwrap();
+        let set = key::set_key_with_gateway(
+            &app.manager,
+            "api",
+            "TESTKEY",
+            &executable,
+            false,
+            &parsed,
+            true,
+            Utc::now(),
+        )
+        .unwrap();
+        let info = format!(
+            "{} {}",
+            key::read_auth_mode(&app.manager, "api", Ok(None)).label(),
+            key::gateway_info(&app.manager, "api")
+        );
+        let list = crate::list_output(&app.manager, Utc::now()).unwrap();
+        let defaults = gateway::list(&app.manager.base_dir).unwrap();
+        for output in [set.gateway_lines.join("\n"), info, list, defaults] {
+            assert!(!output.contains("TOKEN-CANARY") && !output.contains("TESTKEY"));
+        }
+        fn collect(root: &std::path::Path, output: &mut Vec<u8>, skip_key: bool) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if skip_key && path.file_name().is_some_and(|name| name == "api.key") {
+                    continue;
+                }
+                if fs::symlink_metadata(&path).unwrap().file_type().is_dir() {
+                    collect(&path, output, skip_key);
+                } else {
+                    output.extend(fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = Vec::new();
+        collect(&app.manager.base_dir, &mut files, true);
+        assert!(!files.windows(7).any(|window| window == b"TESTKEY"));
+        assert!(!files.windows(12).any(|window| window == b"TOKEN-CANARY"));
+        app.handle_normal_key(KeyCode::Char('p'), KeyModifiers::NONE)
+            .unwrap();
+        app.key_buffer = "TESTKEY".into();
+        app.handle_key_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::GatewayEntry);
+        app.gateway_buffer = json.into();
+        assert!(!render_text(&mut app).contains("TOKEN-CANARY"));
+        app.handle_gateway_entry(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmGatewayDefaults);
+        let frame = render_text(&mut app);
+        assert!(frame.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!frame.contains("TOKEN-CANARY"));
+        app.handle_confirm_gateway_defaults(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.key_buffer.is_empty()
+                && app.gateway_buffer.is_empty()
+                && app.pending_gateway.is_none()
+        );
+        key::clear_key(&app.manager, "api", Utc::now()).unwrap();
+        assert!(!key::key_path(&app.manager.base_dir, "api").exists());
+        files.clear();
+        collect(&app.manager.base_dir, &mut files, false);
+        assert!(!files.windows(7).any(|window| window == b"TESTKEY"));
+        assert!(!files.windows(12).any(|window| window == b"TOKEN-CANARY"));
+    }
+
+    #[test]
+    fn k_moves_up_in_normal_mode_without_opening_key_entry() {
+        // Known-bad: binding k to KeyEntry removes vim-style up navigation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("alpha", Some("alpha@example.com")),
+                ("beta", Some("beta@example.com")),
+            ],
+        );
+        assert_eq!(app.selected_profile().unwrap().name, "alpha");
+        app.handle_normal_key(KeyCode::Char('k'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.selected_profile().unwrap().name, "beta");
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_normal_key(KeyCode::Char('j'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.selected_profile().unwrap().name, "alpha");
+        app.handle_normal_key(KeyCode::Char('K'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_normal_key(KeyCode::Char('P'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmKeyClear);
+    }
+
+    #[test]
+    fn refresh_confirmation_names_saved_key_loss() {
+        // Known-bad: refresh deletes a key without warning in the confirmation.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("api", Some("user@example.com"))]);
+        fs::create_dir_all(app.manager.base_dir.join("keys")).unwrap();
+        fs::write(key::key_path(&app.manager.base_dir, "api"), "synthetic\n").unwrap();
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::ConfirmRefresh);
+        assert!(render_text(&mut app).contains("Its saved API key will be deleted."));
+    }
+
     fn type_name(app: &mut App, name: &str) {
         for c in name.chars() {
             app.handle_add_name(KeyCode::Char(c)).unwrap();
         }
+    }
+
+    #[test]
+    fn limits_cache_refreshes_on_selection_or_after_thirty_seconds() {
+        // Known-bad: reading during render rereads every frame, while never refreshing leaves a stale panel.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("alpha", Some("a@example.com")),
+                ("beta", Some("b@example.com")),
+            ],
+        );
+        let path = app.manager.profile_dir("alpha");
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join(".claude.json");
+        let cache = serde_json::json!({
+            "cachedUsageUtilization": {
+                "fetchedAtMs": 1_894_021_200_000_i64,
+                "utilization": {"limits": [{"kind":"session", "group":"session", "percent":12}]}
+            }
+        });
+        std::fs::write(&file, serde_json::to_vec(&cache).unwrap()).unwrap();
+        std::fs::create_dir_all(app.manager.profile_dir("beta")).unwrap();
+        std::fs::write(app.manager.profile_dir("beta").join(".claude.json"), b"{}").unwrap();
+        let start = Instant::now();
+        app.refresh_limits_if_due(start);
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        std::fs::write(&file, b"{}").unwrap();
+        app.refresh_limits_if_due(start + Duration::from_secs(29));
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        app.refresh_limits_if_due(start + Duration::from_secs(30));
+        assert_eq!(app.limits.get("alpha"), Some(&Limits::NoSnapshot));
+        app.move_down();
+        app.refresh_limits_if_due(start + Duration::from_secs(31));
+        assert_eq!(app.limits.get("beta"), Some(&Limits::NoSnapshot));
+    }
+
+    #[test]
+    fn limit_lines_use_severity_palette_and_mute_reset() {
+        // Known-bad: a reset retains its old critical colour or unknown severity looks normal.
+        let now = DateTime::parse_from_rfc3339("2030-01-07T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut window = Window {
+            group: crate::limits::WindowGroup::Session,
+            kind: "session".to_string(),
+            percent: 40.0,
+            severity: Some("normal".to_string()),
+            resets_at: None,
+            is_active: None,
+        };
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(SUCCESS));
+        window.resets_at = Some(now + chrono::Duration::hours(1));
+        assert!(limit_line(&window, now).spans[0].content.chars().count() <= 46);
+        window.severity = Some("warning".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(ACCENT));
+        window.severity = Some("critical".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(DANGER));
+        window.severity = None;
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(MUTED));
+        window.severity = Some("critical".to_string());
+        window.resets_at = Some(now - chrono::Duration::hours(1));
+        let line = limit_line(&window, now);
+        assert_eq!(line.spans[0].style.fg, Some(MUTED));
+        assert!(line.spans[0].content.contains("reset (was 40%)"));
     }
 
     // ── `a` → name → choice ───────────────────────────────────────────────────
@@ -1607,7 +2557,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
         assert!(app.input_buffer.is_empty());
@@ -1704,7 +2655,10 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
+            })
         );
         // Login must not register anything until Claude has authenticated.
         assert!(app.manager.load_registry().unwrap().profiles.is_empty());
@@ -1737,7 +2691,10 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
+            })
         );
     }
 
@@ -1753,7 +2710,10 @@ mod tests {
         app.handle_add_choice(KeyCode::Esc).unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
-        assert_eq!(app.input_buffer, "business", "the typed name should survive");
+        assert_eq!(
+            app.input_buffer, "business",
+            "the typed name should survive"
+        );
         assert!(app.pending.is_none());
     }
 
@@ -1805,7 +2765,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::LoginName);
     }
@@ -1823,7 +2784,10 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string(),
+                method: LoginMethod::ClaudeAi,
+            })
         );
     }
 
@@ -1993,8 +2957,195 @@ mod tests {
         app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
 
         assert!(
-            !app.manager.load_registry().unwrap().profiles.contains_key("business"),
+            !app.manager
+                .load_registry()
+                .unwrap()
+                .profiles
+                .contains_key("business"),
             "confirming must still delete"
         );
+    }
+
+    #[test]
+    fn codex_add_choice_routes_to_codex_login() {
+        // Known-bad: [o] routes to a Claude login instead of Codex.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        app.mode = Mode::AddChoice;
+        app.input_buffer = "new".into();
+        app.handle_add_choice(KeyCode::Char('o')).unwrap();
+        assert_eq!(
+            app.pending,
+            Some(PendingAction::CodexLogin { name: "new".into() })
+        );
+    }
+
+    #[test]
+    fn codex_refresh_hotkey_refuses_before_confirmation() {
+        // Known-bad: the r key offers to replace a Codex home with a Claude session.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        app.mode = Mode::Normal;
+        app.profiles[0].tool = Tool::Codex;
+        app.handle_normal_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::Message("Refresh is Claude-only".into(), true)
+        );
+    }
+
+    #[test]
+    fn codex_refresh_confirmation_refuses_even_if_reached() {
+        // Known-bad: a stale confirmation deletes the Codex home on y.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        app.mode = Mode::ConfirmRefresh;
+        app.profiles[0].tool = Tool::Codex;
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let marker = app.manager.profile_dir("o").join("auth.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"synthetic untouched").unwrap();
+        app.handle_confirm_refresh(KeyCode::Char('y')).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"synthetic untouched");
+    }
+
+    #[test]
+    fn enter_on_unknown_profile_stays_in_tui_with_error_message() {
+        // Known-bad: without the TUI guard, Enter returns a launch error and exits the TUI.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("alien", Some("alien@example.com"))]);
+        app.profiles[0].tool = Tool::Unknown("martian".into());
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("alien").unwrap().tool = Tool::Unknown("martian".into());
+        std::fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !app.handle_normal_key(KeyCode::Enter, KeyModifiers::NONE)
+                .unwrap()
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Message(
+                "Profile has an unknown tool; cannot use or log in.".into(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn codex_api_key_hotkeys_refuse_before_entry_or_clear() {
+        // Known-bad: removing either p/P tool guard opens a Claude-only key flow.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("work", Some("work@example.com"))]);
+        app.profiles[0].tool = Tool::Codex;
+        for key in ['p', 'P'] {
+            app.mode = Mode::Normal;
+            assert!(
+                !app.handle_normal_key(KeyCode::Char(key), KeyModifiers::NONE)
+                    .unwrap()
+            );
+            assert_eq!(
+                app.mode,
+                Mode::Message("API keys are Claude-only.".into(), true),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_without_claude_can_enter_codex_add_flow() {
+        // Known-bad: the first-run screen requires Claude before Codex can be added.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = false;
+        app.handle_first_run_key(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(app.mode, Mode::AddName);
+    }
+
+    #[test]
+    fn first_run_detected_name_keeps_a_and_uses_three_for_codex() {
+        // Known-bad: `a` opens AddName and discards the detected screen's name.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = true;
+        app.input_buffer = "default".into();
+        for key in ['-', 'a'] {
+            app.handle_first_run_key(KeyCode::Char(key), KeyModifiers::NONE)
+                .unwrap();
+        }
+        assert_eq!(app.input_buffer, "default-a");
+        assert_eq!(app.mode, Mode::FirstRun);
+
+        app.input_buffer = "work".into();
+        app.handle_first_run_key(KeyCode::Char('3'), KeyModifiers::NONE)
+            .unwrap();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::CodexLogin { ref name }) if name == "work"
+        ));
+    }
+
+    #[test]
+    fn first_run_empty_name_does_not_queue_codex_login() {
+        // Known-bad: removing the empty-name guard from the `3` arm queues a blank login.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[]);
+        app.mode = Mode::FirstRun;
+        app.claude_dir_found = true;
+        app.input_buffer.clear();
+        assert!(app.pending.is_none());
+
+        app.handle_first_run_key(KeyCode::Char('3'), KeyModifiers::NONE)
+            .unwrap();
+
+        assert!(app.pending.is_none());
+        assert_eq!(app.mode, Mode::FirstRun);
+    }
+
+    #[test]
+    fn codex_login_without_identity_has_explicit_tui_confirmation() {
+        // Known-bad: an unreadable Codex identity is refused before the TUI can confirm it.
+        let outcome = LoginOutcome {
+            email: None,
+            same_account_as: Vec::new(),
+            tool: Tool::Codex,
+        };
+        assert_eq!(
+            pending_login_message("work", &outcome, None),
+            "Codex login completed for profile 'work' (email unavailable)."
+        );
+    }
+
+    #[test]
+    fn codex_detail_shows_tool_and_plan_without_claude_limits() {
+        // Known-bad: Codex details display Claude auth or limit data, or omit JWT plan type.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp, &[("o", Some("o@example.com"))]);
+        let mut registry = app.manager.load_registry().unwrap();
+        registry.profiles.get_mut("o").unwrap().tool = Tool::Codex;
+        std::fs::write(
+            app.manager.base_dir.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        app.profiles[0].tool = Tool::Codex;
+        let auth = br#"{"tokens":{"id_token":"h.eyJlbWFpbCI6Im9AZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.s"}}"#;
+        std::fs::create_dir_all(app.manager.profile_dir("o")).unwrap();
+        std::fs::write(app.manager.profile_dir("o").join("auth.json"), auth).unwrap();
+        app.refresh_limits_if_due(Instant::now());
+        let display = render_text(&mut app);
+        assert!(display.contains("Tool"));
+        assert!(display.contains("codex"));
+        assert!(display.contains("plus"));
+        assert!(display.contains("Plan limits  —"));
+        assert!(display.contains("CODEX_HOME"));
+        assert!(!display.contains("no data: no cached snapshot"));
     }
 }
