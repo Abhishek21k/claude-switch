@@ -1,18 +1,27 @@
+mod atomic;
+mod limits;
 mod profile;
+mod skills_sync;
 mod tui;
+mod usage;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use profile::{detect_current_account, LoginOutcome, ProfileManager};
+use chrono::{DateTime, Utc};
+use clap::{ArgGroup, Parser, Subcommand};
+use limits::{Limits, Window, format_info, read_limits};
+use profile::{LoginOutcome, ProfileManager, detect_current_account};
+use skills_sync::{SyncAction, SyncOptions, SyncReport};
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(
     name = "cswitch",
     about = "Multi-account profile manager for Claude Code",
     long_about = "Manage multiple Claude Code accounts using isolated config directories.\n\
-                  Each profile stores a complete ~/.claude snapshot and launches Claude\n\
-                  with CLAUDE_CONFIG_DIR set — no credential swapping, no side effects.",
+                  Each profile keeps its own credentials and settings, links shared skills,\n\
+                  and launches Claude with CLAUDE_CONFIG_DIR set.",
     version,
     after_help = "\
 Quick start:
@@ -25,6 +34,26 @@ Quick start:
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    fn try_parse_from<I, T>(input: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let raw: Vec<OsString> = input.into_iter().map(Into::into).collect();
+        let mut cli = <Self as Parser>::try_parse_from(raw.clone())?;
+        if let Some(Commands::Use { args, .. }) = &mut cli.command {
+            // Clap consumes the `--` separator. Claude must receive it as typed.
+            if let Some(use_index) = raw.iter().enumerate().skip(1).find_map(|(index, part)| {
+                if part == "use" { Some(index) } else { None }
+            }) {
+                *args = raw.iter().skip(use_index + 2).cloned().collect();
+            }
+        }
+        Ok(cli)
+    }
 }
 
 #[derive(Subcommand)]
@@ -66,15 +95,35 @@ enum Commands {
     Remove {
         /// Profile name to remove
         name: String,
+        /// Also delete this profile's token ledger rows
+        #[arg(long)]
+        purge_usage: bool,
     },
 
     /// Launch Claude Code with a specific profile
+    #[command(disable_help_flag = true, disable_version_flag = true)]
     Use {
         /// Profile name to use
         name: String,
         /// Extra arguments passed directly to claude
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+
+    /// Link shared skills into one or all profiles
+    #[command(group(ArgGroup::new("target").required(true).args(["name", "all"])))]
+    Sync {
+        /// Profile name
+        name: Option<String>,
+        /// Sync every registered profile
+        #[arg(long)]
+        all: bool,
+        /// Preview changes without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Back up and replace a diverged skill
+        #[arg(long = "adopt")]
+        adopt: Vec<String>,
     },
 
     /// Show details for a specific profile
@@ -85,10 +134,42 @@ enum Commands {
 
     /// Print shell aliases for all profiles
     Aliases,
+
+    /// Read local Claude Code transcripts into an offline token ledger
+    Usage {
+        /// Range: 7d, 30d, all, or YYYY-MM-DD
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Only include one profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Group by profile, workspace, project, session, model, or day
+        #[arg(long, value_parser = ["profile", "workspace", "project", "session", "model", "day"])]
+        by: Option<String>,
+        /// Emit machine-readable report rows and footer
+        #[arg(long)]
+        json: bool,
+        /// Show each attribution signal for a session
+        #[arg(long, conflicts_with = "unattributed")]
+        explain: Option<String>,
+        /// Show sessions without a project and their candidates
+        #[arg(long, conflicts_with = "explain")]
+        unattributed: bool,
+        #[command(subcommand)]
+        action: Option<UsageAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageAction {
+    /// Save a project label for a session
+    Label { session: String, project: String },
+    /// Compare priced requests with matching cost-state snapshots
+    Verify,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let manager = ProfileManager::new()?;
 
     match cli.command {
@@ -98,44 +179,68 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::List) => {
-            let profiles = manager.list_profiles()?;
-            if profiles.is_empty() {
-                println!("No profiles found. Add one with:");
-                println!("  cswitch add <name>");
-                return Ok(());
-            }
-
-            println!("{:<20} {:<35} {}", "NAME", "EMAIL", "LAST USED");
-            println!("{}", "─".repeat(75));
-            for p in profiles {
-                let email = p.email.as_deref().unwrap_or("—");
-                let last_used = p
-                    .last_used
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or("never".to_string());
-                println!("{:<20} {:<35} {}", p.name, email, last_used);
-            }
+            print!("{}", list_output(&manager, Utc::now())?);
         }
 
-        Some(Commands::Add { name, force, include_history }) => {
+        Some(Commands::Add {
+            name,
+            force,
+            include_history,
+        }) => {
             handle_add(&manager, &name, force, include_history)?;
         }
 
-        Some(Commands::Login { name, include_history, email }) => {
+        Some(Commands::Login {
+            name,
+            include_history,
+            email,
+        }) => {
             let outcome = manager.login_profile(&name, include_history, email.as_deref())?;
             report_login(&name, &outcome);
         }
 
-        Some(Commands::Remove { name }) => match manager.remove_profile(&name) {
-            Ok(_) => println!("Profile '{}' removed.", name),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Some(Commands::Remove { name, purge_usage }) => {
+            if purge_usage {
+                manager.get_profile(&name)?;
+                let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
+                usage::report::purge_profile(&usage::store(&manager, directory)?, &name)?;
             }
-        },
+            match manager.remove_profile(&name) {
+                Ok(_) => println!("Profile '{}' removed.", name),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
 
         Some(Commands::Use { name, args }) => {
             manager.launch_claude(&name, &args)?;
+        }
+
+        Some(Commands::Sync {
+            name,
+            all,
+            dry_run,
+            adopt,
+        }) => {
+            let opts = SyncOptions { dry_run, adopt };
+            let names = if all {
+                manager
+                    .list_profiles()?
+                    .into_iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![name.expect("clap requires a name or --all")]
+            };
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+            let (output, failed) = sync_profile_blocks(&manager, &names, &opts, &home, all)?;
+            print!("{output}");
+            if failed {
+                std::process::exit(1);
+            }
         }
 
         Some(Commands::Info { name }) => match manager.get_profile(&name) {
@@ -151,9 +256,10 @@ fn main() -> Result<()> {
                         .unwrap_or("never".to_string())
                 );
                 println!("Directory: {}", dir.display());
+                print!("{}", format_info(&read_limits(&dir), Utc::now()));
                 println!();
                 println!("Launch:");
-                println!("  CLAUDE_CONFIG_DIR='{}' claude", dir.display());
+                println!("  cswitch use {}", p.name);
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -164,41 +270,247 @@ fn main() -> Result<()> {
         Some(Commands::Aliases) => {
             println!("{}", manager.generate_aliases()?);
         }
+        Some(Commands::Usage {
+            since,
+            profile,
+            by,
+            json,
+            explain,
+            unattributed,
+            action,
+        }) => {
+            let directory = std::env::var_os("CSWITCH_USAGE_DIR").map(std::path::PathBuf::from);
+            let store = usage::store(&manager, directory)?;
+            let mut verify_exit_code = 0;
+            let output = match action {
+                Some(UsageAction::Label { session, project }) => {
+                    usage::report::label(&store, &session, &project)?
+                }
+                Some(UsageAction::Verify) => {
+                    let (output, exit_code) = usage::report::verify(&store)?;
+                    verify_exit_code = exit_code;
+                    output
+                }
+                None => usage::report::run(
+                    &store,
+                    &usage::report::Options {
+                        since,
+                        profile,
+                        by,
+                        json,
+                        explain,
+                        unattributed,
+                    },
+                    Utc::now(),
+                )?,
+            };
+            print!("{output}");
+            if verify_exit_code != 0 {
+                std::process::exit(verify_exit_code);
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Smart add: detects an active Claude session and asks the user whether to
-/// copy it or login fresh.
-/// Report a completed login: the account Claude actually authenticated as,
-/// and whether another profile already holds it.
-///
-/// The email is read back from Claude, never from the name the user typed, so
-/// this can contradict what they expected — which is the whole point.
-pub(crate) fn report_login(name: &str, outcome: &LoginOutcome) {
-    println!("\nProfile '{}' registered.", name);
-    println!("  Account: {}", outcome.display_email());
-
-    let others: Vec<&str> = outcome
-        .same_account_as
-        .iter()
-        .map(String::as_str)
-        .filter(|n| *n != name)
-        .collect();
-    if !others.is_empty() {
-        println!(
-            "\n  Note: that is the same account as {}.",
-            others.join(", ")
-        );
-        println!("  Allowed — two profiles can isolate settings for one account.");
-        println!("  If you wanted a different account, the browser session decided:");
-        println!("  sign out of claude.ai (or use a private window) and try again.");
+fn list_output(manager: &ProfileManager, now: DateTime<Utc>) -> Result<String> {
+    let profiles = manager.list_profiles()?;
+    if profiles.is_empty() {
+        return Ok("No profiles found. Add one with:\n  cswitch add <name>\n".to_string());
     }
+    let header = format!(
+        "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
+        "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+    );
+    let mut output = format!("{}\n{}\n", header, "─".repeat(header.chars().count()));
+    let mut saw_reset = false;
+    let mut saw_flag = false;
 
-    println!("\n  Launch with: cswitch use {}", name);
+    for profile in profiles {
+        let limits = read_limits(&manager.profile_dir(&profile.name));
+        let (session, weekly, age) = match &limits {
+            Limits::Snapshot(snapshot) => {
+                let session = list_window(snapshot.session(), now, false);
+                let weekly = list_window(snapshot.weekly(), now, true);
+                saw_reset |= session.1 || weekly.1;
+                saw_flag |= session.2 || weekly.2;
+                (session.0, weekly.0, snapshot.age(now))
+            }
+            Limits::NoSnapshot => ("—".to_string(), "—".to_string(), "no data".to_string()),
+            Limits::AccountMismatch => ("—".to_string(), "—".to_string(), "mismatch".to_string()),
+            Limits::Unreadable => ("—".to_string(), "—".to_string(), "unreadable".to_string()),
+        };
+        let last_used = profile
+            .last_used
+            .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "never".to_string());
+        output.push_str(&format!(
+            "{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+            profile.name,
+            profile.email.as_deref().unwrap_or("—"),
+            session,
+            weekly,
+            age,
+            last_used
+        ));
+    }
+    if saw_reset || saw_flag {
+        let mut parts = Vec::new();
+        if saw_reset {
+            parts.push("reset = that window restarted after the snapshot was taken");
+        }
+        if saw_flag {
+            parts.push("! = Claude Code flags this limit");
+        }
+        output.push_str(&format!("\n{}\n", parts.join(" · ")));
+    }
+    Ok(output)
 }
 
+fn list_window(
+    window: Option<&Window>,
+    now: DateTime<Utc>,
+    with_bar: bool,
+) -> (String, bool, bool) {
+    let Some(window) = window else {
+        return ("—".to_string(), false, false);
+    };
+    let reset = window.rolled_over(now);
+    let flagged = window.flagged();
+    let mut output = window.percent_label(now);
+    if with_bar && !reset {
+        output.push(' ');
+        output.push_str(&window.bar());
+    }
+    if flagged {
+        output.push_str(" !");
+    }
+    (output, reset, flagged)
+}
+
+fn sync_profile_blocks(
+    manager: &ProfileManager,
+    names: &[String],
+    opts: &SyncOptions,
+    home: &Path,
+    all: bool,
+) -> Result<(String, bool)> {
+    let mut output = String::new();
+    let mut failed = false;
+    for name in names {
+        match manager.sync_skills(name, opts) {
+            Ok(report) => {
+                output.push_str(&format_sync_report(name, &report, opts.dry_run, home));
+                failed |= report.has_failures();
+            }
+            Err(error) if all => {
+                output.push_str(&sync_header(name, opts.dry_run));
+                output.push_str(&format!("\n  error: {error}\n"));
+                failed = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((output, failed))
+}
+
+fn sync_header(name: &str, dry_run: bool) -> String {
+    if dry_run {
+        format!("{name} (dry run):")
+    } else {
+        format!("{name}:")
+    }
+}
+
+fn format_sync_report(name: &str, report: &SyncReport, dry_run: bool, home: &Path) -> String {
+    let mut counts = [0usize; 9];
+    let mut rows = Vec::<(&str, &str, Option<String>)>::new();
+    for entry in &report.entries {
+        let skill = &entry.name;
+        let (index, label, detail) = match &entry.action {
+            SyncAction::Linked => (0, if dry_run { "would link" } else { "linked" }, None),
+            SyncAction::AlreadyLinked => {
+                counts[1] += 1;
+                continue;
+            }
+            SyncAction::Migrated { backup } => (
+                2,
+                if dry_run { "would migrate" } else { "migrated" },
+                Some(format!("backup: {}", pretty_path(backup, home))),
+            ),
+            SyncAction::Adopted { backup } => (
+                3,
+                if dry_run { "would adopt" } else { "adopted" },
+                Some(format!("backup: {}", pretty_path(backup, home))),
+            ),
+            SyncAction::Diverged => (
+                4,
+                "diverged",
+                Some(format!(
+                    "differs from {}; keep it, or run: cswitch sync {name} --adopt {skill}",
+                    pretty_path(&home.join(".claude/skills").join(skill), home)
+                )),
+            ),
+            SyncAction::ForeignLink { target } => (
+                5,
+                "foreign link",
+                Some(format!("-> {}", pretty_path(target, home))),
+            ),
+            SyncAction::RemovedDangling => (
+                6,
+                if dry_run { "would remove" } else { "removed" },
+                Some("dangling link into ~/.claude/skills".to_string()),
+            ),
+            SyncAction::ProfileOnly => (7, "profile-only", None),
+            SyncAction::Failed { error } => (8, "FAILED", Some(error.clone())),
+        };
+        counts[index] += 1;
+        rows.push((label, skill, detail));
+    }
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_width = rows
+        .iter()
+        .map(|(_, skill, _)| skill.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![sync_header(name, dry_run)];
+    for (label, skill, detail) in rows {
+        lines.push(match detail {
+            Some(detail) => {
+                format!("  {label:<label_width$}  {skill:<name_width$}  {detail}")
+            }
+            None => format!("  {label:<label_width$}  {skill}"),
+        });
+    }
+    lines.push(format!(
+        "  counts: linked {}, already linked {}, migrated {}, adopted {}, diverged {}, foreign link {}, removed {}, profile-only {}, failed {}",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        counts[6],
+        counts[7],
+        counts[8]
+    ));
+    lines.join("\n") + "\n"
+}
+
+fn pretty_path(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Smart add: detects an active Claude session and asks the user whether to
+/// copy it or login fresh.
 fn handle_add(
     manager: &ProfileManager,
     name: &str,
@@ -253,6 +565,39 @@ fn handle_add(
     Ok(())
 }
 
+/// Report a completed login using the account Claude actually authenticated as.
+///
+/// When the new profile landed on an account another profile already holds,
+/// say so plainly — the usual cause is a browser that was still signed in, and
+/// silently listing the email would look like a different account was added.
+fn report_login(name: &str, outcome: &LoginOutcome) {
+    println!(
+        "\nProfile '{}' registered (account: {}).",
+        name,
+        outcome.display_email()
+    );
+
+    let others: Vec<&str> = outcome
+        .same_account_as
+        .iter()
+        .map(String::as_str)
+        .filter(|n| *n != name)
+        .collect();
+
+    if !others.is_empty() {
+        println!(
+            "\n  Note: this is the same Claude account as: {}",
+            others.join(", ")
+        );
+        println!("  If you meant to add a different account, sign out of claude.ai");
+        println!(
+            "  (or use a private window) and run: cswitch remove {name} && cswitch login {name}"
+        );
+    }
+
+    println!("\nLaunch with: cswitch use {}", name);
+}
+
 fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
     loop {
         print!("{}", prompt);
@@ -267,6 +612,380 @@ fn prompt_choice(prompt: &str, valid: &[char]) -> Result<char> {
                 return Ok(c);
             }
         }
-        println!("Please enter one of: {}", valid.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "));
+        println!(
+            "Please enter one of: {}",
+            valid
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{Profile, Registry};
+    use crate::skills_sync::SyncEntry;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn usage_cli_accepts_report_label_verify_and_purge_surfaces() {
+        // Known-bad: a nested usage command consuming report flags or a remove
+        // command that cannot opt into purging ledger rows.
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cswitch", "usage", "--since", "all", "--by", "model", "--json"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Usage {
+                by: Some(_),
+                json: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "--explain", "sample"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                explain: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "--unattributed"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                unattributed: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "label", "sample", "blue/site"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                action: Some(UsageAction::Label { .. }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "usage", "verify"])
+                .unwrap()
+                .command,
+            Some(Commands::Usage {
+                action: Some(UsageAction::Verify),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cswitch", "remove", "sample", "--purge-usage"])
+                .unwrap()
+                .command,
+            Some(Commands::Remove {
+                purge_usage: true,
+                ..
+            })
+        ));
+    }
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn list_uses_fixed_columns_and_only_needed_legend() {
+        // Known-bad: always printing the legend, flagging normal limits, or overflowing at a 30-character email.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".claude-switch");
+        let manager = ProfileManager::with_paths(base.clone(), tmp.path().join(".claude")).unwrap();
+        let now = at("2030-01-07T14:00:00Z");
+        let mut registry = Registry::default();
+        for (name, email, last_used) in [
+            (
+                "active",
+                "thirtyx.characters@example.com",
+                Some(at("2030-01-07T06:31:00Z")),
+            ),
+            ("fresh", "b@example.com", None),
+        ] {
+            registry.profiles.insert(
+                name.to_string(),
+                Profile {
+                    name: name.to_string(),
+                    email: Some(email.to_string()),
+                    added: now,
+                    last_used,
+                },
+            );
+            fs::create_dir_all(manager.profile_dir(name)).unwrap();
+        }
+        fs::write(
+            base.join("registry.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let path = manager.profile_dir("active").join(".claude.json");
+        let fresh_path = manager.profile_dir("fresh").join(".claude.json");
+        fs::write(&fresh_path, b"{}").unwrap();
+        let mut cache = serde_json::json!({
+            "oauthAccount": {"accountUuid": "00000000-0000-4000-8000-000000000001"},
+            "cachedUsageUtilization": {
+                "accountUuid": "00000000-0000-4000-8000-000000000001",
+                "fetchedAtMs": at("2030-01-07T13:00:00Z").timestamp_millis(),
+                "utilization": {"limits": [
+                    {"kind":"session", "group":"session", "percent":12,
+                     "severity":"normal", "resets_at":"2030-01-07T15:00:00Z"},
+                    {"kind":"weekly_all", "group":"weekly", "percent":88,
+                     "severity":"normal", "resets_at":"2030-01-10T20:00:00Z"}
+                ]}
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        let header = format!(
+            "{:<20} {:<32} {:<7} {:<18} {:<11} {}",
+            "NAME", "EMAIL", "5H", "7D", "AS OF", "LAST USED"
+        );
+        let expected = format!(
+            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n",
+            "─".repeat(header.chars().count()),
+            "active",
+            "thirtyx.characters@example.com",
+            "12%",
+            "88% █████████░",
+            "1 h ago",
+            "2030-01-07 06:31",
+            "fresh",
+            "b@example.com",
+            "—",
+            "—",
+            "no data",
+            "never"
+        );
+        let output = list_output(&manager, now).unwrap();
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 120));
+
+        cache["cachedUsageUtilization"]["utilization"]["limits"][0]["resets_at"] =
+            serde_json::json!("2030-01-07T12:00:00Z");
+        cache["cachedUsageUtilization"]["utilization"]["limits"][1]["severity"] =
+            serde_json::json!("critical");
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let changed = list_output(&manager, now).unwrap();
+        let expected_changed = format!(
+            "{header}\n{}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n{:<20} {:<32} {:<7} {:<18} {:<11} {}\n\nreset = that window restarted after the snapshot was taken · ! = Claude Code flags this limit\n",
+            "─".repeat(header.chars().count()),
+            "active",
+            "thirtyx.characters@example.com",
+            "reset",
+            "88% █████████░ !",
+            "1 h ago",
+            "2030-01-07 06:31",
+            "fresh",
+            "b@example.com",
+            "—",
+            "—",
+            "no data",
+            "never"
+        );
+        assert_eq!(changed, expected_changed);
+        assert!(changed.lines().all(|line| line.chars().count() <= 120));
+
+        cache["cachedUsageUtilization"]["accountUuid"] =
+            serde_json::json!("00000000-0000-4000-8000-000000000002");
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let mismatch = list_output(&manager, now).unwrap();
+        let fields: Vec<&str> = mismatch
+            .lines()
+            .nth(2)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(fields[2..5], ["—", "—", "mismatch"]);
+        assert!(!mismatch.contains("88%"));
+    }
+
+    fn use_args(input: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(input).unwrap();
+        let Some(Commands::Use { name, args }) = cli.command else {
+            panic!("expected use command");
+        };
+        assert_eq!(name, "personal");
+        args.into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn use_passes_resume_flag_and_optional_id() {
+        // Clap must not claim Claude's resume flag as a cswitch option.
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--resume"]),
+            ["--resume"]
+        );
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--resume", "session-id"]),
+            ["--resume", "session-id"]
+        );
+    }
+
+    #[test]
+    fn use_passes_short_continue_flag() {
+        // Treating -c as a cswitch option would consume Claude's flag.
+        assert_eq!(use_args(&["cswitch", "use", "personal", "-c"]), ["-c"]);
+    }
+
+    #[test]
+    fn use_passes_prompt_model_and_permission_flags() {
+        // Parsing these as cswitch options would drop Claude's flag values.
+        assert_eq!(
+            use_args(&[
+                "cswitch",
+                "use",
+                "personal",
+                "-p",
+                "two words",
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions",
+            ]),
+            [
+                "-p",
+                "two words",
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions"
+            ]
+        );
+    }
+
+    #[test]
+    fn use_passes_double_dash_verbatim() {
+        // Clap normally consumes its own argument separator.
+        assert_eq!(
+            use_args(&["cswitch", "use", "personal", "--", "-p", "two words"]),
+            ["--", "-p", "two words"]
+        );
+    }
+
+    #[test]
+    fn use_passes_help_short_help_and_version_to_claude() {
+        // Default help and version handlers would exit cswitch first.
+        for flag in ["--help", "-h", "--version"] {
+            assert_eq!(use_args(&["cswitch", "use", "personal", flag]), [flag]);
+        }
+    }
+
+    #[test]
+    fn sync_requires_exactly_one_profile_target() {
+        // Two optional target arguments would accept neither or both.
+        assert!(Cli::try_parse_from(["cswitch", "sync"]).is_err());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "personal", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "personal"]).is_ok());
+        assert!(Cli::try_parse_from(["cswitch", "sync", "--all"]).is_ok());
+    }
+
+    #[test]
+    fn sync_output_aligns_columns_within_each_profile_block() {
+        // Fixed spaces between labels and details misalign mixed actions.
+        let tmp = TempDir::new().unwrap();
+        let report = SyncReport {
+            entries: vec![
+                SyncEntry {
+                    name: "a".into(),
+                    action: SyncAction::Linked,
+                },
+                SyncEntry {
+                    name: "longer-name".into(),
+                    action: SyncAction::Migrated {
+                        backup: tmp.path().join("backup"),
+                    },
+                },
+                SyncEntry {
+                    name: "local".into(),
+                    action: SyncAction::ProfileOnly,
+                },
+                SyncEntry {
+                    name: "err".into(),
+                    action: SyncAction::Failed {
+                        error: "permission denied".into(),
+                    },
+                },
+            ],
+        };
+        let output = format_sync_report("personal", &report, true, tmp.path());
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "personal (dry run):");
+        assert_eq!(lines[1], format!("  {:<13}  a", "would link"));
+        assert_eq!(
+            lines[2],
+            format!(
+                "  {:<13}  {:<11}  backup: ~/backup",
+                "would migrate", "longer-name"
+            )
+        );
+        assert_eq!(lines[3], format!("  {:<13}  local", "profile-only"));
+        assert_eq!(
+            lines[4],
+            format!("  {:<13}  {:<11}  permission denied", "FAILED", "err")
+        );
+        assert!(lines.iter().all(|line| !line.ends_with(' ')));
+        assert_eq!(
+            lines[5],
+            "  counts: linked 1, already linked 0, migrated 1, adopted 0, diverged 0, foreign link 0, removed 0, profile-only 1, failed 1"
+        );
+
+        let short = SyncReport {
+            entries: vec![SyncEntry {
+                name: "z".into(),
+                action: SyncAction::Linked,
+            }],
+        };
+        let short_output = format_sync_report("work", &short, false, tmp.path());
+        assert_eq!(short_output.lines().nth(1), Some("  linked  z"));
+    }
+
+    #[test]
+    fn sync_all_reports_one_profile_error_and_continues_to_the_next() {
+        // Propagating the first Err would skip later profiles.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude_home = home.join(".claude");
+        let manager =
+            ProfileManager::with_paths(home.join(".claude-switch"), claude_home.clone()).unwrap();
+        let seed = home.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        manager.add_profile_from("bad", &seed).unwrap();
+        manager.add_profile_from("good", &seed).unwrap();
+        fs::create_dir_all(claude_home.join("skills")).unwrap();
+        fs::write(claude_home.join("skills/alpha"), "shared").unwrap();
+        fs::write(manager.profile_dir("bad").join("skills"), "blocked").unwrap();
+        let opts = SyncOptions {
+            dry_run: false,
+            adopt: Vec::new(),
+        };
+
+        let (output, failed) =
+            sync_profile_blocks(&manager, &["bad".into(), "good".into()], &opts, home, true)
+                .unwrap();
+
+        assert!(failed);
+        assert!(output.starts_with("bad:\n  error: profile skills path is not a real directory\n"));
+        assert!(output.contains("good:\n  linked  alpha\n"), "{output}");
+        assert!(
+            manager
+                .profile_dir("good")
+                .join("skills/alpha")
+                .is_symlink()
+        );
+        assert!(sync_profile_blocks(&manager, &["bad".into()], &opts, home, false).is_err());
     }
 }

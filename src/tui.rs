@@ -1,14 +1,18 @@
 use anyhow::Result;
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    DefaultTerminal, Frame,
 };
 
-use crate::profile::{describe_age, detect_current_account, Profile, ProfileManager};
+use crate::limits::{Limits, Window, read_limits};
+use crate::profile::{Profile, ProfileManager, describe_age, detect_current_account};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 const ACCENT: Color = Color::Rgb(255, 149, 0);
@@ -78,6 +82,10 @@ pub struct App {
     /// How the live account gets resolved. Swapped in tests so the choice
     /// screen can be exercised without a real `~/.claude` behind it.
     account_probe: AccountProbe,
+    limits: HashMap<String, Limits>,
+    limits_selection: Option<String>,
+    last_limits_refresh: Option<Instant>,
+    limits_now: DateTime<Utc>,
 }
 
 type AccountProbe = fn() -> Option<String>;
@@ -119,6 +127,10 @@ impl App {
             selected_has_history: false,
             pending: None,
             account_probe: live_account_email,
+            limits: HashMap::new(),
+            limits_selection: None,
+            last_limits_refresh: None,
+            limits_now: Utc::now(),
         })
     }
 
@@ -134,7 +146,24 @@ impl App {
             self.list_state
                 .select(Some(idx.min(self.filtered_indices.len() - 1)));
         }
+        self.last_limits_refresh = None;
         Ok(())
+    }
+
+    fn refresh_limits_if_due(&mut self, instant: Instant) {
+        let selected = self.selected_profile().map(|profile| profile.name.clone());
+        let changed = selected != self.limits_selection;
+        let due = self
+            .last_limits_refresh
+            .is_none_or(|last| instant.duration_since(last) >= Duration::from_secs(30));
+        if let Some(name) = &selected
+            && (changed || due)
+        {
+            self.limits
+                .insert(name.clone(), read_limits(&self.manager.profile_dir(name)));
+            self.last_limits_refresh = Some(instant);
+        }
+        self.limits_selection = selected;
     }
 
     fn apply_filter(&mut self) {
@@ -148,11 +177,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, p)| {
                     p.name.to_lowercase().contains(&q)
-                        || p.email
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&q)
+                        || p.email.as_deref().unwrap_or("").to_lowercase().contains(&q)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -234,9 +259,13 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.limits_now = Utc::now();
+            self.refresh_limits_if_due(Instant::now());
             terminal.draw(|f| self.render(f))?;
 
-            if let Event::Key(key) = event::read()? {
+            if event::poll(Duration::from_secs(30))?
+                && let Event::Key(key) = event::read()?
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -298,11 +327,7 @@ impl App {
     /// Tear the TUI down, run `action` against the real terminal, then rebuild
     /// the TUI and carry on. Errors are shown in-app rather than propagated —
     /// a cancelled or failed login must not take the whole program down with it.
-    fn run_pending(
-        &mut self,
-        action: PendingAction,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<()> {
+    fn run_pending(&mut self, action: PendingAction, terminal: &mut DefaultTerminal) -> Result<()> {
         ratatui::restore();
 
         // `select` is only set when a profile actually landed in the registry,
@@ -319,7 +344,11 @@ impl App {
                             .collect();
 
                         let msg = if others.is_empty() {
-                            format!("Profile '{}' logged in as {}.", name, result.display_email())
+                            format!(
+                                "Profile '{}' logged in as {}.",
+                                name,
+                                result.display_email()
+                            )
                         } else {
                             // Not an error: two profiles for one account is a
                             // valid setup. But say it, or it reads as a new one.
@@ -352,11 +381,7 @@ impl App {
 
     // ── Key handlers ──────────────────────────────────────────────────────────
 
-    fn handle_first_run_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_first_run_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -418,11 +443,7 @@ impl App {
         Ok(false)
     }
 
-    fn handle_normal_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_normal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
@@ -511,11 +532,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_search_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Result<bool> {
+    fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(true);
         }
@@ -832,11 +849,17 @@ impl App {
                 Style::default().fg(DIM),
             )),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(SUCCESS).bold()),
-                Span::styled("Claude Code installation detected", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "Claude Code installation detected",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -844,9 +867,15 @@ impl App {
                 Span::styled(email, Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  Set up your first profile:", Style::default().fg(TEXT))),
+            Line::from(Span::styled(
+                "  Set up your first profile:",
+                Style::default().fg(TEXT),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Profile name   ", Style::default().fg(DIM)),
@@ -858,19 +887,34 @@ impl App {
                 Span::styled(dest, Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [1] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Copy active session as this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Copy active session as this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Uses your existing credentials — no re-login needed", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Uses your existing credentials — no re-login needed",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [2] ", Style::default().fg(ACCENT).bold()),
-                Span::styled("Login to a different account for this profile", Style::default().fg(TEXT)),
+                Span::styled(
+                    "Login to a different account for this profile",
+                    Style::default().fg(TEXT),
+                ),
             ]),
-            Line::from(Span::styled("      Opens Claude for you to authenticate a new account", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "      Opens Claude for you to authenticate a new account",
+                Style::default().fg(DIM),
+            )),
         ]
     }
 
@@ -882,14 +926,23 @@ impl App {
                 Span::styled("claude-switch", Style::default().fg(ACCENT).bold()),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  ─────────────────────────────────────────────────────────", Style::default().fg(BORDER))),
+            Line::from(Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(BORDER),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ✗ ", Style::default().fg(DANGER).bold()),
-                Span::styled("No Claude Code installation found at ~/.claude", Style::default().fg(TEXT).bold()),
+                Span::styled(
+                    "No Claude Code installation found at ~/.claude",
+                    Style::default().fg(TEXT).bold(),
+                ),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  You need to install and log in to Claude Code before adding profiles.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  You need to install and log in to Claude Code before adding profiles.",
+                Style::default().fg(DIM),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    Install   ", Style::default().fg(DIM)),
@@ -907,7 +960,10 @@ impl App {
                 Span::styled("claude", Style::default().fg(Color::Rgb(140, 200, 140))),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Then re-run cswitch to set up your first profile.", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  Then re-run cswitch to set up your first profile.",
+                Style::default().fg(DIM),
+            )),
         ]
     }
 
@@ -1046,13 +1102,12 @@ impl App {
 
         let profile_dir = self.manager.profile_dir(&profile.name);
 
-        let lines: Vec<Line> = vec![
+        let mut lines: Vec<Line> = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Name         ", Style::default().fg(DIM)),
                 Span::styled(profile.name.clone(), Style::default().fg(ACCENT).bold()),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Email        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1060,7 +1115,6 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Added        ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1068,7 +1122,6 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
-            Line::from(""),
             Line::from(vec![
                 Span::styled("  Last used    ", Style::default().fg(DIM)),
                 Span::styled(
@@ -1079,10 +1132,48 @@ impl App {
                     Style::default().fg(TEXT),
                 ),
             ]),
+        ];
+        lines.push(Line::from(""));
+        match self.limits.get(&profile.name) {
+            Some(Limits::Snapshot(snapshot)) => {
+                lines.push(Line::from(vec![
+                    Span::styled("  Plan limits  ", Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("as of {}", snapshot.age(self.limits_now)),
+                        Style::default().fg(TEXT),
+                    ),
+                ]));
+                if snapshot.windows.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    No limit windows in this snapshot.",
+                        Style::default().fg(MUTED),
+                    )));
+                }
+                for window in &snapshot.windows {
+                    lines.push(limit_line(window, self.limits_now));
+                }
+            }
+            Some(Limits::AccountMismatch) => lines.push(Line::from(Span::styled(
+                "  Plan limits  mismatch: another account's snapshot",
+                Style::default().fg(MUTED),
+            ))),
+            Some(Limits::Unreadable) => lines.push(Line::from(Span::styled(
+                "  Plan limits  unreadable: file couldn't be read",
+                Style::default().fg(MUTED),
+            ))),
+            Some(Limits::NoSnapshot) | None => lines.push(Line::from(Span::styled(
+                "  Plan limits  no data: no cached snapshot yet",
+                Style::default().fg(MUTED),
+            ))),
+        }
+        lines.extend([
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Config dir   ", Style::default().fg(DIM)),
-                Span::styled(profile_dir.display().to_string(), Style::default().fg(MUTED)),
+                Span::styled(
+                    profile_dir.display().to_string(),
+                    Style::default().fg(MUTED),
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -1093,18 +1184,18 @@ impl App {
             Line::from(Span::styled("  Launch command", Style::default().fg(DIM))),
             Line::from(Span::styled(
                 if cfg!(target_os = "windows") {
-                    format!("  $env:CLAUDE_CONFIG_DIR='{}'; claude", profile_dir.display())
+                    format!(
+                        "  $env:CLAUDE_CONFIG_DIR='{}'; claude",
+                        profile_dir.display()
+                    )
                 } else {
                     format!("  CLAUDE_CONFIG_DIR='{}' claude", profile_dir.display())
                 },
                 Style::default().fg(Color::Rgb(140, 200, 140)),
             )),
-        ];
+        ]);
 
-        f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -1115,11 +1206,7 @@ impl App {
             .style(Style::default().bg(PANEL));
 
         let keys: Vec<(&str, &str)> = if self.mode == Mode::Search {
-            vec![
-                ("↑/↓", "navigate"),
-                ("enter", "confirm"),
-                ("esc", "clear"),
-            ]
+            vec![("↑/↓", "navigate"), ("enter", "confirm"), ("esc", "clear")]
         } else {
             vec![
                 ("↑↓/jk", "nav"),
@@ -1145,10 +1232,7 @@ impl App {
             })
             .collect();
 
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).block(block),
-            area,
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     // ── Overlay popups ────────────────────────────────────────────────────────
@@ -1239,7 +1323,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1332,7 +1419,10 @@ impl App {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  [l] ", Style::default().fg(ACCENT).bold()),
-                    Span::styled("Log in to a different Claude account", Style::default().fg(TEXT)),
+                    Span::styled(
+                        "Log in to a different Claude account",
+                        Style::default().fg(TEXT),
+                    ),
                 ]),
                 Line::from(Span::styled(
                     "      Opens Claude's login. Sign out of claude.ai first,",
@@ -1371,14 +1461,12 @@ impl App {
         // Overwriting a profile another terminal is using is its own hazard,
         // independent of which account it holds — as is destroying history,
         // which happens even on a same-account refresh.
-        let color = if replaces_account
-            || self.selected_in_use.is_some()
-            || self.selected_has_history
-        {
-            DANGER
-        } else {
-            ACCENT
-        };
+        let color =
+            if replaces_account || self.selected_in_use.is_some() || self.selected_has_history {
+                DANGER
+            } else {
+                ACCENT
+            };
 
         let block = Block::default()
             .title(Line::from(Span::styled(
@@ -1423,7 +1511,10 @@ impl App {
 
         if let Some(secs) = self.selected_in_use {
             lines.push(Line::from(Span::styled(
-                format!("  In use? Written {} by a Claude session.", describe_age(secs)),
+                format!(
+                    "  In use? Written {} by a Claude session.",
+                    describe_age(secs)
+                ),
                 Style::default().fg(DANGER).bold(),
             )));
             lines.push(Line::from(Span::styled(
@@ -1534,6 +1625,44 @@ impl App {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+fn limit_line(window: &Window, now: DateTime<Utc>) -> Line<'static> {
+    let reset = window.rolled_over(now);
+    let color = if reset {
+        MUTED
+    } else {
+        match window.severity.as_deref() {
+            Some("normal") => SUCCESS,
+            Some("warning") => ACCENT,
+            Some("critical") => DANGER,
+            _ => MUTED,
+        }
+    };
+    let value = if reset {
+        format!("reset (was {:.0}%)", window.percent.round())
+    } else {
+        window.percent_label(now)
+    };
+    let bar = if reset {
+        "░".repeat(10)
+    } else {
+        window.bar()
+    };
+    let reset_time = window
+        .resets_at
+        .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string());
+    Line::from(Span::styled(
+        format!(
+            "  {:<14} {} {:<5} {}",
+            window.label(),
+            bar,
+            value,
+            reset_time
+        ),
+        Style::default().fg(color),
+    ))
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let w = area.width * percent_x / 100;
     Rect {
@@ -1566,8 +1695,7 @@ mod tests {
     /// An App wired to a manager that cannot reach the real `~/.claude-switch`,
     /// with the live-account probe stubbed out.
     fn make_app(tmp: &TempDir, existing: &[(&str, Option<&str>)]) -> App {
-        let manager =
-            ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
+        let manager = ProfileManager::with_base_dir(tmp.path().join(".claude-switch")).unwrap();
 
         for (name, email) in existing {
             let mut registry = manager.load_registry().unwrap();
@@ -1600,6 +1728,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn limits_cache_refreshes_on_selection_or_after_thirty_seconds() {
+        // Known-bad: reading during render rereads every frame, while never refreshing leaves a stale panel.
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(
+            &tmp,
+            &[
+                ("alpha", Some("a@example.com")),
+                ("beta", Some("b@example.com")),
+            ],
+        );
+        let path = app.manager.profile_dir("alpha");
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join(".claude.json");
+        let cache = serde_json::json!({
+            "cachedUsageUtilization": {
+                "fetchedAtMs": 1_894_021_200_000_i64,
+                "utilization": {"limits": [{"kind":"session", "group":"session", "percent":12}]}
+            }
+        });
+        std::fs::write(&file, serde_json::to_vec(&cache).unwrap()).unwrap();
+        std::fs::create_dir_all(app.manager.profile_dir("beta")).unwrap();
+        std::fs::write(app.manager.profile_dir("beta").join(".claude.json"), b"{}").unwrap();
+        let start = Instant::now();
+        app.refresh_limits_if_due(start);
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        std::fs::write(&file, b"{}").unwrap();
+        app.refresh_limits_if_due(start + Duration::from_secs(29));
+        assert!(matches!(app.limits.get("alpha"), Some(Limits::Snapshot(_))));
+        app.refresh_limits_if_due(start + Duration::from_secs(30));
+        assert_eq!(app.limits.get("alpha"), Some(&Limits::NoSnapshot));
+        app.move_down();
+        app.refresh_limits_if_due(start + Duration::from_secs(31));
+        assert_eq!(app.limits.get("beta"), Some(&Limits::NoSnapshot));
+    }
+
+    #[test]
+    fn limit_lines_use_severity_palette_and_mute_reset() {
+        // Known-bad: a reset retains its old critical colour or unknown severity looks normal.
+        let now = DateTime::parse_from_rfc3339("2030-01-07T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut window = Window {
+            group: crate::limits::WindowGroup::Session,
+            kind: "session".to_string(),
+            percent: 40.0,
+            severity: Some("normal".to_string()),
+            resets_at: None,
+            is_active: None,
+        };
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(SUCCESS));
+        window.resets_at = Some(now + chrono::Duration::hours(1));
+        assert!(limit_line(&window, now).spans[0].content.chars().count() <= 46);
+        window.severity = Some("warning".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(ACCENT));
+        window.severity = Some("critical".to_string());
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(DANGER));
+        window.severity = None;
+        assert_eq!(limit_line(&window, now).spans[0].style.fg, Some(MUTED));
+        window.severity = Some("critical".to_string());
+        window.resets_at = Some(now - chrono::Duration::hours(1));
+        let line = limit_line(&window, now);
+        assert_eq!(line.spans[0].style.fg, Some(MUTED));
+        assert!(line.spans[0].content.contains("reset (was 40%)"));
+    }
+
     // ── `a` → name → choice ───────────────────────────────────────────────────
 
     #[test]
@@ -1607,7 +1801,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
         assert!(app.input_buffer.is_empty());
@@ -1704,7 +1899,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
         // Login must not register anything until Claude has authenticated.
         assert!(app.manager.load_registry().unwrap().profiles.is_empty());
@@ -1737,7 +1934,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
     }
 
@@ -1753,7 +1952,10 @@ mod tests {
         app.handle_add_choice(KeyCode::Esc).unwrap();
 
         assert_eq!(app.mode, Mode::AddName);
-        assert_eq!(app.input_buffer, "business", "the typed name should survive");
+        assert_eq!(
+            app.input_buffer, "business",
+            "the typed name should survive"
+        );
         assert!(app.pending.is_none());
     }
 
@@ -1805,7 +2007,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut app = make_app(&tmp, &[("default", Some("me@example.com"))]);
 
-        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE).unwrap();
+        app.handle_normal_key(KeyCode::Char('l'), KeyModifiers::NONE)
+            .unwrap();
 
         assert_eq!(app.mode, Mode::LoginName);
     }
@@ -1823,7 +2026,9 @@ mod tests {
 
         assert_eq!(
             app.pending,
-            Some(PendingAction::Login { name: "business".to_string() })
+            Some(PendingAction::Login {
+                name: "business".to_string()
+            })
         );
     }
 
@@ -1993,7 +2198,11 @@ mod tests {
         app.handle_confirm_delete(KeyCode::Char('y')).unwrap();
 
         assert!(
-            !app.manager.load_registry().unwrap().profiles.contains_key("business"),
+            !app.manager
+                .load_registry()
+                .unwrap()
+                .profiles
+                .contains_key("business"),
             "confirming must still delete"
         );
     }
