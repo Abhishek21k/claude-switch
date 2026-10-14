@@ -1,0 +1,765 @@
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use tempfile::TempDir;
+
+fn command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cswitch"));
+    command
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CSWITCH_USAGE_DIR")
+        .env_remove("COLUMNS")
+        .env_remove("NO_COLOR")
+        .env_remove("TZ")
+        .env_remove("CSWITCH_TEST_STATUSLINE_PANIC")
+        .env_remove("CSWITCH_TEST_REFRESH_DELAY_MS");
+    command
+}
+
+fn run(home: &Path, args: &[&str]) -> std::process::Output {
+    command(home).args(args).output().unwrap()
+}
+
+fn run_status(
+    home: &Path,
+    payload: Option<&[u8]>,
+    configure: impl FnOnce(&mut Command),
+) -> std::process::Output {
+    let mut command = command(home);
+    command
+        .arg("statusline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure(&mut command);
+    let mut child = command.spawn().unwrap();
+    if let Some(payload) = payload {
+        let result = child.stdin.take().unwrap().write_all(payload);
+        assert!(
+            result.is_ok() || result.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    } else {
+        drop(child.stdin.take());
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn built_binary_prints_one_line_on_json_and_closed_stdin() {
+    // Known-bad: malformed or absent stdin returns non-zero and blanks Claude Code's row.
+    let home = TempDir::new().unwrap();
+    for payload in [Some(r#"{"cost":{"total_cost_usd":1.7}}"#), Some("{"), None] {
+        let output = run_status(home.path(), payload.map(str::as_bytes), |command| {
+            command.env("COLUMNS", "120");
+        });
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let line = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.starts_with("default"), "{line}");
+        assert!(line.ends_with('\n'));
+    }
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn built_binary_installs_and_uninstalls_only_named_profile() {
+    // Known-bad: the CLI writes ~/.claude/settings.json or leaves no backup.
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".claude-switch");
+    let profile = base.join("profiles/work");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(base.join("registry.json"), r#"{"profiles":{"work":{"name":"work","tool":"claude","email":null,"added":"2030-01-01T00:00:00Z","last_used":null}}}"#).unwrap();
+    let settings = profile.join("settings.json");
+    let original = br#"{"theme":"dark"}"#;
+    std::fs::write(&settings, original).unwrap();
+    let output = run(
+        home.path(),
+        &["statusline", "--install", "work", "--no-refresh"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"work: installed\n");
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(value["theme"], "dark");
+    let command = value["statusLine"]["command"].as_str().unwrap();
+    assert!(command.ends_with(" statusline --no-refresh"), "{command}");
+    let backups = base.join("backups/settings/work");
+    let saved = std::fs::read_dir(&backups)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(std::fs::read(&saved[0]).unwrap(), original);
+    let current = std::fs::read(&settings).unwrap();
+    let second = run(
+        home.path(),
+        &["statusline", "--install", "work", "--no-refresh"],
+    );
+    assert_eq!(second.stdout, b"work: already installed\n");
+    assert_eq!(std::fs::read(&settings).unwrap(), current);
+    assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+    let removed = run(home.path(), &["statusline", "--uninstall", "work"]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(removed.stdout, b"work: removed\n");
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(value, serde_json::json!({"theme":"dark"}));
+    assert!(!home.path().join(".claude/settings.json").exists());
+}
+
+#[test]
+fn foreign_statusline_refusal_exits_one_without_a_write() {
+    // Known-bad: install or uninstall reports a refusal but exits zero.
+    let home = TempDir::new().unwrap();
+    let profile = register(home.path(), "work");
+    let settings = profile.join("settings.json");
+    let original =
+        br#"{"theme":"dark","statusLine":{"type":"command","command":"other statusline"}}"#;
+    fs::write(&settings, original).unwrap();
+    for args in [
+        ["statusline", "--install", "work"],
+        ["statusline", "--uninstall", "work"],
+    ] {
+        let output = run(home.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("work:"));
+        assert_eq!(fs::read(&settings).unwrap(), original);
+    }
+}
+
+#[test]
+fn usage_refresh_is_silent_and_busy_lock_is_a_noop() {
+    // Known-bad: a busy lock makes refresh fail or print a report.
+    let home = TempDir::new().unwrap();
+    let (_, usage) = usage_fixture(home.path());
+    let refresh = || {
+        command(home.path())
+            .env("CSWITCH_USAGE_DIR", &usage)
+            .args(["usage", "refresh"])
+            .output()
+            .unwrap()
+    };
+    let first = refresh();
+    assert!(first.status.success(), "{first:?}");
+    assert!(first.stdout.is_empty() && first.stderr.is_empty());
+    for file in ["hourly.json", "chats.json", "cursors.json"] {
+        assert!(usage.join(file).exists(), "{file}");
+    }
+    // Known-bad: a second clock read gives the rollup a different timestamp.
+    assert_eq!(
+        generated_at(&usage.join("hourly.json")),
+        generated_at(&usage.join("chats.json"))
+    );
+    let files = ["hourly.json", "chats.json", "cursors.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let busy = refresh();
+    assert!(busy.status.success(), "{busy:?}");
+    assert!(busy.stdout.is_empty() && busy.stderr.is_empty());
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected.1);
+    }
+}
+
+#[test]
+fn stale_statusline_prints_before_detached_refresh_and_never_waits_on_lock() {
+    // Known-bads: waiting for ingest, or blocking the line behind a held ledger lock.
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let hourly_path = usage.join("hourly.json");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    let make_stale = || {
+        for file in ["hourly.json", "chats.json"] {
+            let path = usage.join(file);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["generated_at"] = serde_json::json!(stale);
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+    };
+    make_stale();
+    let payload =
+        br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#;
+    let render = || {
+        run_status(home.path(), Some(payload), |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &profile)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120")
+                .env("NO_COLOR", "1");
+        })
+    };
+    let start = Instant::now();
+    let output = render();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "statusline took {:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(line.contains("today") && line.contains("(10m)"), "{line}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let hourly: serde_json::Value =
+            serde_json::from_slice(&fs::read(&hourly_path).unwrap()).unwrap();
+        let generated: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(hourly["generated_at"].clone()).unwrap();
+        if generated > stale {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached refresh did not update hourly.json"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "first refresh held lock too long"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    make_stale();
+    fs::remove_file(usage.join(".refresh-attempt")).unwrap();
+    let files = ["hourly.json", "chats.json", "cursors.json", "summary.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let start = Instant::now();
+    let output = render();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "locked statusline took {:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(10m)"));
+    std::thread::sleep(Duration::from_millis(100));
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0, "{file}");
+        assert_eq!(
+            fs::metadata(path).unwrap().modified().unwrap(),
+            expected.1,
+            "{file}"
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn refresh_child_closes_pipes_and_survives_parent_group_signal() {
+    // Known-bads: waiting for the child, inheriting stdout or stderr, or
+    // leaving the child in the status line's process group.
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    for file in ["hourly.json", "chats.json"] {
+        let path = usage.join(file);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["generated_at"] = serde_json::json!(stale);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let mut statusline = command(home.path());
+    statusline
+        .arg("statusline")
+        .env("CLAUDE_CONFIG_DIR", &profile)
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .env("COLUMNS", "120")
+        .env("NO_COLOR", "1")
+        .env("CSWITCH_TEST_REFRESH_DELAY_MS", "3000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let start = Instant::now();
+    let mut child = statusline.spawn().unwrap();
+    let group = format!("-{}", child.id());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(line.lines().count(), 1);
+    assert!(line.contains("(10m)"), "{line}");
+    assert!(usage.join(".refresh-attempt").exists());
+    assert_eq!(generated_at(&usage.join("hourly.json")), stale);
+
+    let _ = Command::new("kill").args(["-TERM", "--", &group]).output();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if generated_at(&usage.join("hourly.json")) > stale {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refresh child did not survive signal"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "refresh held the lock too long");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn unregistered_config_directory_never_starts_ledger_refresh() {
+    // Known-bad: a stale ledger starts a refresh for a directory the ledger does not know.
+    let home = TempDir::new().unwrap();
+    let (_, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(601);
+    for file in ["hourly.json", "chats.json"] {
+        let path = usage.join(file);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["generated_at"] = serde_json::json!(stale);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let files = ["hourly.json", "chats.json", "cursors.json"];
+    let before = files.map(|file| {
+        let path = usage.join(file);
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+    let unknown = home.path().join("elsewhere/work");
+    fs::create_dir_all(&unknown).unwrap();
+    let output = run_status(
+        home.path(),
+        Some(br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#),
+        |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &unknown)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120");
+        },
+    );
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(line.starts_with("work · chat ~$1.70"), "{line}");
+    assert!(!line.contains("today"), "{line}");
+    assert!(!usage.join(".refresh-attempt").exists());
+    for (file, expected) in files.into_iter().zip(before) {
+        let path = usage.join(file);
+        assert_eq!(fs::read(&path).unwrap(), expected.0);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected.1);
+    }
+}
+
+#[test]
+fn mismatched_rollup_starts_a_refresh_and_heals() {
+    // Known-bad: a mismatched rollup is used or a fresh hourly file prevents repair.
+    use std::time::{Duration, Instant};
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let first = generated_at(&usage.join("hourly.json"));
+    let chat_path = usage.join("chats.json");
+    let mut chats: serde_json::Value =
+        serde_json::from_slice(&fs::read(&chat_path).unwrap()).unwrap();
+    chats["generated_at"] = serde_json::json!(first - chrono::Duration::seconds(1));
+    fs::write(&chat_path, serde_json::to_vec(&chats).unwrap()).unwrap();
+    let payload =
+        br#"{"session_id":"00000000-0000-4000-8000-000000000001","cost":{"total_cost_usd":1.70}}"#;
+    let render = |no_refresh: bool| {
+        run_status(home.path(), Some(payload), |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &profile)
+                .env("CSWITCH_USAGE_DIR", &usage)
+                .env("COLUMNS", "120");
+            if no_refresh {
+                command.arg("--no-refresh");
+            }
+        })
+    };
+    let output = render(false);
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        line.contains("chat ~$1.70") && !line.contains("today"),
+        "{line}"
+    );
+    assert!(usage.join(".refresh-attempt").exists());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let hourly = generated_at(&usage.join("hourly.json"));
+        let chats = generated_at(&chat_path);
+        if hourly > first && chats == hourly {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refresh did not repair timestamps"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(usage.join(".lock"))
+        .unwrap();
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "refresh held the lock too long");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let healed = render(true);
+    assert!(healed.status.success(), "{healed:?}");
+    assert!(String::from_utf8_lossy(&healed.stdout).contains("today"));
+}
+
+fn generated_at(path: &Path) -> chrono::DateTime<chrono::Utc> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    serde_json::from_value(value["generated_at"].clone()).unwrap()
+}
+
+#[test]
+fn no_refresh_statusline_reads_existing_ledger_without_writes() {
+    // Known-bad: a statusline read seeds settings or refreshes a ledger anyway.
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
+    fn files(root: &Path) -> BTreeMap<std::path::PathBuf, (Vec<u8>, SystemTime)> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    found.insert(
+                        path.clone(),
+                        (
+                            fs::read(&path).unwrap(),
+                            fs::metadata(path).unwrap().modified().unwrap(),
+                        ),
+                    );
+                }
+            }
+        }
+        found
+    }
+    let home = TempDir::new().unwrap();
+    let (profile, usage) = usage_fixture(home.path());
+    let initial = command(home.path())
+        .env("CSWITCH_USAGE_DIR", &usage)
+        .args(["usage", "refresh"])
+        .output()
+        .unwrap();
+    assert!(initial.status.success(), "{initial:?}");
+    let before = files(home.path());
+    let output = run_status(home.path(), Some(b"{}"), |command| {
+        command
+            .arg("--no-refresh")
+            .env("CLAUDE_CONFIG_DIR", &profile)
+            .env("CSWITCH_USAGE_DIR", &usage);
+    });
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(files(home.path()), before);
+    assert!(!usage.join(".refresh-attempt").exists());
+}
+
+#[test]
+fn no_color_env_removes_limit_escape_sequences() {
+    // Known-bad: treating NO_COLOR as a terminal-only setting and emitting escapes into a pipe.
+    let home = TempDir::new().unwrap();
+    let output = run_status(
+        home.path(),
+        Some(br#"{"rate_limits":{"five_hour":{"used_percentage":95}}}"#),
+        |command| {
+            command.env("NO_COLOR", "1").env("COLUMNS", "120");
+        },
+    );
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("5h 95%"));
+    assert!(!output.stdout.contains(&0x1b));
+}
+
+fn register(home: &Path, name: &str) -> std::path::PathBuf {
+    let base = home.join(".claude-switch");
+    let profile = base.join("profiles").join(name);
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        base.join("registry.json"),
+        serde_json::to_vec(&serde_json::json!({"profiles":{name:{
+            "name":name,"tool":"claude","email":null,
+            "added":"2030-01-01T00:00:00Z","last_used":null
+        }}}))
+        .unwrap(),
+    )
+    .unwrap();
+    profile
+}
+
+fn usage_fixture(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let profile = register(home, "work");
+    let projects = profile.join("projects/demo");
+    fs::create_dir_all(&projects).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/usage/profile/projects/demo/a.jsonl");
+    fs::copy(fixture, projects.join("a.jsonl")).unwrap();
+    (profile, home.join("usage"))
+}
+
+#[test]
+fn binary_respects_config_and_usage_directories() {
+    // Known-bad: the binary ignores CLAUDE_CONFIG_DIR or CSWITCH_USAGE_DIR,
+    // or treats an empty config directory as a registered one.
+    let home = TempDir::new().unwrap();
+    let profile = register(home.path(), "work");
+    let work = run_status(home.path(), Some(b"{}"), |command| {
+        command.env("CLAUDE_CONFIG_DIR", &profile);
+    });
+    assert!(work.status.success());
+    assert!(String::from_utf8_lossy(&work.stdout).starts_with("work\n"));
+    let empty = run_status(home.path(), Some(b"{}"), |command| {
+        command.env("CLAUDE_CONFIG_DIR", "");
+    });
+    assert_eq!(empty.stdout, b"default\n");
+
+    let root = home.path().join("atlas");
+    let site = root.join("apps/site/src");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("apps/site/.git")).unwrap();
+    fs::create_dir_all(&site).unwrap();
+    let usage = home.path().join("custom-usage");
+    fs::create_dir_all(&usage).unwrap();
+    fs::write(
+        usage.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "superproject":root,"workspaces":[{"glob":"apps/*","name":"acme"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({"cwd":site})).unwrap();
+    let output = run_status(home.path(), Some(&payload), |command| {
+        command.env("CSWITCH_USAGE_DIR", &usage);
+    });
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("acme › site"),
+        "{output:?}"
+    );
+    let without = run_status(home.path(), Some(&payload), |_| {});
+    assert!(!String::from_utf8_lossy(&without.stdout).contains("acme › site"));
+}
+
+#[test]
+fn binary_columns_fallback_colour_and_pipe_are_stable() {
+    // Known-bads: COLUMNS ignored, zero used literally, or colour limited to a TTY.
+    let home = TempDir::new().unwrap();
+    let profile = register(home.path(), "work");
+    let mut own =
+        serde_json::json!({"oauthAccount":{"accountUuid":"00000000-0000-4000-8000-000000000001"}});
+    own["cachedUsageUtilization"] = serde_json::json!({"accountUuid":"00000000-0000-4000-8000-000000000001",
+        "fetchedAtMs": chrono::Utc::now().timestamp_millis(), "utilization":{"five_hour":{"utilization":60}}});
+    fs::write(
+        profile.join(".claude.json"),
+        serde_json::to_vec(&own).unwrap(),
+    )
+    .unwrap();
+    let spare = home.path().join(".claude-switch/profiles/spare");
+    fs::create_dir_all(&spare).unwrap();
+    let mut registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join(".claude-switch/registry.json")).unwrap(),
+    )
+    .unwrap();
+    registry["profiles"]["spare"] = serde_json::json!({"name":"spare","tool":"claude","email":null,
+        "added":"2030-01-01T00:00:00Z","last_used":null});
+    fs::write(
+        home.path().join(".claude-switch/registry.json"),
+        serde_json::to_vec(&registry).unwrap(),
+    )
+    .unwrap();
+    let mut candidate = own;
+    candidate["cachedUsageUtilization"]["utilization"]["five_hour"]["utilization"] =
+        serde_json::json!(10);
+    fs::write(
+        spare.join(".claude.json"),
+        serde_json::to_vec(&candidate).unwrap(),
+    )
+    .unwrap();
+    let root = home.path().join("atlas");
+    let site = root.join("apps/site/src");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("apps/site/.git")).unwrap();
+    fs::create_dir_all(&site).unwrap();
+    let usage = home.path().join("usage");
+    fs::create_dir_all(&usage).unwrap();
+    fs::write(
+        usage.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "superproject":root,"workspaces":[{"glob":"apps/*","name":"acme"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "cwd":site,
+        "rate_limits":{"five_hour":{"used_percentage":88,"resets_at":chrono::Utc::now().timestamp()+4800},
+            "seven_day":{"used_percentage":71,"resets_at":chrono::Utc::now().timestamp()+259200}},
+        "context_window":{"total_input_tokens":142000},"cost":{"total_cost_usd":1.70}
+    })).unwrap();
+    let run_at = |columns: Option<&str>, no_color: Option<&str>| {
+        run_status(home.path(), Some(&payload), |command| {
+            command
+                .env("CLAUDE_CONFIG_DIR", &profile)
+                .env("CSWITCH_USAGE_DIR", &usage);
+            if let Some(columns) = columns {
+                command.env("COLUMNS", columns);
+            }
+            if let Some(no_color) = no_color {
+                command.env("NO_COLOR", no_color);
+            }
+        })
+    };
+    let wide = run_at(Some("120"), Some("1"));
+    let narrow = run_at(Some("50"), Some("1"));
+    assert!(String::from_utf8_lossy(&wide.stdout).contains("→ spare 5h 10%"));
+    assert_eq!(
+        String::from_utf8_lossy(&narrow.stdout),
+        "work · site · 5h 88% · 7d 71% · → spare 5h 10%\n"
+    );
+    let at_80 = run_at(Some("80"), Some("1"));
+    for columns in [None, Some("0"), Some("abc")] {
+        assert_eq!(run_at(columns, Some("1")).stdout, at_80.stdout);
+    }
+    assert_ne!(at_80.stdout, wide.stdout);
+    for no_color in [None, Some("")] {
+        let red = run_status(
+            home.path(),
+            Some(br#"{"rate_limits":{"five_hour":{"used_percentage":95}}}"#),
+            |command| {
+                command
+                    .env("CLAUDE_CONFIG_DIR", &profile)
+                    .env("COLUMNS", "120");
+                if let Some(no_color) = no_color {
+                    command.env("NO_COLOR", no_color);
+                }
+            },
+        );
+        assert!(String::from_utf8_lossy(&red.stdout).contains("\x1b[31m95%\x1b[0m"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_uses_tz_for_weekly_reset_weekday() {
+    // Known-bad: UTC weekday is used instead of the command's local timezone.
+    use chrono::{Datelike, Duration, FixedOffset, TimeZone, Utc};
+    let home = TempDir::new().unwrap();
+    let day = Utc::now().date_naive() + Duration::days(3);
+    let reset = Utc.from_utc_datetime(&day.and_hms_opt(0, 30, 0).unwrap());
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "rate_limits":{"seven_day":{"used_percentage":71,"resets_at":reset.timestamp()}}
+    }))
+    .unwrap();
+    let mut suffixes = Vec::new();
+    for (zone, offset) in [("<-12>12", -12), ("<+14>-14", 14)] {
+        let output = run_status(home.path(), Some(&payload), |command| {
+            command.env("TZ", zone).env("COLUMNS", "120");
+        });
+        let expected = reset
+            .with_timezone(&FixedOffset::east_opt(offset * 3600).unwrap())
+            .weekday()
+            .to_string();
+        let expected = &expected[..3];
+        let line = String::from_utf8(output.stdout).unwrap();
+        assert!(line.contains(&format!("↻{expected}")), "{zone}: {line}");
+        suffixes.push(expected.to_string());
+    }
+    assert_ne!(suffixes[0], suffixes[1]);
+}
+
+#[test]
+fn oversized_stdin_uses_account_fallback_without_failing() {
+    // Known-bad: a missing cap accepts the 1.5 MiB object's final rate_limits.
+    let home = TempDir::new().unwrap();
+    let payload = format!(
+        "{{\"padding\":\"{}\",\"rate_limits\":{{\"five_hour\":{{\"used_percentage\":88}}}}}}",
+        "x".repeat(1_500_000)
+    );
+    let output = run_status(home.path(), Some(payload.as_bytes()), |_| {});
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"default\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn panic_guard_prints_cswitch_without_stderr() {
+    // Known-bads: an empty fallback or the default panic hook writing to stderr.
+    let home = TempDir::new().unwrap();
+    let output = run_status(home.path(), Some(b"{}"), |command| {
+        command.env("CSWITCH_TEST_STATUSLINE_PANIC", "1");
+    });
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"cswitch\n");
+    assert!(output.stderr.is_empty());
+}
